@@ -212,7 +212,7 @@ def test_score_details_do_not_contain_threshold_or_abnormal_fields(monkeypatch: 
     detail = legacy.evaluate_one_record_scores(
         object(),
         "model",
-        {"path": str(tmp_path / "clip.wav")},
+        {"path": str(tmp_path / "clip.wav"), "text": "Hey Siri"},
         "testing.positive",
         0,
         1,
@@ -227,7 +227,28 @@ def test_score_details_do_not_contain_threshold_or_abnormal_fields(monkeypatch: 
     )
     for field in ("threshold", "detected", "false_reject", "false_accept", "abnormal", "abnormal_type"):
         assert field not in detail
+    assert detail["text"] == "Hey Siri"
+    keys = list(detail)
+    assert keys.index("text") + 1 == keys.index("best_window")
     assert detail["sliding_windows"]
+
+    background_detail = legacy.evaluate_one_record_scores(
+        object(),
+        "model",
+        {"path": str(tmp_path / "background.wav"), "text": "must not be included"},
+        "testing.background",
+        0,
+        0,
+        {
+            "sample_rate": 16000,
+            "chunk_size": 1280,
+            "positive_padding": 1,
+            "negative_padding": 0,
+            "model_window_seconds": 2.0,
+            "record_window_scores": True,
+        },
+    )
+    assert background_detail["text"] == ""
 
 
 def test_train_stage_resumes_from_a_model_checkpoint(tmp_path: Path) -> None:
@@ -275,8 +296,7 @@ split = dev
 
 [train]
 train = feature.positive_train, feature.negative_train
-dev = feature.positive_dev, feature.negative_dev
-false_positive = feature.background_dev
+dev = feature.positive_dev, feature.negative_dev, feature.background_dev
 batch.feature.positive_train = 2
 batch.feature.negative_train = 2
 steps = 2
@@ -286,7 +306,6 @@ validation_points = 1
 model_type = dnn
 layer_size = 8
 max_negative_weight = 2
-target_false_positives_per_hour = 1
 resume = yes
 checkpoint_interval_steps = 1
 keep_checkpoints = 2
@@ -302,7 +321,14 @@ output_summary = ${{main:experiment_dir}}/trained_model/training_summary.json
     training_log = tmp_path / "experiment" / "trained_model" / "training_summary.jsonl"
     events = [json.loads(line) for line in training_log.read_text(encoding="utf-8").splitlines()]
     assert any(event["event"] == "train_step" and "loss" in event for event in events)
-    assert any(event["event"] == "validation" and "val_accuracy" in event for event in events)
+    assert any(event["event"] == "validation" and "val_loss" in event for event in events)
+    per_set = [event for event in events if event["event"] == "validation_set"]
+    assert {event["validation_set"] for event in per_set} == {
+        "feature.positive_dev",
+        "feature.negative_dev",
+        "feature.background_dev",
+    }
+    assert all("loss" in event and "label" in event and "threshold" not in event for event in per_set)
     assert events[-1]["event"] == "run_complete"
 
     checkpoint_path = tmp_path / "experiment" / "model_checkpoints" / "latest.pt"

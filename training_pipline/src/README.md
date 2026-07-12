@@ -41,10 +41,13 @@ but are deprecated for new work.
 - A `feature.*` block accepts one JSONL path or a JSON list of paths, emits one
   NPY file, and declares `label` plus `split`. Relative audio paths use
   `audio_base_dir` when present, otherwise the JSONL file's parent directory.
-- `[train]` names feature blocks with `train`, `dev`, and `false_positive`.
-  Each named training block needs a matching line such as
+- `[train]` names labeled feature blocks with `train` and `dev`. Each named
+  training block needs a matching line such as
   `batch.feature.negative_cv_train = 128`. The stage saves resumable model
-  checkpoints separately from its final `.pt` model artifact.
+  checkpoints separately from its final `.pt` model artifact. Validation is
+  threshold-free: it reports BCE loss independently for every dev block, plus
+  aggregate, positive-label, and negative-label dev losses. Older configs with
+  `false_positive` remain readable and are merged into the labeled dev list.
 - `[export]` reads the final training `.pt` artifact and writes ONNX. It can
   verify PyTorch/ONNX Runtime inference parity.
 - Every `testing.*` block evaluates one positive or negative set once, sweeps
@@ -136,9 +139,11 @@ validation_interval_steps = 500
 training_log_file = ${main:experiment_dir}/trained_model/training.jsonl
 ```
 
-The JSONL includes `run_start`, `phase_start`, `train_step`, `validation`,
-`checkpoint`, and `run_complete` events. Resumed runs append a new session ID
-to the same file.
+The JSONL includes `run_start`, `phase_start`, `train_step`, aggregate
+`validation`, one `validation_set` event per labeled dev block, `checkpoint`,
+and `run_complete` events. Resumed runs append a new session ID to the same
+file. Threshold-based FA/FR metrics are intentionally reserved for
+`testing.*`, where the configured threshold range is swept.
 
 Use this Python environment:
 

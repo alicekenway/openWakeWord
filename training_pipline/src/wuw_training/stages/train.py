@@ -19,7 +19,7 @@ import torch.nn.functional as functional
 
 from ..artifacts import file_signature, hash_payload, read_json, write_json
 from ..config import ConfigurationError, parse_json
-from .common import boolean, csv_option, integer, number, optional_integer, optional_number, require
+from .common import boolean, csv_option, integer, number, optional_integer, require
 
 
 @dataclass(frozen=True)
@@ -59,12 +59,30 @@ def _feature_block(ctx: Any, name: str) -> FeatureBlock:
     return FeatureBlock(name, path, label, split, (), 0)
 
 
-def _references(ctx: Any, option: str) -> list[str]:
-    return csv_option(ctx.section, option, ctx.step)
+def _references(ctx: Any, option: str, *, required: bool = True) -> list[str]:
+    return csv_option(ctx.section, option, ctx.step, required=required)
 
 
-def _blocks(ctx: Any, option: str) -> list[FeatureBlock]:
-    return [_feature_block(ctx, name) for name in _references(ctx, option)]
+def _blocks(ctx: Any, option: str, *, required: bool = True) -> list[FeatureBlock]:
+    return [_feature_block(ctx, name) for name in _references(ctx, option, required=required)]
+
+
+def _validation_blocks(ctx: Any) -> list[FeatureBlock]:
+    """Return one labeled validation list.
+
+    ``false_positive`` remains readable only for compatibility with existing
+    experiment configs. New configs should list every positive and negative
+    validation set under ``dev``; labels determine which metrics are reported.
+    """
+    dev = _blocks(ctx, "dev")
+    legacy_false_positive = _blocks(ctx, "false_positive", required=False)
+    names = [block.name for block in [*dev, *legacy_false_positive]]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ConfigurationError(
+            f"[{ctx.step}] validation feature block(s) listed more than once: {', '.join(duplicates)}"
+        )
+    return [*dev, *legacy_false_positive]
 
 
 def _phase_plan(ctx: Any) -> list[dict[str, float | int]]:
@@ -227,16 +245,14 @@ def _training_log(ctx: Any) -> Path:
 def _normalise_config_for_fingerprint(
     ctx: Any,
     train: list[FeatureBlock],
-    dev: list[FeatureBlock],
-    false_positive: list[FeatureBlock],
+    validation: list[FeatureBlock],
 ) -> str:
     return hash_payload(
         {
             "section": ctx.section,
             "train": [block.name for block in train],
-            "dev": [block.name for block in dev],
-            "false_positive": [block.name for block in false_positive],
-            "pipeline_training_schema": 1,
+            "validation": [block.name for block in validation],
+            "pipeline_training_schema": 2,
         }
     )
 
@@ -258,12 +274,13 @@ def _feature_signature(blocks: Iterable[FeatureBlock]) -> str:
 def validate(ctx: Any) -> None:
     train = _blocks(ctx, "train")
     dev = _blocks(ctx, "dev")
-    false_positive = _blocks(ctx, "false_positive")
+    legacy_false_positive = _blocks(ctx, "false_positive", required=False)
+    validation = _validation_blocks(ctx)
     if not any(block.label == 1 for block in train) or not any(block.label == 0 for block in train):
         raise ConfigurationError(f"[{ctx.step}] train must contain at least one positive and one negative feature block")
-    if not any(block.label == 1 for block in dev) or not any(block.label == 0 for block in dev):
+    if not any(block.label == 1 for block in validation) or not any(block.label == 0 for block in validation):
         raise ConfigurationError(f"[{ctx.step}] dev must contain at least one positive and one negative feature block")
-    if any(block.label != 0 for block in false_positive):
+    if any(block.label != 0 for block in legacy_false_positive):
         raise ConfigurationError(f"[{ctx.step}] false_positive may contain only label = 0 feature blocks")
     for block in train:
         if block.split != "train":
@@ -272,7 +289,7 @@ def validate(ctx: Any) -> None:
     for block in dev:
         if block.split != "dev":
             raise ConfigurationError(f"[{ctx.step}] dev block {block.name} has split={block.split!r}, expected dev")
-    for block in false_positive:
+    for block in legacy_false_positive:
         if block.split not in {"dev", "false_positive"}:
             raise ConfigurationError(f"[{ctx.step}] false_positive block {block.name} must use split=dev or false_positive")
     train_names = {block.name for block in train}
@@ -283,12 +300,12 @@ def validate(ctx: Any) -> None:
     ]
     if extra_batch_options:
         raise ConfigurationError(f"[{ctx.step}] batch option(s) do not name a listed train block: {', '.join(extra_batch_options)}")
-    shapes = {block.shape for block in [*train, *dev, *false_positive] if block.shape}
+    shapes = {block.shape for block in [*train, *validation] if block.shape}
     if len(shapes) > 1:
         raise ConfigurationError(f"[{ctx.step}] all feature arrays must have the same shape, found {sorted(shapes)}")
     if ctx.section.get("model_type", "dnn") not in {"dnn", "rnn", "cnn", "attention"}:
         raise ConfigurationError(f"[{ctx.step}] model_type must be dnn, rnn, cnn, or attention")
-    known_shape = next((block.shape for block in [*train, *dev, *false_positive] if block.shape), ())
+    known_shape = next((block.shape for block in [*train, *validation] if block.shape), ())
     _model_config(ctx, known_shape)
     _phase_plan(ctx)
     if number(ctx.section, "max_negative_weight", ctx.step, 100.0) < 1:
@@ -310,7 +327,7 @@ def validate(ctx: Any) -> None:
 
 
 def input_paths(ctx: Any) -> list[Path]:
-    return [block.path for block in [*_blocks(ctx, "train"), *_blocks(ctx, "dev"), *_blocks(ctx, "false_positive")]]
+    return [block.path for block in [*_blocks(ctx, "train"), *_validation_blocks(ctx)]]
 
 
 def output_paths(ctx: Any) -> list[Path]:
@@ -408,20 +425,18 @@ class ResumableAutoTrainer:
         self,
         ctx: Any,
         train_blocks: list[FeatureBlock],
-        dev_blocks: list[FeatureBlock],
-        false_positive_blocks: list[FeatureBlock],
+        validation_blocks: list[FeatureBlock],
     ):
         from openwakeword.train import Model as TrainModel
 
         self.ctx = ctx
         self.train_blocks = train_blocks
-        self.dev_blocks = dev_blocks
-        self.false_positive_blocks = false_positive_blocks
+        self.validation_blocks = validation_blocks
         self.feature_shape = train_blocks[0].shape
         self.model_config = _model_config(ctx, self.feature_shape)
         self.plan = _phase_plan(ctx)
-        self.config_fingerprint = _normalise_config_for_fingerprint(ctx, train_blocks, dev_blocks, false_positive_blocks)
-        self.inputs_fingerprint = _feature_signature([*train_blocks, *dev_blocks, *false_positive_blocks])
+        self.config_fingerprint = _normalise_config_for_fingerprint(ctx, train_blocks, validation_blocks)
+        self.inputs_fingerprint = _feature_signature([*train_blocks, *validation_blocks])
         self.seed = integer(ctx.config.section("main"), "seed", "main", 1337)
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.use_amp = boolean(ctx.section, "mixed_precision", ctx.step, False) and self.device.type == "cuda"
@@ -446,6 +461,7 @@ class ResumableAutoTrainer:
         self.global_step = 0
         self.current_max_negative_weight = number(ctx.section, "max_negative_weight", ctx.step, 100.0)
         self.history: dict[str, list[float]] = defaultdict(list)
+        self.validation_history: list[dict[str, Any]] = []
         self.best_model_states: list[dict[str, torch.Tensor]] = []
         self.best_model_scores: list[dict[str, float]] = []
         self.started_at = time.time()
@@ -476,7 +492,7 @@ class ResumableAutoTrainer:
     def _checkpoint_payload(self) -> dict[str, Any]:
         cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "config_fingerprint": self.config_fingerprint,
             "inputs_fingerprint": self.inputs_fingerprint,
             "model_state_dict": _cpu_state_dict(self.network),
@@ -487,6 +503,7 @@ class ResumableAutoTrainer:
             "global_step": self.global_step,
             "current_max_negative_weight": self.current_max_negative_weight,
             "history": dict(self.history),
+            "validation_history": self.validation_history,
             "best_model_states": self.best_model_states,
             "best_model_scores": self.best_model_scores,
             "sampler_state": self.sampler.state_dict(),
@@ -536,6 +553,7 @@ class ResumableAutoTrainer:
                 self.global_step = int(state["global_step"])
                 self.current_max_negative_weight = float(state["current_max_negative_weight"])
                 self.history = defaultdict(list, {key: list(value) for key, value in state.get("history", {}).items()})
+                self.validation_history = list(state.get("validation_history", []))
                 self.best_model_states = list(state.get("best_model_states", []))
                 self.best_model_scores = list(state.get("best_model_scores", []))
                 self.sampler.load_state_dict(state["sampler_state"])
@@ -575,65 +593,106 @@ class ResumableAutoTrainer:
         start = int(phase_steps * 0.75) if phase_index == 0 else 0
         return set(int(value) for value in np.linspace(start, phase_steps - 1, points, dtype=np.int64)) | {phase_steps - 1}
 
-    def _scores(self, blocks: list[FeatureBlock]) -> tuple[int, int, int, int, int, int]:
-        total = 0
-        correct = 0
-        positives = 0
-        positive_detected = 0
-        negatives = 0
-        false_positives = 0
+    def _validation_loss(self, block: FeatureBlock) -> dict[str, float | int]:
+        examples = 0
+        loss_sum = 0.0
         self.network.eval()
         with torch.inference_mode():
-            for block in blocks:
-                values = np.load(block.path, mmap_mode="r")
-                for start in range(0, int(values.shape[0]), 8192):
-                    batch = np.array(values[start:start + 8192], dtype=np.float32, copy=True)
-                    x = torch.from_numpy(batch).to(self.device)
-                    predictions = self.network(x).reshape(-1) >= 0.5
-                    count = int(predictions.numel())
-                    total += count
-                    if block.label == 1:
-                        positives += count
-                        positive_detected += int(predictions.sum().item())
-                        correct += int(predictions.sum().item())
-                    else:
-                        negatives += count
-                        fp = int(predictions.sum().item())
-                        false_positives += fp
-                        correct += count - fp
-        return total, correct, positive_detected, positives, false_positives, negatives
-
-    def _validate(self) -> dict[str, float]:
-        total, correct, detected, positives, val_fp, _ = self._scores(self.dev_blocks)
-        _, _, _, _, fp_count, fp_rows = self._scores(self.false_positive_blocks)
-        sample_rate = integer(self.ctx.config.section("main"), "sample_rate", "main", 16000)
-        seconds_per_example = 1280 * self.feature_shape[0] / sample_rate
-        configured_hours = optional_number(self.ctx.section, "false_positive_hours", self.ctx.step)
-        validation_hours = configured_hours if configured_hours is not None else (fp_rows * seconds_per_example / 3600.0)
-        score = {
-            "global_step": float(self.global_step),
-            "val_accuracy": (correct / total) if total else 0.0,
-            "val_recall": (detected / positives) if positives else 0.0,
-            "val_n_fp": float(val_fp),
-            "val_fp_per_hr": (fp_count / validation_hours) if validation_hours else 0.0,
+            values = np.load(block.path, mmap_mode="r")
+            for start in range(0, int(values.shape[0]), 8192):
+                batch = np.array(values[start:start + 8192], dtype=np.float32, copy=True)
+                x = torch.from_numpy(batch).to(self.device)
+                probabilities = self.network(x).reshape(-1).float()
+                targets = torch.full_like(probabilities, float(block.label))
+                loss_sum += float(
+                    functional.binary_cross_entropy(probabilities, targets, reduction="sum").cpu().item()
+                )
+                examples += int(probabilities.numel())
+        return {
+            "examples": examples,
+            "loss_sum": loss_sum,
+            "loss": loss_sum / examples if examples else 0.0,
         }
-        for key, value in score.items():
+
+    def _validate(self) -> dict[str, Any]:
+        validation_sets: dict[str, dict[str, Any]] = {}
+        total_examples = 0
+        total_loss_sum = 0.0
+        label_examples = {0: 0, 1: 0}
+        label_loss_sums = {0: 0.0, 1: 0.0}
+        for block in self.validation_blocks:
+            values = self._validation_loss(block)
+            examples = int(values["examples"])
+            loss_sum = float(values["loss_sum"])
+            total_examples += examples
+            total_loss_sum += loss_sum
+            label_examples[block.label] += examples
+            label_loss_sums[block.label] += loss_sum
+            validation_sets[block.name] = {
+                "label": block.label,
+                "examples": examples,
+                "loss": float(values["loss"]),
+            }
+
+        score: dict[str, Any] = {
+            "global_step": float(self.global_step),
+            "val_loss": total_loss_sum / total_examples if total_examples else 0.0,
+            "val_positive_loss": (
+                label_loss_sums[1] / label_examples[1] if label_examples[1] else 0.0
+            ),
+            "val_negative_loss": (
+                label_loss_sums[0] / label_examples[0] if label_examples[0] else 0.0
+            ),
+            "validation_sets": validation_sets,
+        }
+        for key in ("global_step", "val_loss", "val_positive_loss", "val_negative_loss"):
+            value = score[key]
             self.history[key].append(float(value))
-        recalls = np.asarray(self.history["val_recall"], dtype=float)
-        n_fps = np.asarray(self.history["val_n_fp"], dtype=float)
-        eligible = (
-            score["val_n_fp"] <= float(np.percentile(n_fps, 50))
-            and score["val_recall"] >= float(np.percentile(recalls, 5))
+        self.validation_history.append(
+            {
+                "global_step": self.global_step,
+                "sets": copy.deepcopy(validation_sets),
+            }
         )
-        if eligible:
-            self.best_model_states.append(_cpu_state_dict(self.network))
-            self.best_model_scores.append(dict(score))
-            limit = integer(self.ctx.section, "max_best_models", self.ctx.step, 24)
-            if len(self.best_model_states) > limit:
-                self.best_model_states.pop(0)
-                self.best_model_scores.pop(0)
+        self.best_model_states.append(_cpu_state_dict(self.network))
+        self.best_model_scores.append(
+            {
+                key: float(score[key])
+                for key in ("global_step", "val_loss", "val_positive_loss", "val_negative_loss")
+            }
+        )
+        limit = integer(self.ctx.section, "max_best_models", self.ctx.step, 24)
+        if len(self.best_model_states) > limit:
+            worst = max(range(len(self.best_model_scores)), key=lambda index: self.best_model_scores[index]["val_loss"])
+            self.best_model_states.pop(worst)
+            self.best_model_scores.pop(worst)
         self.network.train()
         return score
+
+    def _log_validation(self, score: dict[str, Any]) -> None:
+        self._log_event(
+            "validation",
+            (
+                f"[validation] phase={self.phase_index + 1}/{len(self.plan)} "
+                f"global_step={self.global_step} loss={score['val_loss']:.6f} "
+                f"positive_loss={score['val_positive_loss']:.6f} "
+                f"negative_loss={score['val_negative_loss']:.6f}"
+            ),
+            phase_number=self.phase_index + 1,
+            phase_count=len(self.plan),
+            **score,
+        )
+        for name, metrics in score["validation_sets"].items():
+            message = (
+                f"[validation:{name}] label={metrics['label']} "
+                f"examples={metrics['examples']} loss={metrics['loss']:.6f}"
+            )
+            self._log_event(
+                "validation_set",
+                message,
+                validation_set=name,
+                **metrics,
+            )
 
     def _train_one_step(self, phase_steps: int, learning_rate: float) -> dict[str, float | int]:
         features, labels = self.sampler.next_batch()
@@ -673,11 +732,7 @@ class ResumableAutoTrainer:
             "negative_weight": negative_weight,
         }
 
-    def _advance_phase(self, latest_score: dict[str, float] | None) -> None:
-        target = number(self.ctx.section, "target_false_positives_per_hour", self.ctx.step, 0.5)
-        multiplier = number(self.ctx.section, "negative_weight_multiplier", self.ctx.step, 2.0)
-        if latest_score is not None and latest_score["val_fp_per_hr"] > target:
-            self.current_max_negative_weight *= multiplier
+    def _advance_phase(self) -> None:
         self.phase_index += 1
         self.phase_step = 0
 
@@ -685,18 +740,15 @@ class ResumableAutoTrainer:
         if not self.best_model_states:
             return _cpu_state_dict(self.network)
         scores = self.best_model_scores
-        accuracy_cutoff = float(np.percentile([score["val_accuracy"] for score in scores], 90))
-        recall_cutoff = float(np.percentile([score["val_recall"] for score in scores], 90))
-        fp_cutoff = float(np.percentile([score["val_fp_per_hr"] for score in scores], 10))
+        loss_cutoff = float(np.percentile([score["val_loss"] for score in scores], 10))
         candidates = [
             state
             for state, score in zip(self.best_model_states, scores)
-            if score["val_accuracy"] >= accuracy_cutoff
-            and score["val_recall"] >= recall_cutoff
-            and score["val_fp_per_hr"] <= fp_cutoff
+            if score["val_loss"] <= loss_cutoff
         ]
         if not candidates:
-            candidates = [self.best_model_states[-1]]
+            best = min(range(len(scores)), key=lambda index: scores[index]["val_loss"])
+            candidates = [self.best_model_states[best]]
         averaged: dict[str, torch.Tensor] = {}
         for key in candidates[0]:
             values = [state[key] for state in candidates]
@@ -710,7 +762,7 @@ class ResumableAutoTrainer:
         resumed = self._try_resume() if resume else False
         if not resumed:
             self._seed_everything()
-        latest_score: dict[str, float] | None = None
+        latest_score: dict[str, Any] | None = None
         checkpoint_interval = integer(self.ctx.section, "checkpoint_interval_steps", self.ctx.step, 500)
         log_interval = integer(self.ctx.section, "log_interval_steps", self.ctx.step, 100)
         recent_losses: list[float] = []
@@ -777,18 +829,7 @@ class ResumableAutoTrainer:
                     recent_losses.clear()
                 if completed_phase_index in validation_steps:
                     latest_score = self._validate()
-                    self._log_event(
-                        "validation",
-                        (
-                            f"[validation] phase={self.phase_index + 1}/{len(self.plan)} "
-                            f"global_step={self.global_step} accuracy={latest_score['val_accuracy']:.6f} "
-                            f"recall={latest_score['val_recall']:.6f} val_fp={latest_score['val_n_fp']:.0f} "
-                            f"fp_per_hr={latest_score['val_fp_per_hr']:.6f}"
-                        ),
-                        phase_number=self.phase_index + 1,
-                        phase_count=len(self.plan),
-                        **latest_score,
-                    )
+                    self._log_validation(latest_score)
                 if self.global_step % checkpoint_interval == 0:
                     self._save_checkpoint()
                     self._log_event(
@@ -798,19 +839,8 @@ class ResumableAutoTrainer:
                     )
             if latest_score is None:
                 latest_score = self._validate()
-                self._log_event(
-                    "validation",
-                    (
-                        f"[validation] phase={self.phase_index + 1}/{len(self.plan)} "
-                        f"global_step={self.global_step} accuracy={latest_score['val_accuracy']:.6f} "
-                        f"recall={latest_score['val_recall']:.6f} val_fp={latest_score['val_n_fp']:.0f} "
-                        f"fp_per_hr={latest_score['val_fp_per_hr']:.6f}"
-                    ),
-                    phase_number=self.phase_index + 1,
-                    phase_count=len(self.plan),
-                    **latest_score,
-                )
-            self._advance_phase(latest_score)
+                self._log_validation(latest_score)
+            self._advance_phase()
             self._save_checkpoint()
             self._log_event(
                 "checkpoint",
@@ -847,10 +877,10 @@ class ResumableAutoTrainer:
             "layer_size": payload["layer_size"],
             "model_config": self.model_config,
             "train_blocks": [block.name for block in self.train_blocks],
-            "dev_blocks": [block.name for block in self.dev_blocks],
-            "false_positive_blocks": [block.name for block in self.false_positive_blocks],
+            "validation_blocks": [block.name for block in self.validation_blocks],
             "effective_batch_counts": {block.name: _batch_count(self.ctx, block.name) for block in self.train_blocks},
             "history": dict(self.history),
+            "validation_history": self.validation_history,
             "best_model_scores": self.best_model_scores,
             "training_log_file": str(self.log_path),
             "elapsed_seconds": time.time() - self.started_at,
@@ -871,17 +901,15 @@ class ResumableAutoTrainer:
 
 def run(ctx: Any) -> dict[str, Any]:
     train = _blocks(ctx, "train")
-    dev = _blocks(ctx, "dev")
-    false_positive = _blocks(ctx, "false_positive")
+    validation = _validation_blocks(ctx)
     # The runner makes sure producer stages have completed before this point.
-    unresolved = [block.path for block in [*train, *dev, *false_positive] if not block.path.is_file()]
+    unresolved = [block.path for block in [*train, *validation] if not block.path.is_file()]
     if unresolved:
         raise FileNotFoundError(f"Training feature file(s) are missing: {', '.join(str(path) for path in unresolved)}")
     # Re-read blocks now that preceding feature steps exist and include their shapes.
     train = _blocks(ctx, "train")
-    dev = _blocks(ctx, "dev")
-    false_positive = _blocks(ctx, "false_positive")
-    trainer = ResumableAutoTrainer(ctx, train, dev, false_positive)
+    validation = _validation_blocks(ctx)
+    trainer = ResumableAutoTrainer(ctx, train, validation)
     result = trainer.run(resume=boolean(ctx.section, "resume", ctx.step, True) and not ctx.force)
     if not validate_outputs(ctx):
         raise RuntimeError("Training output validation failed")

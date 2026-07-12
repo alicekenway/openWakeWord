@@ -274,7 +274,9 @@ def run(ctx: Any) -> dict[str, Any]:
                     expected_label,
                     score_config,
                 )
-                temporary_handle.write(json.dumps(detail, sort_keys=True, default=legacy.json_default) + "\n")
+                # Preserve the deliberate field order in the detail record, including
+                # utterance text immediately before the best scoring window.
+                temporary_handle.write(json.dumps(detail, default=legacy.json_default) + "\n")
                 windows = detail.get("sliding_windows", [])
                 duration = float(detail.get("duration_seconds") or 0.0)
                 evaluated += 1

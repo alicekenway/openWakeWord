@@ -1936,6 +1936,12 @@ def evaluate_one_record_scores(
         model_window_seconds=float(config["model_window_seconds"]),
     )
     best_window = max(windows, key=lambda window: float(window["score"])) if windows else None
+    is_background = "background" in set_name.lower() or any(
+        str(record.get(field) or "").lower() == "background" for field in ("source", "subset")
+    )
+    utterance_text = "" if is_background else record.get("text", record.get("sentence", ""))
+    if utterance_text is None:
+        utterance_text = ""
     detail: dict[str, Any] = {
         "set": set_name,
         "index": index,
@@ -1945,13 +1951,13 @@ def evaluate_one_record_scores(
         "input_jsonl": record.get("input_jsonl"),
         "dataset_index": record.get("dataset_index"),
         "subset": evaluation_subset_name(record, set_name),
-        "sentence": record.get("sentence"),
         "expected_label": expected_label,
         "padding_seconds": padding_seconds,
         "chunk_size": chunk_size,
         "frame_seconds": round_metric(chunk_size / sample_rate),
         "model_window_seconds": float(config["model_window_seconds"]),
         "duration_seconds": round_metric(duration_seconds),
+        "text": str(utterance_text),
         "best_window": best_window,
     }
     detail.update(score_summary(scores))
