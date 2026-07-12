@@ -15,22 +15,39 @@ import logging
 from tqdm import tqdm
 import yaml
 from pathlib import Path
+
+# ``acoustics`` still imports scipy.special.sph_harm, which was renamed to
+# sph_harm_y in newer SciPy releases. Keep the training module importable both
+# through the pipeline and as a standalone public module.
+try:
+    if not hasattr(scipy.special, "sph_harm") and hasattr(scipy.special, "sph_harm_y"):
+        def _sph_harm_compat(m, n, theta, phi):
+            return scipy.special.sph_harm_y(n, m, phi, theta)
+
+        scipy.special.sph_harm = _sph_harm_compat
+except Exception:
+    pass
+
 import openwakeword
 from openwakeword.data import generate_adversarial_texts, augment_clips, mmap_batch_generator
 from openwakeword.utils import compute_features_from_generator
 from openwakeword.utils import AudioFeatures
+from openwakeword.models import ConvAttentionWakeWordHead, TemporalCNNWakeWordHead
 
 
 # Base model class for an openwakeword model
 class Model(nn.Module):
     def __init__(self, n_classes=1, input_shape=(16, 96), model_type="dnn",
-                 layer_dim=128, n_blocks=1, seconds_per_example=None):
+                 layer_dim=128, n_blocks=1, seconds_per_example=None,
+                 model_kwargs=None):
         super().__init__()
 
         # Store inputs as attributes
         self.n_classes = n_classes
         self.input_shape = input_shape
         self.seconds_per_example = seconds_per_example
+        self.model_type = model_type
+        self.model_kwargs = dict(model_kwargs or {})
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.best_models = []
         self.best_model_scores = []
@@ -94,6 +111,45 @@ class Model(nn.Module):
                     out, h = self.layer1(x)
                     return self.layer3(self.layer2(out[:, -1]))
             self.model = Net(input_shape, n_classes)
+        elif model_type == "cnn":
+            if n_classes != 1:
+                raise ValueError("The cnn wake-word head currently supports binary classification only")
+            cnn_kwargs = {
+                "input_dim": input_shape[-1],
+                "channels": 128,
+                "expansion": 1,
+                "dropout": 0.05,
+                "kernels": (3, 5, 3, 3),
+                "dilations": (1, 1, 2, 4),
+                "use_se": (False, False, True, True),
+                "classifier_hidden": 64,
+            }
+            cnn_kwargs.update(self.model_kwargs)
+            # The reusable head returns logits as documented. The established
+            # openWakeWord trainer and runtime expect a probability score.
+            self.model = nn.Sequential(TemporalCNNWakeWordHead(**cnn_kwargs), nn.Sigmoid())
+            self.model_kwargs = cnn_kwargs
+        elif model_type == "attention":
+            if n_classes != 1:
+                raise ValueError("The attention wake-word head currently supports binary classification only")
+            attention_kwargs = {
+                "input_dim": input_shape[-1],
+                "time_steps": input_shape[0],
+                "channels": 128,
+                "num_heads": 4,
+                "ff_multiplier": 2,
+                "dropout": 0.05,
+                "expansion": 1,
+                "local_kernels": (3, 3),
+                "local_dilations": (1, 2),
+                "local_use_se": (False, False),
+                "classifier_hidden": 64,
+            }
+            attention_kwargs.update(self.model_kwargs)
+            self.model = nn.Sequential(ConvAttentionWakeWordHead(**attention_kwargs), nn.Sigmoid())
+            self.model_kwargs = attention_kwargs
+        else:
+            raise ValueError(f"Unknown model_type {model_type!r}; use dnn, rnn, cnn, or attention")
 
         # Define metrics
         if n_classes == 1:

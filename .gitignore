@@ -139,6 +139,8 @@ notebooks/
 # Most example files
 examples/
 !examples/audio/activation.wav
+!training_pipline/examples/
+!training_pipline/examples/wakeword_pipeline.ini.example.conf
 
 # archive files
 archive/
