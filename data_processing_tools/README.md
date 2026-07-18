@@ -176,6 +176,40 @@ The tool rewrites legacy audio path fields to one canonical `path`. If
 absolute. `--add-path-field` is retained as a deprecated no-op for older
 command lines.
 
+## Silero VAD Trim With Slurm Arrays
+
+For a large JSONL, choose the number of VAD array tasks. The tool divides the
+non-empty JSONL records as evenly as possible between them:
+
+```bash
+export VAD_SLURM_ARRAY_TASKS=50
+
+python data_processing_tools/trim_jsonl_silero_vad_slurm.py \
+  --input-jsonl /path/to/input.jsonl \
+  --audio-base-dir /path/to/audio \
+  --output-dir /path/to/trimmed \
+  --sbatch-args "--partition=gpu --gres=gpu:1 --cpus-per-task=4" \
+  --workers 4
+```
+
+The command writes small shard JSONLs under
+`output-dir/.slurm_vad/<run-id>/shards/`, submits an `sbatch` array, then
+submits a merge job with `afterok` dependency. The merge writes the usual
+`output-dir/metadata.jsonl` and `metadata.summary.json`; it runs only when all
+array tasks succeed. Trimmed audio is stored under `output-dir/wav/<task-id>/`.
+
+Use `--array-tasks N` to override the environment variable for one run. If the
+requested task count exceeds the number of records, the tool creates one task
+per record. Use
+`--prepare-only` to inspect the generated shard manifests and batch scripts
+without submitting, or `--no-merge-job` to submit only the array and later run
+the merge explicitly:
+
+```bash
+python data_processing_tools/trim_jsonl_silero_vad_slurm.py \
+  --merge-spec /path/to/trimmed/.slurm_vad/<run-id>/spec.json
+```
+
 ## JSONL Audio To WAV
 
 Convert audio referenced by a metadata JSONL file into a `wav/` folder and
