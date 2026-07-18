@@ -120,6 +120,89 @@ def _fbank_config(
     }
 
 
+def _complete_model_dimensions(
+    configs: dict[str, Any], *, config_file: Path, checkpoint: Path
+) -> None:
+    """Fill dimensions that WeNet adds to the YAML during training.
+
+    A recipe YAML normally only describes the feature extractor and tokenizer.
+    WeNet's training setup turns those settings into ``input_dim`` and
+    ``output_dim`` before it saves the runtime YAML beside each checkpoint.
+    ``init_model`` requires the completed values, so an exporter that also
+    accepts the original recipe needs to perform the same completion.
+    """
+
+    sources: dict[str, str] = {}
+    sidecar_path = checkpoint.with_suffix(".yaml")
+    sidecar: dict[str, Any] = {}
+    if sidecar_path.is_file():
+        with sidecar_path.open("r", encoding="utf-8") as handle:
+            loaded = yaml.load(handle, Loader=yaml.FullLoader)
+        if isinstance(loaded, dict):
+            sidecar = loaded
+
+    for name in ("input_dim", "output_dim", "vocab_size"):
+        if name not in configs and name in sidecar:
+            configs[name] = sidecar[name]
+            sources[name] = str(sidecar_path)
+
+    if "input_dim" not in configs:
+        dataset = configs.get("dataset_conf")
+        if isinstance(dataset, dict):
+            for feature_name in ("fbank_conf", "log_mel_spectrogram_conf", "mfcc_conf"):
+                feature = dataset.get(feature_name)
+                if isinstance(feature, dict) and "num_mel_bins" in feature:
+                    configs["input_dim"] = feature["num_mel_bins"]
+                    sources["input_dim"] = f"dataset_conf.{feature_name}.num_mel_bins"
+                    break
+
+    if "output_dim" not in configs and "vocab_size" in configs:
+        configs["output_dim"] = configs["vocab_size"]
+        sources["output_dim"] = "vocab_size"
+
+    # Old checkpoints may not have a YAML sidecar.  For character/BPE recipes,
+    # the symbol table is the same vocabulary used to construct the CTC head.
+    if "output_dim" not in configs:
+        tokenizer = configs.get("tokenizer_conf")
+        symbol_table_value = tokenizer.get("symbol_table_path") if isinstance(tokenizer, dict) else None
+        if symbol_table_value:
+            symbol_table = Path(symbol_table_value).expanduser()
+            if not symbol_table.is_absolute():
+                symbol_table = config_file.parent / symbol_table
+            if symbol_table.is_file():
+                with symbol_table.open("r", encoding="utf-8") as handle:
+                    vocab_size = sum(1 for line in handle if line.strip())
+                configs["output_dim"] = vocab_size
+                sources["output_dim"] = str(symbol_table)
+
+    missing = [name for name in ("input_dim", "output_dim") if name not in configs]
+    if missing:
+        names = ", ".join(missing)
+        raise ValueError(
+            f"WeNet config is missing {names}. Use the completed train/epoch YAML "
+            f"saved beside the checkpoint, or provide feature and tokenizer settings "
+            f"that allow the exporter to infer them."
+        )
+
+    for name in ("input_dim", "output_dim"):
+        try:
+            value = int(configs[name])
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"WeNet config {name} must be a positive integer") from error
+        if value < 1:
+            raise ValueError(f"WeNet config {name} must be a positive integer")
+        configs[name] = value
+        if name in sources:
+            print(f"Inferred {name}={value} from {sources[name]}")
+
+    if "vocab_size" in configs and int(configs["vocab_size"]) != configs["output_dim"]:
+        raise ValueError(
+            "WeNet config output_dim and vocab_size disagree: "
+            f"{configs['output_dim']} != {configs['vocab_size']}"
+        )
+    configs.setdefault("vocab_size", configs["output_dim"])
+
+
 def _onnx_names(path: Path) -> tuple[set[str], set[str]]:
     model = onnx.load(str(path), load_external_data=False)
     initializer_names = {item.name for item in model.graph.initializer}
@@ -305,6 +388,9 @@ def main() -> None:
 
     with config_file.open("r", encoding="utf-8") as handle:
         configs = yaml.load(handle, Loader=yaml.FullLoader)
+    if not isinstance(configs, dict):
+        raise ValueError(f"WeNet config must contain a YAML mapping: {config_file}")
+    _complete_model_dimensions(configs, config_file=config_file, checkpoint=checkpoint)
     torch_model, configs = init_model(args, configs)
     torch_model = torch_model.cpu().eval()
 
