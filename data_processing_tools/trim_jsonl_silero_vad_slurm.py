@@ -346,6 +346,20 @@ def final_audio_path(path_value: str, output_jsonl: Path, *, absolute_paths: boo
         return str(path)
 
 
+def cleanup_shard_jsonls(tasks: list[dict[str, Any]]) -> int:
+    """Remove temporary task manifests only after a successful final merge."""
+
+    removed = 0
+    for task in tasks:
+        output_jsonl = Path(str(task["output_jsonl"])).resolve()
+        input_jsonl = Path(str(task["input_jsonl"])).resolve()
+        for path in (input_jsonl, output_jsonl, output_jsonl.with_suffix(".summary.json")):
+            if path.exists():
+                path.unlink()
+                removed += 1
+    return removed
+
+
 def merge_spec(spec_path: Path) -> dict[str, Any]:
     spec = read_json(spec_path)
     output_jsonl = Path(str(spec["output_jsonl"])).resolve()
@@ -419,6 +433,8 @@ def merge_spec(spec_path: Path) -> dict[str, Any]:
             "work_dir": str(spec_path.parent),
         },
     }
+    write_json(output_jsonl.with_suffix(".summary.json"), summary)
+    summary["slurm"]["temporary_shard_jsonls_removed"] = cleanup_shard_jsonls(tasks)
     write_json(output_jsonl.with_suffix(".summary.json"), summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     return summary

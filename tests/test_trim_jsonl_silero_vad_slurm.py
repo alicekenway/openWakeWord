@@ -62,6 +62,8 @@ def test_merge_rewrites_internal_absolute_paths_for_final_manifest(tmp_path: Pat
     work_dir = output_dir / ".slurm_vad" / "test-run"
     first_jsonl = work_dir / "shards" / "00000" / "output.jsonl"
     second_jsonl = work_dir / "shards" / "00001" / "output.jsonl"
+    first_input = work_dir / "shards" / "00000" / "input.jsonl"
+    second_input = work_dir / "shards" / "00001" / "input.jsonl"
     output_jsonl = output_dir / "metadata.jsonl"
     first_audio = output_dir / "wav" / "00000" / "first.wav"
     second_audio = output_dir / "wav" / "00001" / "second.wav"
@@ -73,6 +75,8 @@ def test_merge_rewrites_internal_absolute_paths_for_final_manifest(tmp_path: Pat
         second_jsonl,
         [{"path": str(second_audio), "_vad_slurm_index": 0, "text": "first in source"}],
     )
+    slurm_trim.write_jsonl(first_input, [{"path": "first.wav"}])
+    slurm_trim.write_jsonl(second_input, [{"path": "second.wav"}])
     for path in (first_jsonl, second_jsonl):
         slurm_trim.write_json(
             path.with_suffix(".summary.json"),
@@ -113,8 +117,8 @@ def test_merge_rewrites_internal_absolute_paths_for_final_manifest(tmp_path: Pat
                 "absolute_paths": False,
             },
             "tasks": [
-                {"id": 0, "output_jsonl": str(first_jsonl)},
-                {"id": 1, "output_jsonl": str(second_jsonl)},
+                {"id": 0, "input_jsonl": str(first_input), "output_jsonl": str(first_jsonl)},
+                {"id": 1, "input_jsonl": str(second_input), "output_jsonl": str(second_jsonl)},
             ],
         },
     )
@@ -127,6 +131,13 @@ def test_merge_rewrites_internal_absolute_paths_for_final_manifest(tmp_path: Pat
     assert all("_vad_slurm_index" not in record for record in merged)
     assert summary["written_rows"] == 2
     assert summary["removed_duration_seconds"] == 1.0
+    assert summary["slurm"]["temporary_shard_jsonls_removed"] == 6
+    assert not first_jsonl.exists()
+    assert not second_jsonl.exists()
+    assert not first_jsonl.with_suffix(".summary.json").exists()
+    assert not second_jsonl.with_suffix(".summary.json").exists()
+    assert not first_input.exists()
+    assert not second_input.exists()
 
 
 def test_split_caps_array_tasks_at_the_number_of_records(tmp_path: Path) -> None:

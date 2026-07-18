@@ -196,7 +196,9 @@ The command writes small shard JSONLs under
 `output-dir/.slurm_vad/<run-id>/shards/`, submits an `sbatch` array, then
 submits a merge job with `afterok` dependency. The merge writes the usual
 `output-dir/metadata.jsonl` and `metadata.summary.json`; it runs only when all
-array tasks succeed. Trimmed audio is stored under `output-dir/wav/<task-id>/`.
+array tasks succeed. After a successful merge it removes the temporary shard
+input/output JSONLs and their summaries, while retaining trimmed audio under
+`output-dir/wav/<task-id>/` plus the Slurm logs and job spec for inspection.
 
 Use `--array-tasks N` to override the environment variable for one run. If the
 requested task count exceeds the number of records, the tool creates one task
