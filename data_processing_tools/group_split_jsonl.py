@@ -12,7 +12,7 @@ from typing import Any
 
 
 REST_TOKENS = {"*", "all", "rest", "remaining"}
-AUDIO_PATH_KEYS = ["path", "audiofile_path", "audio_file", "audio_path", "file", "filename"]
+AUDIO_PATH_KEYS = ["path", "audiofile_path", "audio_file", "audio_path", "file", "filename", "audio_filepath"]
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
