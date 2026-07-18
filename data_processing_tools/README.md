@@ -12,6 +12,52 @@ Readers still accept legacy aliases such as `audiofile_path`, but any tool that
 creates new audio (conversion, VAD trimming, or augmentation) replaces the old
 audio reference instead of retaining source-path copies.
 
+## Wake Words To Phoneme Keyword Tokens
+
+Create the token-only keyword JSON used by the WeNet CTC-WAC feature stages:
+
+```bash
+python data_processing_tools/wakewords_to_keyword_tokens.py \
+  --wakewords /path/to/wakewords.txt \
+  --phoneme-dict /path/to/wakeword_phonemes.txt \
+  --tokens /path/to/tokens.txt \
+  --output-json /path/to/wenet_ctc_keyword_tokens.json
+```
+
+The wake-word file contains one phrase per non-empty line:
+
+```text
+hey frank
+hello lynn
+```
+
+The pronunciation dictionary must use a tab between the phrase and its
+space-separated phonemes:
+
+```text
+hey frank<TAB>HH EY F R AE NG K
+hello lynn<TAB>HH AH L OW L IH N
+```
+
+Here `<TAB>` represents one actual tab character, not the literal text
+`<TAB>`.
+
+The WeNet token table accepts a space or tab before each integer ID:
+
+```text
+<blank> 0
+<unk> 1
+HH 10
+EY 11
+```
+
+Wake-word lookup ignores letter case and repeated whitespace unless
+`--case-sensitive` is supplied. Phoneme tokens always match exactly. The tool
+stops with an error if a phrase has no pronunciation, a phoneme is missing
+from the token table, or an input mapping is ambiguous. The output deliberately
+has no `threshold`; use it as `keyword_tokens` during feature generation, then
+maintain stage-1 thresholds separately in the training/testing keyword JSON.
+
 ## Common Voice TSV To JSONL
 
 Convert all rows:
