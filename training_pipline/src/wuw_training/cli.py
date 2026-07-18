@@ -9,6 +9,7 @@ from typing import Sequence
 
 from .config import ConfigurationError, load_ini_config
 from .runner import PipelineRunner
+from .slurm import run_worker
 
 
 def _force_steps(values: list[str] | None) -> set[str]:
@@ -38,12 +39,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subcommands.add_parser("status", help="Show completion/staleness for each configured stage")
     status.add_argument("--config", required=True, help="INI configuration file")
+
+    worker = subcommands.add_parser("__slurm-worker", help=argparse.SUPPRESS)
+    worker.add_argument("--config", required=True, help=argparse.SUPPRESS)
+    worker.add_argument("--config-root", required=True, help=argparse.SUPPRESS)
+    worker.add_argument("--spec", required=True, help=argparse.SUPPRESS)
+    worker.add_argument("--task-id", required=True, type=int, help=argparse.SUPPRESS)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "__slurm-worker":
+            result = run_worker(
+                config_path=args.config,
+                config_root=args.config_root,
+                spec_path=args.spec,
+                task_id=args.task_id,
+            )
+            print(json.dumps(result, indent=2, sort_keys=True, default=str))
+            return 0
         runner = PipelineRunner(load_ini_config(args.config))
         if args.command == "validate":
             plan = runner.validate()

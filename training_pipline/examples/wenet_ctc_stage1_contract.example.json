@@ -1,0 +1,47 @@
+{
+  "sample_rate": 16000,
+  "fbank": {
+    "num_mel_bins": 80,
+    "frame_length_ms": 25.0,
+    "frame_shift_ms": 10.0,
+    "dither": 0.0
+  },
+  "chunk_frames": 67,
+  "chunk_stride_frames": 64,
+  "minimum_input_frames": 7,
+  "pad_final_chunk": false,
+  "initial_offset": 64,
+  "blank_id": 0,
+  "input_layout": "BTF",
+  "inputs": {
+    "features": "chunk",
+    "offset": "offset"
+  },
+  "outputs": {
+    "encoder": "encoder_out",
+    "ctc_log_probs": "ctc_log_probs"
+  },
+  "ctc_output_is_log_probs": true,
+  "constant_inputs": {
+    "required_cache_size": 64
+  },
+  "attention_mask": {
+    "input": "att_mask",
+    "cache_frames": 64,
+    "chunk_frames": 16
+  },
+  "cache_inputs": [
+    {
+      "input": "att_cache",
+      "output": "next_att_cache",
+      "shape": [12, 4, 64, 128],
+      "dtype": "float32"
+    },
+    {
+      "input": "cnn_cache",
+      "output": "next_cnn_cache",
+      "shape": [12, 1, 256, 14],
+      "dtype": "float32"
+    }
+  ]
+}

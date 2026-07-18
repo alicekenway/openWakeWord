@@ -1,0 +1,16 @@
+{
+  "keywords": [
+    {
+      "id": "hey_frank",
+      "display_text": "hey frank",
+      "token_ids": [101, 205, 309],
+      "threshold": -1.7
+    },
+    {
+      "id": "hello_lynn",
+      "display_text": "hello lynn",
+      "token_ids": [104, 88, 412],
+      "threshold": -1.8
+    }
+  ]
+}

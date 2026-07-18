@@ -16,7 +16,12 @@ class StageContext:
     experiment_dir: Path
     work_dir: Path
     force: bool = False
+    execution_role: str = "controller"
 
     @property
     def section_name(self) -> str:
         return self.step
+
+    @property
+    def is_slurm_worker(self) -> bool:
+        return self.execution_role == "slurm_worker"

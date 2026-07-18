@@ -13,6 +13,7 @@ from .artifacts import file_signature, hash_payload, read_json, write_json
 from .checkpoints import CheckpointManager, step_slug
 from .config import ConfigurationError, IniConfig, parse_csv
 from .context import StageContext
+from .slurm import SlurmExecutor, execution_mode
 from .stages import StageHandler, handler_for_step
 
 
@@ -46,6 +47,8 @@ class PipelineRunner:
             else self.experiment_dir / "pipeline_state"
         )
         self.manager = CheckpointManager(self.checkpoint_dir)
+        self.execution_mode = execution_mode(self.config)
+        self.slurm = SlurmExecutor(self.config) if self.execution_mode == "slurm" else None
         self._planned: list[PlannedStep] | None = None
 
     def steps(self) -> list[str]:
@@ -69,6 +72,7 @@ class PipelineRunner:
             experiment_dir=self.experiment_dir,
             work_dir=self.experiment_dir / ".pipeline_work" / step_slug(step),
             force=force,
+            execution_role="slurm_controller" if self.execution_mode == "slurm" else "controller",
         )
 
     def plan(self) -> list[PlannedStep]:
@@ -117,6 +121,8 @@ class PipelineRunner:
 
     def validate(self) -> list[PlannedStep]:
         planned = self.plan()
+        if self.slurm is not None:
+            self.slurm.validate(planned)
         return planned
 
     def _input_signature(self, item: PlannedStep) -> dict[str, Any]:
@@ -232,7 +238,17 @@ class PipelineRunner:
             started = time.time()
             print(f"\n### {item.name}", flush=True)
             try:
-                result = item.handler.run(ctx)
+                if self.slurm is not None:
+                    result = self.slurm.run_stage(
+                        name=item.name,
+                        handler=item.handler,
+                        ctx=ctx,
+                        fingerprint=fingerprint,
+                        input_signature=input_signature,
+                        force=force,
+                    )
+                else:
+                    result = item.handler.run(ctx)
                 if not item.handler.validate_outputs(ctx):
                     raise RuntimeError(f"Stage output validation failed: {item.name}")
                 self.manager.mark_complete(

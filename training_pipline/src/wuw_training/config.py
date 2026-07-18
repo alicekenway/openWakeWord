@@ -39,10 +39,19 @@ class IniConfig:
 
     path: Path
     parser: configparser.ConfigParser
+    base_dir: Path | None = None
 
     @property
     def root(self) -> Path:
-        return self.path.parent
+        """Directory used to resolve relative paths.
+
+        Slurm workers read an immutable copy of the submitted configuration
+        from the experiment work directory.  Keeping the original directory
+        separately lets that copy retain the same relative-path semantics as
+        the user's source INI file.
+        """
+
+        return self.base_dir or self.path.parent
 
     def has_section(self, name: str) -> bool:
         return self.parser.has_section(name)
@@ -120,7 +129,7 @@ class IniConfig:
             output.write(handle)
 
 
-def load_ini_config(path: str | Path) -> IniConfig:
+def load_ini_config(path: str | Path, *, base_dir: str | Path | None = None) -> IniConfig:
     config_path = Path(path).expanduser().resolve()
     if not config_path.is_file():
         raise ConfigurationError(f"Configuration file does not exist: {config_path}")
@@ -135,7 +144,8 @@ def load_ini_config(path: str | Path) -> IniConfig:
             parser.read_file(handle)
     except (OSError, configparser.Error) as exc:
         raise ConfigurationError(f"Could not read INI configuration {config_path}: {exc}") from exc
-    return IniConfig(path=config_path, parser=parser)
+    resolved_base = Path(base_dir).expanduser().resolve() if base_dir is not None else None
+    return IniConfig(path=config_path, parser=parser, base_dir=resolved_base)
 
 
 def ensure_known_options(section: str, values: dict[str, str], allowed: Iterable[str], *, prefixes: Iterable[str] = ()) -> None:

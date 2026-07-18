@@ -16,6 +16,18 @@ class StageHandler:
     output_paths: Callable[[Any], list[Path]]
     validate_outputs: Callable[[Any], bool]
     run: Callable[[Any], dict[str, Any]]
+    distributed: "DistributedStageHandler | None" = None
+
+
+@dataclass(frozen=True)
+class DistributedStageHandler:
+    """Stage-specific pieces needed by the Slurm job-array backend."""
+
+    prepare: Callable[[Any, Path, int], list[dict[str, Any]]]
+    run_shard: Callable[[Any, dict[str, Any]], dict[str, Any]]
+    validate_shard: Callable[[Any, dict[str, Any]], bool]
+    merge: Callable[[Any, list[dict[str, Any]]], dict[str, Any]]
+    cleanup: Callable[[list[dict[str, Any]]], None]
 
 
 HANDLERS: dict[str, StageHandler] = {
@@ -25,6 +37,13 @@ HANDLERS: dict[str, StageHandler] = {
         augment.output_paths,
         augment.validate_outputs,
         augment.run,
+        DistributedStageHandler(
+            augment.prepare_slurm_shards,
+            augment.run_slurm_shard,
+            augment.validate_slurm_shard,
+            augment.merge_slurm_shards,
+            augment.cleanup_slurm_shards,
+        ),
     ),
     "feature": StageHandler(
         feature.validate,
@@ -32,6 +51,13 @@ HANDLERS: dict[str, StageHandler] = {
         feature.output_paths,
         feature.validate_outputs,
         feature.run,
+        DistributedStageHandler(
+            feature.prepare_slurm_shards,
+            feature.run_slurm_shard,
+            feature.validate_slurm_shard,
+            feature.merge_slurm_shards,
+            feature.cleanup_slurm_shards,
+        ),
     ),
     "train": StageHandler(
         train.validate,
@@ -53,6 +79,13 @@ HANDLERS: dict[str, StageHandler] = {
         testing.output_paths,
         testing.validate_outputs,
         testing.run,
+        DistributedStageHandler(
+            testing.prepare_slurm_shards,
+            testing.run_slurm_shard,
+            testing.validate_slurm_shard,
+            testing.merge_slurm_shards,
+            testing.cleanup_slurm_shards,
+        ),
     ),
     "summary": StageHandler(
         summary.validate,

@@ -866,8 +866,9 @@ def command_augment_audio(args: argparse.Namespace) -> None:
         "overwrite": args.overwrite or force_output_overwrite,
     }
     workers = max(1, args.workers)
+    index_offset = int(getattr(args, "index_offset", 0) or 0)
     tasks = (
-        (round_ndx, ndx, record)
+        (round_ndx, index_offset + ndx, record)
         for round_ndx in range(args.rounds)
         for ndx, record in enumerate(input_records)
     )
@@ -905,6 +906,7 @@ def command_augment_audio(args: argparse.Namespace) -> None:
             "placement_counts": input_placement_counts,
             "input_signature": input_signature,
             "workers": workers,
+            "index_offset": index_offset,
             "errors": errors[:50],
             "error_count": len(errors),
         },
@@ -1065,9 +1067,11 @@ def command_generate_features(args: argparse.Namespace) -> None:
             },
         )
 
+    index_offset = int(getattr(args, "index_offset", 0) or 0)
+
     def feature_load_items(start: int, batch_items: list[tuple[Path, str]]) -> list[tuple[int, Path, int, str, int, int]]:
         return [
-            (start + offset, path, target_samples, placement, args.sample_rate, args.seed)
+            (index_offset + start + offset, path, target_samples, placement, args.sample_rate, args.seed)
             for offset, (path, placement) in enumerate(batch_items)
         ]
 
@@ -1155,6 +1159,7 @@ def command_generate_features(args: argparse.Namespace) -> None:
             "placement_counts": input_placement_counts,
             "errors": errors[:50],
             "error_count": error_count,
+            "index_offset": index_offset,
         },
     )
     if progress_path.exists():
@@ -3293,7 +3298,7 @@ def main() -> None:
     # argparse tree.  This keeps all existing low-level commands compatible
     # while making `run`, `run-step`, `validate`, and `status` the new public
     # orchestration interface.
-    if len(sys.argv) > 1 and sys.argv[1] in {"run", "run-step", "validate", "status"}:
+    if len(sys.argv) > 1 and sys.argv[1] in {"run", "run-step", "validate", "status", "__slurm-worker"}:
         from wuw_training.cli import main as ini_main
 
         raise SystemExit(ini_main(sys.argv[1:]))

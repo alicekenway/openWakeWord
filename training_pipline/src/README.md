@@ -9,8 +9,18 @@ The modular pipeline uses Python's `configparser` and runs the exact ordered
 list in `[steps]`. JSONL paths are specified directly in `augment.*`,
 `feature.*`, and `testing.*` blocks; `data.json` is not required.
 
-Start from [wakeword_pipeline.ini.example.conf](../examples/wakeword_pipeline.ini.example.conf)
-and the design notes in [INI_PIPELINE_PLAN.md](../INI_PIPELINE_PLAN.md).
+Choose the example that matches your model and execution environment:
+
+- [local_wuw.ini.example.conf](../examples/local_wuw.ini.example.conf):
+  standard openWakeWord model on one machine.
+- [slurm_wuw.ini.example.conf](../examples/slurm_wuw.ini.example.conf):
+  standard openWakeWord model with Slurm arrays.
+- [local_ctc_wuw.ini.example.conf](../examples/local_ctc_wuw.ini.example.conf):
+  WeNet CTC + WAC two-stage model on one machine.
+- [slurm_ctc_wuw.ini.example.conf](../examples/slurm_ctc_wuw.ini.example.conf):
+  WeNet CTC + WAC two-stage model with Slurm arrays.
+
+See also the design notes in [INI_PIPELINE_PLAN.md](../INI_PIPELINE_PLAN.md).
 
 ```bash
 PYTHON=/home/alicekenway/miniconda3/envs/openwake/bin/python
@@ -27,6 +37,53 @@ Use `--from`, `--to`, or repeat `--force <stage>` with `run` to control a
 partial rerun. Pipeline completion files and model-training checkpoints are
 separate. The former JSON end-to-end commands remain below for compatibility
 but are deprecated for new work.
+
+### Slurm mode
+
+Set `[main] execution_mode = slurm` to submit the same INI pipeline to Slurm.
+The submission host prepares each stage, waits for it to finish, and only then
+starts the next one. `augment.*`, `feature.*`, and `testing.*` use a Slurm job
+array; `train`, `export`, and `summary` use one Slurm job.
+
+Each listed stage needs a matching resource section. `sbatch_args` is passed
+as arguments to `sbatch`, so normal settings such as `--mem`, `--gres`, and
+`--partition` work directly.
+
+```ini
+[main]
+execution_mode = slurm
+
+[slurm]
+sbatch_command = sbatch
+squeue_command = squeue
+python_executable = /path/to/openwake/bin/python
+setup_commands =
+    module load cuda
+
+[slurm.feature.positive_train]
+tasks = 16
+sbatch_args = --partition=gpu --mem=24G --gres=gpu:1 --cpus-per-task=4
+
+[slurm.train]
+sbatch_args = --partition=gpu --mem=48G --gres=gpu:1
+```
+
+The controller writes generated scripts, logs, and per-task state beneath
+`<experiment_dir>/.pipeline_work/<stage>/slurm/`. If one array task fails, it
+waits for all sibling tasks, reports every failed/missing task, and stops the
+pipeline. On the next run, completed shard outputs are reused and only failed
+or missing tasks are submitted. Once a stage merges successfully, its large
+temporary shard outputs are removed while final artifacts, task metadata, and
+logs remain.
+
+If `tasks` is greater than the number of input records, the pipeline submits
+one task per record instead and records both requested and actual counts in
+the stage result.
+
+Slurm workers must be able to see the repository, the source/configuration
+paths, model assets, and experiment directory. The default worker Python is
+the Python used to start the controller; set `python_executable` and optional
+trusted `setup_commands` when compute nodes need a different environment.
 
 ### INI section contracts
 
@@ -77,6 +134,92 @@ Only genuine lists use JSON syntax within the INI, for example
 `input_jsonl = ["original.jsonl", "${augment.positive_train:output_manifest}"]`.
 Shared values are referenced explicitly with `${section:option}`; INI sections
 do not inherit values implicitly.
+
+### Optional: WeNet CTC + WAC two-stage wake word
+
+There is an opt-in pipeline for the design we discussed:
+
+1. A frozen WeNet CTC model is stage 1. It gives a CTC keyword score and an
+   encoder feature for each audio window.
+2. A small WAC-like model is stage 2. It receives the encoder feature, the
+   length-normalized CTC score, the top-one minus top-two margin, and a one-hot
+   value saying which wake word won in stage 1.
+
+Stage 1 and stage 2 are trained separately. This repository does **not** train
+the CTC model; fine-tune and export it with WeNet. The feature stage saves all
+audio rows. The `[train] structure = ctc_wac` step applies each wake word's
+manual stage-1 threshold later, immediately before training the WAC model.
+That means you can tune a threshold and retrain stage 2 without rerunning the
+expensive CTC model.
+
+Start with
+[local_ctc_wuw.ini.example.conf](../examples/local_ctc_wuw.ini.example.conf)
+or [slurm_ctc_wuw.ini.example.conf](../examples/slurm_ctc_wuw.ini.example.conf),
+[wenet_ctc_stage1_contract.example.json](../examples/wenet_ctc_stage1_contract.example.json),
+the stable [wenet_ctc_keyword_tokens.example.json](../examples/wenet_ctc_keyword_tokens.example.json),
+and [wenet_ctc_keywords.example.json](../examples/wenet_ctc_keywords.example.json).
+
+Export stage 1 with the WUW exporter. It creates the FP32 model, INT8 model,
+and matching contract together:
+
+```bash
+python wenet_export/export-onnx-streaming.py \
+  --checkpoint /path/to/wenet/final.pt \
+  --config /path/to/wenet/train.yaml \
+  --output-dir /path/to/stage1-export \
+  --output-prefix stage1-wuw \
+  --chunk-size 16 \
+  --left-chunks 4
+```
+
+The generated `stage1-wuw.contract.json` is a small description of the ONNX
+interface. It tells the pipeline which tensor is the fbank input, encoder
+feature, CTC output, attention mask, and streaming cache. It also records the
+fbank and overlapping-window settings. Normally, do not write or edit this
+file yourself; point the pipeline INI at the file created by the exporter.
+The example contract is only there to make the format easy to inspect.
+
+The code does not assume BPE or phonemes. Put the correct `token_ids` for each
+wake word in the keyword JSON. For a BPE/character CTC model, use its
+BPE/character IDs. For a phoneme CTC model, use phone IDs.
+
+The example deliberately has two keyword files. Feature blocks use
+`keyword_tokens`, which contains only the fixed ids/text/token IDs. Train and
+test blocks use `keywords`, which adds the manual threshold for each wake
+word. Keep their ids and token IDs identical. With this split, changing only a
+threshold invalidates train/export/test, not the expensive feature stage. A
+feature block may instead use `keywords` directly for a simpler first setup,
+but then a threshold edit will make the normal pipeline cache re-run feature
+generation too.
+
+If you use some other ONNX exporter, you must create its contract manually.
+The example is a template, not a universal WeNet interface. For example, a
+cache entry looks like this:
+
+```json
+{
+  "input": "att_cache",
+  "output": "new_att_cache",
+  "shape": [12, 4, 64, 128],
+  "dtype": "float32"
+}
+```
+
+The `shape` is the initial cache shape used by that specific graph. If an input
+such as `required_cache_size` is not in the graph, do not put it in
+`constant_inputs`. Run one short feature block first: it will report a clear
+missing input/output name rather than silently using the wrong tensor.
+
+An `onnx.int8` stage-1 model is fine if it is a normal QDQ-style ONNX model:
+the external fbank input, `encoder` output, and `ctc_log_probs` output must be
+floating tensors. Do not expose only an int8 encoder tensor. The stage-2
+classifier needs the real dequantized encoder values, and feature extraction
+and evaluation should use the same stage-1 ONNX file.
+
+The CTC-WAC evaluator runs both ONNX files. It reports the stage-1 candidate
+rate, the final false-accept/false-reject threshold sweep, candidate counts by
+winning wake word, and real-time factor. It keeps a fixed encoder history with
+the same frame count used in stage-2 training.
 
 ### CNN and attention model choices
 
