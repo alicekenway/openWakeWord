@@ -172,8 +172,9 @@ python /home/alicekenway/Dev/project/WUW/openWakeWord/data_processing_tools/grou
 ```
 
 The tool rewrites legacy audio path fields to one canonical `path`. If
-`--audio-base-dir` is supplied, that path is absolute. `--add-path-field` is
-retained as a deprecated no-op for older command lines.
+`--audio-base-dir` (or its alias `--audio-base-path`) is supplied, that path is
+absolute. `--add-path-field` is retained as a deprecated no-op for older
+command lines.
 
 ## JSONL Audio To WAV
 

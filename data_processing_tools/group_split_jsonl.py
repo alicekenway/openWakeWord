@@ -162,6 +162,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--audio-base-dir",
+        "--audio-base-path",
+        dest="audio_base_dir",
         help="Resolve relative audio paths against this directory and write absolute paths to the split JSONL files.",
     )
     parser.add_argument(
