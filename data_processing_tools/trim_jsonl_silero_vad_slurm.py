@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Submit Slurm-array Silero VAD trimming jobs for a JSONL manifest.
+"""Run Slurm-array Silero VAD trimming and merge its JSONL shards.
 
 Each array task runs the existing ``trim_jsonl_silero_vad.py`` behavior over
-one small manifest.  A dependent merge job combines successful shard manifests
-into the normal output JSONL after the array completes.
+one small manifest.  The controller waits for the complete array with
+``sbatch --wait`` and merges successful shards itself.  No dependent merge job
+is submitted, so an array failure cannot leave one pending indefinitely.
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ RESERVED_SBATCH_OPTIONS = {
     "-a",
     "--dependency",
     "-d",
+    "--wait",
+    "-W",
     "--parsable",
     "--job-name",
     "-J",
@@ -211,44 +214,48 @@ def prepare_spec(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
     return spec_path, spec
 
 
-def write_batch_scripts(spec_path: Path, args: argparse.Namespace) -> tuple[Path, Path]:
+def write_batch_script(spec_path: Path, args: argparse.Namespace) -> Path:
     work_dir = spec_path.parent
     python = str(Path(args.python).expanduser().resolve()) if args.python else sys.executable
     if not Path(python).is_file():
         raise FileNotFoundError(f"Python executable does not exist: {python}")
     array_script = work_dir / "run_array_task.sh"
-    merge_script = work_dir / "merge.sh"
     command = " ".join(shlex.quote(value) for value in (python, str(SCRIPT_PATH), "--worker-spec", str(spec_path)))
     array_script.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         f'exec {command} --task-id "${{SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID is required}}"\n',
         encoding="utf-8",
     )
-    merge_command = " ".join(shlex.quote(value) for value in (python, str(SCRIPT_PATH), "--merge-spec", str(spec_path)))
-    merge_script.write_text("#!/usr/bin/env bash\nset -euo pipefail\nexec " + merge_command + "\n", encoding="utf-8")
     array_script.chmod(0o700)
-    merge_script.chmod(0o700)
-    return array_script, merge_script
+    return array_script
 
 
-def submit_sbatch(command: list[str]) -> tuple[str, str]:
+def submit_sbatch_wait(command: list[str]) -> tuple[str, str]:
     try:
         result = subprocess.run(command, text=True, capture_output=True, check=False)
     except FileNotFoundError as exc:
         raise RuntimeError(f"Cannot submit Slurm job; command not found: {command[0]}") from exc
     if result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
-        raise RuntimeError(f"sbatch submission failed: {message}")
+        details = [f"exit code {result.returncode}"]
+        if result.stdout.strip():
+            details.append(f"stdout: {result.stdout.strip()}")
+        if result.stderr.strip():
+            details.append(f"stderr: {result.stderr.strip()}")
+        raise RuntimeError("Slurm VAD array failed while sbatch --wait was waiting; " + "; ".join(details))
     match = re.search(r"(\d+)", result.stdout)
     if match is None:
         raise RuntimeError(f"Cannot determine Slurm job id from sbatch output: {result.stdout!r}")
     return match.group(1), result.stdout.strip()
 
 
-def submit_jobs(spec_path: Path, spec: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+def submit_and_merge(
+    spec_path: Path,
+    spec: dict[str, Any],
+    args: argparse.Namespace,
+    array_script: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if shutil.which(args.sbatch) is None and not Path(args.sbatch).is_file():
         raise RuntimeError(f"Cannot submit Slurm job; sbatch command not found: {args.sbatch}")
-    array_script, merge_script = write_batch_scripts(spec_path, args)
     work_dir = spec_path.parent
     logs_dir = work_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -256,6 +263,7 @@ def submit_jobs(spec_path: Path, spec: dict[str, Any], args: argparse.Namespace)
     array_command = [
         args.sbatch,
         *common_args,
+        "--wait",
         "--parsable",
         f"--job-name={args.job_name}",
         f"--array=0-{len(spec['tasks']) - 1}",
@@ -263,38 +271,15 @@ def submit_jobs(spec_path: Path, spec: dict[str, Any], args: argparse.Namespace)
         f"--error={logs_dir}/array_%A_%a.err",
         str(array_script),
     ]
-    array_job_id, array_stdout = submit_sbatch(array_command)
+    array_job_id, array_stdout = submit_sbatch_wait(array_command)
     submission: dict[str, Any] = {
         "array_job_id": array_job_id,
         "array_command": array_command,
         "array_stdout": array_stdout,
-        "merge_job_id": None,
-        "merge_command": None,
-        "merge_stdout": None,
+        "waited_for_completion": True,
     }
     write_json(work_dir / "submission.json", submission)
-    if not args.no_merge_job:
-        merge_args = parse_sbatch_args(args.merge_sbatch_args or args.sbatch_args, "--merge-sbatch-args")
-        merge_command = [
-            args.sbatch,
-            *merge_args,
-            "--parsable",
-            f"--job-name={args.job_name}-merge",
-            f"--dependency=afterok:{array_job_id}",
-            f"--output={logs_dir}/merge_%j.out",
-            f"--error={logs_dir}/merge_%j.err",
-            str(merge_script),
-        ]
-        merge_job_id, merge_stdout = submit_sbatch(merge_command)
-        submission.update(
-            {
-                "merge_job_id": merge_job_id,
-                "merge_command": merge_command,
-                "merge_stdout": merge_stdout,
-            }
-        )
-    write_json(work_dir / "submission.json", submission)
-    return submission
+    return submission, merge_spec(spec_path)
 
 
 def load_trimmer() -> ModuleType:
@@ -429,19 +414,19 @@ def merge_spec(spec_path: Path) -> dict[str, Any]:
             "requested_array_tasks": spec["requested_array_tasks"],
             "array_task_count": len(tasks),
             "array_job_id": submission.get("array_job_id"),
-            "merge_job_id": submission.get("merge_job_id"),
             "work_dir": str(spec_path.parent),
         },
     }
     write_json(output_jsonl.with_suffix(".summary.json"), summary)
     summary["slurm"]["temporary_shard_jsonls_removed"] = cleanup_shard_jsonls(tasks)
     write_json(output_jsonl.with_suffix(".summary.json"), summary)
-    print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     return summary
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Submit Slurm-array Silero VAD trimming jobs for a JSONL file.")
+    parser = argparse.ArgumentParser(
+        description="Run a Slurm-array Silero VAD trim, wait for it, and merge its JSONL shards."
+    )
     parser.add_argument("--worker-spec", help=argparse.SUPPRESS)
     parser.add_argument("--merge-spec", help=argparse.SUPPRESS)
     parser.add_argument("--task-id", type=int, help=argparse.SUPPRESS)
@@ -477,12 +462,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--run-id", help="Unique work-directory name under output-dir/.slurm_vad")
     parser.add_argument("--sbatch", default="sbatch", help="sbatch command path")
-    parser.add_argument("--sbatch-args", default="", help="Extra sbatch arguments for the array and merge jobs")
-    parser.add_argument("--merge-sbatch-args", help="Extra sbatch arguments for only the merge job")
-    parser.add_argument("--job-name", default="silero-vad-trim", help="Base Slurm job name")
-    parser.add_argument("--python", help="Python executable used in array and merge jobs")
+    parser.add_argument("--sbatch-args", default="", help="Extra sbatch arguments for the array job")
+    parser.add_argument("--job-name", default="silero-vad-trim", help="Slurm array job name")
+    parser.add_argument("--python", help="Python executable used in array jobs")
     parser.add_argument("--prepare-only", action="store_true", help="Write shards and scripts but do not call sbatch")
-    parser.add_argument("--no-merge-job", action="store_true", help="Submit only the array; run --merge-spec manually later")
     return parser.parse_args()
 
 
@@ -494,21 +477,23 @@ def main() -> None:
         run_worker(Path(args.worker_spec).expanduser().resolve(), args.task_id)
         return
     if args.merge_spec:
-        merge_spec(Path(args.merge_spec).expanduser().resolve())
+        summary = merge_spec(Path(args.merge_spec).expanduser().resolve())
+        print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
         return
     if not args.input_jsonl or not args.output_dir:
         raise ValueError("--input-jsonl and --output-dir are required when submitting jobs")
     spec_path, spec = prepare_spec(args)
-    array_script, merge_script = write_batch_scripts(spec_path, args)
+    array_script = write_batch_script(spec_path, args)
     result: dict[str, Any] = {
         "spec": str(spec_path),
         "array_script": str(array_script),
-        "merge_script": str(merge_script),
         "array_task_count": len(spec["tasks"]),
         "requested_array_tasks": spec["requested_array_tasks"],
     }
     if not args.prepare_only:
-        result["submission"] = submit_jobs(spec_path, spec, args)
+        submission, merge_summary = submit_and_merge(spec_path, spec, args, array_script)
+        result["submission"] = submission
+        result["merge_summary"] = merge_summary
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
 
 

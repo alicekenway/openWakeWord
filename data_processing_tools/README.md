@@ -217,19 +217,24 @@ python data_processing_tools/trim_jsonl_silero_vad_slurm.py \
 ```
 
 The command writes small shard JSONLs under
-`output-dir/.slurm_vad/<run-id>/shards/`, submits an `sbatch` array, then
-submits a merge job with `afterok` dependency. The merge writes the usual
-`output-dir/metadata.jsonl` and `metadata.summary.json`; it runs only when all
-array tasks succeed. After a successful merge it removes the temporary shard
-input/output JSONLs and their summaries, while retaining trimmed audio under
-`output-dir/wav/<task-id>/` plus the Slurm logs and job spec for inspection.
+`output-dir/.slurm_vad/<run-id>/shards/`, submits the array with
+`sbatch --wait`, and stays attached until all array tasks finish. If every task
+succeeds, the controller process merges the shards into
+`output-dir/metadata.jsonl` and `metadata.summary.json`. It then removes the
+temporary shard input/output JSONLs and their summaries, while retaining
+trimmed audio under `output-dir/wav/<task-id>/` plus the Slurm logs and job
+spec for inspection.
+
+If any array task fails, `sbatch --wait` returns a failure status. The tool does
+not merge or clean the shards, and exits nonzero so the task logs and partial
+outputs remain available for diagnosis. No dependent merge job is submitted.
 
 Use `--array-tasks N` to override the environment variable for one run. If the
 requested task count exceeds the number of records, the tool creates one task
-per record. Use
-`--prepare-only` to inspect the generated shard manifests and batch scripts
-without submitting, or `--no-merge-job` to submit only the array and later run
-the merge explicitly:
+per record. Use `--prepare-only` to inspect the generated shard manifests and
+batch script without submitting. The hidden recovery command below can merge
+a completed run again if the controller itself was interrupted after the
+array succeeded:
 
 ```bash
 python data_processing_tools/trim_jsonl_silero_vad_slurm.py \

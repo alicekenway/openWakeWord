@@ -6,6 +6,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -156,3 +157,75 @@ def test_split_caps_array_tasks_at_the_number_of_records(tmp_path: Path) -> None
 def test_array_tasks_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(slurm_trim.ARRAY_TASKS_ENV, "3")
     assert slurm_trim.array_tasks(None) == 3
+
+
+def test_submit_waits_for_array_then_merges(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    work_dir = tmp_path / "output" / ".slurm_vad" / "test-run"
+    work_dir.mkdir(parents=True)
+    spec_path = work_dir / "spec.json"
+    slurm_trim.write_json(spec_path, {"tasks": [{"id": 0}, {"id": 1}]})
+    array_script = work_dir / "run_array_task.sh"
+    array_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    args = SimpleNamespace(
+        sbatch="sbatch",
+        sbatch_args="--partition=cpu",
+        job_name="silero-vad-trim",
+    )
+    submitted: list[str] = []
+    merged: list[Path] = []
+
+    monkeypatch.setattr(slurm_trim.shutil, "which", lambda _command: "/usr/bin/sbatch")
+
+    def fake_submit(command: list[str]) -> tuple[str, str]:
+        submitted.extend(command)
+        return "12345", "12345"
+
+    def fake_merge(path: Path) -> dict[str, object]:
+        merged.append(path)
+        return {"written_rows": 2}
+
+    monkeypatch.setattr(slurm_trim, "submit_sbatch_wait", fake_submit)
+    monkeypatch.setattr(slurm_trim, "merge_spec", fake_merge)
+
+    submission, summary = slurm_trim.submit_and_merge(
+        spec_path,
+        {"tasks": [{"id": 0}, {"id": 1}]},
+        args,
+        array_script,
+    )
+
+    assert "--wait" in submitted
+    assert "--dependency" not in submitted
+    assert "--array=0-1" in submitted
+    assert merged == [spec_path]
+    assert submission["array_job_id"] == "12345"
+    assert submission["waited_for_completion"] is True
+    assert summary == {"written_rows": 2}
+
+
+def test_failed_array_is_not_merged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    work_dir = tmp_path / "output" / ".slurm_vad" / "test-run"
+    work_dir.mkdir(parents=True)
+    spec_path = work_dir / "spec.json"
+    array_script = work_dir / "run_array_task.sh"
+    array_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    args = SimpleNamespace(sbatch="sbatch", sbatch_args="", job_name="silero-vad-trim")
+    merged = False
+
+    monkeypatch.setattr(slurm_trim.shutil, "which", lambda _command: "/usr/bin/sbatch")
+
+    def fail_submit(_command: list[str]) -> tuple[str, str]:
+        raise RuntimeError("array task failed")
+
+    def fake_merge(_path: Path) -> dict[str, object]:
+        nonlocal merged
+        merged = True
+        return {}
+
+    monkeypatch.setattr(slurm_trim, "submit_sbatch_wait", fail_submit)
+    monkeypatch.setattr(slurm_trim, "merge_spec", fake_merge)
+
+    with pytest.raises(RuntimeError, match="array task failed"):
+        slurm_trim.submit_and_merge(spec_path, {"tasks": [{"id": 0}]}, args, array_script)
+
+    assert merged is False
