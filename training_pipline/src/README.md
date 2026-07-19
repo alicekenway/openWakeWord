@@ -139,18 +139,40 @@ do not inherit values implicitly.
 
 There is an opt-in pipeline for the design we discussed:
 
-1. A frozen WeNet CTC model is stage 1. It gives a CTC keyword score and an
-   encoder feature for each audio window.
-2. A small WAC-like model is stage 2. It receives the encoder feature, the
-   length-normalized CTC score, the top-one minus top-two margin, and a one-hot
-   value saying which wake word won in stage 1.
+1. A frozen WeNet CTC model is stage 1. It returns the complete encoder
+   matrix `[T, D]` and CTC log-probability matrix `[T, V]` for each augmented
+   waveform. The pipeline scores every keyword, finds the best normalized CTC
+   candidate, and records its non-blank start/end frames.
+2. A small WAC-like model is stage 2. It receives only the cropped encoder
+   candidate, its length-normalized CTC score, the top-one minus top-two
+   margin, and a one-hot value saying which wake word won in stage 1. Candidate
+   lengths remain variable: training groups nearby lengths, tail-pads a batch,
+   and supplies a frame mask to masked pooling.
 
 Stage 1 and stage 2 are trained separately. This repository does **not** train
-the CTC model; fine-tune and export it with WeNet. The feature stage saves all
-audio rows. The `[train] structure = ctc_wac` step applies each wake word's
-manual stage-1 threshold later, immediately before training the WAC model.
-That means you can tune a threshold and retrain stage 2 without rerunning the
-expensive CTC model.
+the CTC model; fine-tune and export it with WeNet. The feature stage retains
+every valid best candidate in a ragged bundle, plus its score, margin, keyword
+winner, and crop boundaries. `[stage1_report]` writes JSON and Markdown
+quantiles and threshold sweeps before any filtering. The
+`[train] structure = ctc_wac` step applies each wake word's manual stage-1
+threshold later, immediately before training the WAC model. That means you can
+choose a threshold and retrain stage 2 without rerunning the expensive CTC
+model.
+
+For CTC training, use `ctc_context = yes` and a `window_seconds` of about
+`2.56`. A short source is placed at the tail of the window and mixed with a
+full-window background recording, so its leading context is real background
+instead of a learned run of zeros. `long_audio_mode` supports `filter`,
+`start`, `end`, and `random`; the supplied examples filter long positives and
+randomly crop long negatives.
+
+The intended first-run workflow is:
+
+```bash
+"$PYTHON" "$PIPELINE" run --config "$CONFIG" --to stage1_report
+# Inspect stage1_report/candidates.md, then set each keyword's threshold.
+"$PYTHON" "$PIPELINE" run --config "$CONFIG" --from train
+```
 
 Start with
 [local_ctc_wuw.ini.example.conf](../examples/local_ctc_wuw.ini.example.conf)
@@ -169,7 +191,8 @@ python wenet_export/export-onnx-streaming.py \
   --output-dir /path/to/stage1-export \
   --output-prefix stage1-wuw \
   --chunk-size 16 \
-  --left-chunks 4
+  --left-chunks 4 \
+  --token-file /path/to/token.txt
 ```
 
 The generated `stage1-wuw.contract.json` is a small description of the ONNX
@@ -216,10 +239,11 @@ floating tensors. Do not expose only an int8 encoder tensor. The stage-2
 classifier needs the real dequantized encoder values, and feature extraction
 and evaluation should use the same stage-1 ONNX file.
 
-The CTC-WAC evaluator runs both ONNX files. It reports the stage-1 candidate
-rate, the final false-accept/false-reject threshold sweep, candidate counts by
-winning wake word, and real-time factor. It keeps a fixed encoder history with
-the same frame count used in stage-2 training.
+The CTC-WAC evaluator runs both ONNX files. It uses the same CTC boundary
+scorer and candidate crop as feature generation, then supplies an all-one
+mask for the unpadded crop. It reports the stage-1 candidate rate, the final
+false-accept/false-reject threshold sweep, candidate counts by winning wake
+word, and real-time factor.
 
 ### CNN and attention model choices
 

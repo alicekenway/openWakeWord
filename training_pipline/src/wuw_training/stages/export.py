@@ -85,48 +85,70 @@ def _verify_ctc_wac(
     model: torch.nn.Module,
     output: Path,
     *,
-    time_steps: int,
+    example_time_steps: int,
     feature_dim: int,
     keyword_count: int,
 ) -> float:
-    """Verify the four-input WAC ONNX interface against PyTorch."""
+    """Verify the dynamic, mask-aware WAC ONNX interface against PyTorch."""
 
     try:
         import onnxruntime as ort
     except ImportError as exc:
         raise RuntimeError("ONNX Runtime is required to verify exported models") from exc
     rng = np.random.default_rng(1337)
-    features = rng.standard_normal((2, time_steps, feature_dim), dtype=np.float32)
-    top_score = rng.standard_normal((2, 1), dtype=np.float32)
-    margin = rng.standard_normal((2, 1), dtype=np.float32)
-    winner = np.zeros((2, keyword_count), dtype=np.float32)
-    winner[np.arange(2), np.arange(2) % keyword_count] = 1.0
-    with torch.inference_mode():
-        expected = model(
-            torch.from_numpy(features),
-            torch.from_numpy(top_score),
-            torch.from_numpy(margin),
-            torch.from_numpy(winner),
-        ).detach().cpu().numpy()
     session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
-    actual = session.run(
-        None,
-        {
-            "encoder_features": features,
-            "top_score": top_score,
-            "margin": margin,
-            "winner_onehot": winner,
-        },
-    )[0]
-    difference = float(np.max(np.abs(expected - actual)))
-    if not np.allclose(expected, actual, rtol=1e-4, atol=1e-5):
-        raise RuntimeError(f"CTC-WAC ONNX verification failed; maximum absolute difference is {difference}")
-    return difference
+    maximum_difference = 0.0
+    for time_steps in sorted({max(1, int(example_time_steps)), max(1, int(example_time_steps) + 3)}):
+        features = rng.standard_normal((2, time_steps, feature_dim), dtype=np.float32)
+        frame_mask = np.ones((2, time_steps), dtype=np.float32)
+        if time_steps > 1:
+            frame_mask[1, -1] = 0.0
+        top_score = rng.standard_normal((2, 1), dtype=np.float32)
+        margin = rng.standard_normal((2, 1), dtype=np.float32)
+        winner = np.zeros((2, keyword_count), dtype=np.float32)
+        winner[np.arange(2), np.arange(2) % keyword_count] = 1.0
+        with torch.inference_mode():
+            expected = model(
+                torch.from_numpy(features),
+                torch.from_numpy(frame_mask),
+                torch.from_numpy(top_score),
+                torch.from_numpy(margin),
+                torch.from_numpy(winner),
+            ).detach().cpu().numpy()
+        actual = session.run(
+            None,
+            {
+                "encoder_features": features,
+                "frame_mask": frame_mask,
+                "top_score": top_score,
+                "margin": margin,
+                "winner_onehot": winner,
+            },
+        )[0]
+        difference = float(np.max(np.abs(expected - actual)))
+        maximum_difference = max(maximum_difference, difference)
+        if not np.allclose(expected, actual, rtol=1e-4, atol=1e-5):
+            raise RuntimeError(f"CTC-WAC ONNX verification failed; maximum absolute difference is {difference}")
+        if time_steps > 1:
+            altered = features.copy()
+            altered[frame_mask == 0] = 1000.0
+            with torch.inference_mode():
+                masked_expected = model(
+                    torch.from_numpy(altered),
+                    torch.from_numpy(frame_mask),
+                    torch.from_numpy(top_score),
+                    torch.from_numpy(margin),
+                    torch.from_numpy(winner),
+                ).detach().cpu().numpy()
+            if not np.allclose(expected, masked_expected, rtol=1e-5, atol=1e-6):
+                raise RuntimeError("CTC-WAC mask verification failed: padded feature values changed the output")
+    return maximum_difference
 
 
 def _run_ctc_wac_export(ctx: Any, checkpoint: dict[str, Any]) -> dict[str, Any]:
     try:
-        time_steps = int(checkpoint["time_steps"])
+        if int(checkpoint.get("schema_version", 0)) != 2:
+            raise ValueError("expected CTC-WAC checkpoint schema 2")
         feature_dim = int(checkpoint["feature_dim"])
         keyword_count = int(checkpoint["keyword_count"])
         model_config = dict(checkpoint["model_config"])
@@ -148,8 +170,10 @@ def _run_ctc_wac_export(ctx: Any, checkpoint: dict[str, Any]) -> dict[str, Any]:
     output = _output_model(ctx)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp.onnx")
+    example_time_steps = max(1, min(int(checkpoint.get("max_candidate_frames", 16)), 16))
     examples = (
-        torch.rand((1, time_steps, feature_dim), dtype=torch.float32),
+        torch.rand((1, example_time_steps, feature_dim), dtype=torch.float32),
+        torch.ones((1, example_time_steps), dtype=torch.float32),
         torch.rand((1, 1), dtype=torch.float32),
         torch.rand((1, 1), dtype=torch.float32),
         torch.nn.functional.one_hot(torch.zeros(1, dtype=torch.long), num_classes=keyword_count).to(torch.float32),
@@ -159,10 +183,11 @@ def _run_ctc_wac_export(ctx: Any, checkpoint: dict[str, Any]) -> dict[str, Any]:
         network,
         examples,
         temporary,
-        input_names=["encoder_features", "top_score", "margin", "winner_onehot"],
+        input_names=["encoder_features", "frame_mask", "top_score", "margin", "winner_onehot"],
         output_names=["wake_probability"],
         dynamic_axes={
-            "encoder_features": {0: "batch"},
+            "encoder_features": {0: "batch", 1: "frames"},
+            "frame_mask": {0: "batch", 1: "frames"},
             "top_score": {0: "batch"},
             "margin": {0: "batch"},
             "winner_onehot": {0: "batch"},
@@ -176,7 +201,7 @@ def _run_ctc_wac_export(ctx: Any, checkpoint: dict[str, Any]) -> dict[str, Any]:
         maximum_difference = _verify_ctc_wac(
             network,
             output,
-            time_steps=time_steps,
+            example_time_steps=example_time_steps,
             feature_dim=feature_dim,
             keyword_count=keyword_count,
         )
@@ -184,7 +209,8 @@ def _run_ctc_wac_export(ctx: Any, checkpoint: dict[str, Any]) -> dict[str, Any]:
         "structure": "ctc_wac",
         "input_model": str(_input_model(ctx)),
         "output_model": str(output),
-        "input_shape": [time_steps, feature_dim],
+        "input_shape": [None, feature_dim],
+        "max_candidate_frames": int(checkpoint.get("max_candidate_frames", example_time_steps)),
         "keyword_count": keyword_count,
         "keyword_ids": list(checkpoint.get("keyword_ids", [])),
         "keywords_fingerprint": checkpoint.get("keywords_fingerprint"),
@@ -192,7 +218,7 @@ def _run_ctc_wac_export(ctx: Any, checkpoint: dict[str, Any]) -> dict[str, Any]:
         "opset_version": opset,
         "verified": boolean(ctx.section, "verify", ctx.step, True),
         "maximum_absolute_difference": maximum_difference,
-        "inputs": ["encoder_features", "top_score", "margin", "winner_onehot"],
+        "inputs": ["encoder_features", "frame_mask", "top_score", "margin", "winner_onehot"],
         "output": "wake_probability",
     }
     write_json(_output_summary(ctx), payload)

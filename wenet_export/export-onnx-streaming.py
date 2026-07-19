@@ -13,6 +13,7 @@ do not need to copy ONNX tensor names or cache shapes by hand.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -84,6 +85,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--left-chunks", type=int, default=4, help="Number of cached encoder chunks")
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--blank-id", type=int, default=0)
+    parser.add_argument(
+        "--token-file",
+        default=None,
+        help="Optional token.txt used to fingerprint the stage-1 CTC vocabulary in the contract",
+    )
     parser.add_argument("--opset-version", type=int, default=13)
     parser.add_argument("--num-mel-bins", type=int, default=None, help="Override YAML fbank dimension")
     parser.add_argument(
@@ -226,6 +232,10 @@ def _write_contract(
     blank_id: int,
     att_cache_shape: tuple[int, ...],
     cnn_cache_shape: tuple[int, ...],
+    encoder_output_size: int,
+    vocab_size: int,
+    subsampling_factor: int,
+    token_table_fingerprint: str | None,
 ) -> dict[str, Any]:
     graph_inputs, graph_outputs = _onnx_names(model_path)
     required_outputs = {"encoder_out", "ctc_log_probs", "next_att_cache", "next_cnn_cache"}
@@ -265,7 +275,7 @@ def _write_contract(
             }
         )
     contract: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "sample_rate": sample_rate,
         "fbank": fbank,
         # The ONNX input window overlaps.  These are fbank-frame counts,
@@ -283,11 +293,18 @@ def _write_contract(
             "ctc_log_probs": "ctc_log_probs",
         },
         "ctc_output_is_log_probs": True,
+        "encoder_frame_shift_ms": float(fbank["frame_shift_ms"]) * int(subsampling_factor),
+        "encoder_output_size": int(encoder_output_size),
+        "vocab_size": int(vocab_size),
+        "subsampling_factor": int(subsampling_factor),
+        "encoder_chunk_frames": int(encoder_chunk_size),
         "constant_inputs": constants,
         "cache_inputs": cache_inputs,
     }
     if attention_mask is not None:
         contract["attention_mask"] = attention_mask
+    if token_table_fingerprint is not None:
+        contract["token_table_fingerprint"] = token_table_fingerprint
     path.write_text(json.dumps(contract, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return contract
 
@@ -490,7 +507,7 @@ def main() -> None:
 
     meta_data = {
         "model_type": "wenet_ctc_wuw_stage1",
-        "version": "1",
+        "version": "2",
         "model_author": "wenet",
         "comment": "streaming encoder feature plus CTC log probabilities",
         "url": os.environ.get("WENET_URL", ""),
@@ -508,6 +525,12 @@ def main() -> None:
         "blank_id": args.blank_id,
     }
     add_meta_data(output_fp32, meta_data)
+    token_table_fingerprint = None
+    if args.token_file:
+        token_file = Path(args.token_file).expanduser().resolve()
+        if not token_file.is_file():
+            raise FileNotFoundError(f"--token-file does not exist: {token_file}")
+        token_table_fingerprint = hashlib.sha256(token_file.read_bytes()).hexdigest()
     contract = _write_contract(
         output_contract,
         model_path=output_fp32,
@@ -522,6 +545,10 @@ def main() -> None:
         blank_id=args.blank_id,
         att_cache_shape=tuple(att_cache.shape),
         cnn_cache_shape=tuple(cnn_cache.shape),
+        encoder_output_size=output_size,
+        vocab_size=int(torch_model.ctc.ctc_lo.weight.shape[0]),
+        subsampling_factor=subsampling_factor,
+        token_table_fingerprint=token_table_fingerprint,
     )
 
     expected = model(chunk, offset, required_cache_size, att_cache, cnn_cache, att_mask)

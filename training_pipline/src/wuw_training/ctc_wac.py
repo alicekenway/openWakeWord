@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import random
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -25,11 +24,14 @@ import numpy as np
 import torch
 from numpy.lib.format import open_memmap
 
-from .artifacts import hash_payload, read_json, read_jsonl, write_json, write_jsonl
+from .artifacts import hash_payload, read_json, write_json, write_jsonl
 from .config import ConfigurationError
 
 
-BUNDLE_SCHEMA_VERSION = 1
+# Schema 2 stores variable-length candidate features as one flat matrix plus
+# row offsets.  It deliberately cannot be confused with the old fixed-window
+# ``[N, T, D]`` artifact format.
+BUNDLE_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,13 @@ class Stage1Contract:
     constant_inputs: dict[str, Any]
     feature_mean: tuple[float, ...] | None
     feature_istd: tuple[float, ...] | None
+    schema_version: int = 1
+    encoder_frame_shift_ms: float = 40.0
+    encoder_output_size: int | None = None
+    vocab_size: int | None = None
+    subsampling_factor: int | None = None
+    encoder_chunk_frames: int | None = None
+    token_table_fingerprint: str | None = None
 
     @classmethod
     def from_json(cls, path: Path) -> "Stage1Contract":
@@ -119,6 +128,7 @@ class Stage1Contract:
         if not isinstance(inputs, dict) or not isinstance(outputs, dict):
             raise ConfigurationError(f"Stage-1 contract {path}: inputs and outputs must be objects")
         try:
+            schema_version = int(raw.get("schema_version", 1))
             sample_rate = int(raw.get("sample_rate", 16000))
             num_mel_bins = int(fbank.get("num_mel_bins", 80))
             frame_length_ms = float(fbank.get("frame_length_ms", 25.0))
@@ -129,6 +139,10 @@ class Stage1Contract:
             minimum_input_frames = int(raw.get("minimum_input_frames", 1))
             blank_id = int(raw.get("blank_id", 0))
             initial_offset = int(raw.get("initial_offset", 0))
+            subsampling_factor = int(raw.get("subsampling_factor", 4))
+            encoder_frame_shift_ms = float(
+                raw.get("encoder_frame_shift_ms", frame_shift_ms * subsampling_factor)
+            )
         except (KeyError, TypeError, ValueError) as exc:
             raise ConfigurationError(
                 f"Stage-1 contract {path} needs numeric sample_rate/fbank/chunk_frames values"
@@ -143,6 +157,9 @@ class Stage1Contract:
             or minimum_input_frames < 1
             or minimum_input_frames > chunk_frames
             or initial_offset < 0
+            or schema_version < 1
+            or subsampling_factor < 1
+            or encoder_frame_shift_ms <= 0
         ):
             raise ConfigurationError(f"Stage-1 contract {path} contains invalid frontend or chunk values")
 
@@ -238,6 +255,21 @@ class Stage1Contract:
                 raise ConfigurationError(
                     f"Stage-1 contract {path}: fbank.mean/istd must each have {num_mel_bins} values"
                 )
+        def optional_positive_int(key: str) -> int | None:
+            value = raw.get(key)
+            if value is None:
+                return None
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError(f"Stage-1 contract {path}: {key} must be an integer") from exc
+            if parsed < 1:
+                raise ConfigurationError(f"Stage-1 contract {path}: {key} must be >= 1")
+            return parsed
+
+        token_table_fingerprint = raw.get("token_table_fingerprint")
+        if token_table_fingerprint is not None and not isinstance(token_table_fingerprint, str):
+            raise ConfigurationError(f"Stage-1 contract {path}: token_table_fingerprint must be a string")
         return cls(
             sample_rate=sample_rate,
             num_mel_bins=num_mel_bins,
@@ -262,6 +294,13 @@ class Stage1Contract:
             constant_inputs=dict(constants),
             feature_mean=mean,
             feature_istd=istd,
+            schema_version=schema_version,
+            encoder_frame_shift_ms=encoder_frame_shift_ms,
+            encoder_output_size=optional_positive_int("encoder_output_size"),
+            vocab_size=optional_positive_int("vocab_size"),
+            subsampling_factor=subsampling_factor,
+            encoder_chunk_frames=optional_positive_int("encoder_chunk_frames"),
+            token_table_fingerprint=token_table_fingerprint,
         )
 
     def fingerprint(self) -> str:
@@ -337,6 +376,8 @@ def keyword_token_fingerprint(keywords: Sequence[Keyword]) -> str:
 @dataclass(frozen=True)
 class FeatureBundlePaths:
     features: Path
+    offsets: Path
+    lengths: Path
     all_scores: Path
     top_score: Path
     margin: Path
@@ -347,6 +388,8 @@ class FeatureBundlePaths:
     def all(self) -> list[Path]:
         return [
             self.features,
+            self.offsets,
+            self.lengths,
             self.all_scores,
             self.top_score,
             self.margin,
@@ -368,6 +411,8 @@ def feature_bundle_paths(features: Path) -> FeatureBundlePaths:
     parent = features.parent
     return FeatureBundlePaths(
         features=features,
+        offsets=parent / f"{stem}.offsets.npy",
+        lengths=parent / f"{stem}.lengths.npy",
         all_scores=parent / f"{stem}.all_scores.npy",
         top_score=parent / f"{stem}.top_score.npy",
         margin=parent / f"{stem}.margin.npy",
@@ -390,16 +435,28 @@ def feature_bundle_valid(features: Path, *, require_complete: bool = True) -> bo
     try:
         summary = read_json(paths.summary)
         x = np.load(paths.features, mmap_mode="r")
+        offsets = np.load(paths.offsets, mmap_mode="r")
+        lengths = np.load(paths.lengths, mmap_mode="r")
         scores = np.load(paths.all_scores, mmap_mode="r")
         top = np.load(paths.top_score, mmap_mode="r")
         margin = np.load(paths.margin, mmap_mode="r")
         winner = np.load(paths.winner_onehot, mmap_mode="r")
-        n = int(x.shape[0])
+        n = int(lengths.shape[0])
+        offset_values = np.asarray(offsets, dtype=np.int64)
+        length_values = np.asarray(lengths, dtype=np.int64)
         valid = (
             int(summary.get("bundle_schema", -1)) == BUNDLE_SCHEMA_VERSION
             and (not require_complete or int(summary.get("error_count", -1)) == 0)
             and int(summary.get("feature_count", -1)) == n
-            and x.ndim == 3
+            and x.ndim == 2
+            and x.shape[1] >= 1
+            and offsets.ndim == 1
+            and lengths.ndim == 1
+            and offsets.shape == (n + 1,)
+            and offset_values[0] == 0
+            and offset_values[-1] == x.shape[0]
+            and np.all(np.diff(offset_values) == length_values)
+            and np.all(length_values > 0)
             and scores.ndim == 2
             and top.shape == (n, 1)
             and margin.shape == (n, 1)
@@ -418,13 +475,47 @@ def _log_softmax(values: np.ndarray) -> np.ndarray:
     return values - maximum - np.log(np.sum(np.exp(values - maximum), axis=-1, keepdims=True))
 
 
-def ctc_keyword_score_trace(log_probs: np.ndarray, token_ids: Sequence[int], *, blank_id: int = 0) -> np.ndarray:
-    """Return the best length-normalized CTC alignment score at each frame.
+@dataclass(frozen=True)
+class CtcKeywordAlignmentTrace:
+    """Best score and CTC token boundaries for every possible end frame."""
 
-    This is a Viterbi-style CTC keyword scorer.  A fresh alignment may start at
-    any frame, which is what makes it suitable for a wake-word trigger rather
-    than for scoring an entire utterance.  ``token_ids`` should not include the
-    CTC blank token.
+    scores: np.ndarray
+    starts: np.ndarray
+    ends: np.ndarray
+
+
+def _better_alignment(
+    left: tuple[np.float32, int, int], right: tuple[np.float32, int, int]
+) -> tuple[np.float32, int, int]:
+    """Choose a deterministic Viterbi predecessor.
+
+    Scores are primary.  For a score tie, a later start produces the shorter,
+    more useful wake-word crop; an earlier final token then breaks any remaining
+    tie.  This does not alter non-tied score traces from the previous scorer.
+    """
+
+    if right[0] > left[0]:
+        return right
+    if right[0] < left[0]:
+        return left
+    if right[1] > left[1]:
+        return right
+    if right[1] < left[1]:
+        return left
+    return right if right[2] < left[2] else left
+
+
+def ctc_keyword_alignment_trace(
+    log_probs: np.ndarray,
+    token_ids: Sequence[int],
+    *,
+    blank_id: int = 0,
+) -> CtcKeywordAlignmentTrace:
+    """Return normalized CTC scores and token start/end frames.
+
+    The dynamic program is the previous restartable Viterbi scorer with
+    boundary metadata propagated beside each state.  A boundary ends at the
+    final non-blank token, so trailing CTC blanks never become stage-2 audio.
     """
 
     values = np.asarray(log_probs, dtype=np.float32)
@@ -444,25 +535,57 @@ def ctc_keyword_score_trace(log_probs: np.ndarray, token_ids: Sequence[int], *, 
         extended.extend([token, blank_id])
     state_count = len(extended)
     negative_infinity = np.float32(-1.0e30)
-    previous = np.full(state_count, negative_infinity, dtype=np.float32)
+    previous_score = np.full(state_count, negative_infinity, dtype=np.float32)
+    previous_start = np.full(state_count, -1, dtype=np.int64)
+    previous_end = np.full(state_count, -1, dtype=np.int64)
     trace = np.full(values.shape[0], negative_infinity, dtype=np.float32)
+    starts = np.full(values.shape[0], -1, dtype=np.int64)
+    ends = np.full(values.shape[0], -1, dtype=np.int64)
 
     for frame_index, frame in enumerate(values):
-        current = np.full(state_count, negative_infinity, dtype=np.float32)
-        # Restarting here removes the score of arbitrary speech before a
-        # possible keyword.  Keeping previous[0] handles blank stretches.
-        current[0] = np.float32(frame[blank_id])
+        current_score = np.full(state_count, negative_infinity, dtype=np.float32)
+        current_start = np.full(state_count, -1, dtype=np.int64)
+        current_end = np.full(state_count, -1, dtype=np.int64)
+        # Restarting here removes arbitrary speech before a possible keyword.
+        current_score[0] = np.float32(frame[blank_id])
         for state in range(1, state_count):
             symbol = extended[state]
-            candidates = [previous[state], previous[state - 1]]
+            best = (previous_score[state], int(previous_start[state]), int(previous_end[state]))
+            best = _better_alignment(
+                best,
+                (previous_score[state - 1], int(previous_start[state - 1]), int(previous_end[state - 1])),
+            )
             if state == 1:
-                candidates.append(np.float32(0.0))  # begin the keyword now
+                best = _better_alignment(best, (np.float32(0.0), -1, -1))
             elif state % 2 == 1 and extended[state] != extended[state - 2]:
-                candidates.append(previous[state - 2])
-            current[state] = np.max(np.asarray(candidates, dtype=np.float32)) + frame[symbol]
-        previous = current
-        trace[frame_index] = max(current[-1], current[-2]) / np.float32(len(tokens))
-    return trace
+                best = _better_alignment(
+                    best,
+                    (previous_score[state - 2], int(previous_start[state - 2]), int(previous_end[state - 2])),
+                )
+            current_score[state] = best[0] + np.float32(frame[symbol])
+            if state % 2 == 1:  # emitted a token at this frame
+                current_start[state] = frame_index if best[1] < 0 else best[1]
+                current_end[state] = frame_index
+            else:  # emitted a blank: preserve the last non-blank boundary
+                current_start[state] = best[1]
+                current_end[state] = best[2]
+
+        final = _better_alignment(
+            (current_score[-2], int(current_start[-2]), int(current_end[-2])),
+            (current_score[-1], int(current_start[-1]), int(current_end[-1])),
+        )
+        trace[frame_index] = final[0] / np.float32(len(tokens))
+        if final[0] > negative_infinity / 2:
+            starts[frame_index] = final[1]
+            ends[frame_index] = final[2]
+        previous_score, previous_start, previous_end = current_score, current_start, current_end
+    return CtcKeywordAlignmentTrace(trace, starts, ends)
+
+
+def ctc_keyword_score_trace(log_probs: np.ndarray, token_ids: Sequence[int], *, blank_id: int = 0) -> np.ndarray:
+    """Return the best length-normalized CTC alignment score at each frame."""
+
+    return ctc_keyword_alignment_trace(log_probs, token_ids, blank_id=blank_id).scores
 
 
 def ctc_keyword_score_traces(
@@ -479,6 +602,24 @@ def ctc_keyword_score_traces(
         [ctc_keyword_score_trace(log_probs, item.token_ids, blank_id=blank_id) for item in keywords],
         axis=1,
     ).astype(np.float32, copy=False)
+
+
+def ctc_keyword_alignment_traces(
+    log_probs: np.ndarray,
+    keywords: Sequence[Keyword],
+    *,
+    blank_id: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return score, start, and end matrices with shape ``[frames, keywords]``."""
+
+    if not keywords:
+        raise ValueError("At least one keyword is required")
+    traces = [ctc_keyword_alignment_trace(log_probs, item.token_ids, blank_id=blank_id) for item in keywords]
+    return (
+        np.stack([item.scores for item in traces], axis=1).astype(np.float32, copy=False),
+        np.stack([item.starts for item in traces], axis=1).astype(np.int64, copy=False),
+        np.stack([item.ends for item in traces], axis=1).astype(np.int64, copy=False),
+    )
 
 
 def rank_keyword_scores(scores: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -501,6 +642,51 @@ def winner_onehot(winner: np.ndarray, keyword_count: int) -> np.ndarray:
     result = np.zeros((int(winner.shape[0]), int(keyword_count)), dtype=np.float32)
     result[np.arange(result.shape[0]), winner.astype(np.int64)] = 1.0
     return result
+
+
+@dataclass(frozen=True)
+class CtcCandidate:
+    """One best keyword hypothesis for an utterance or augmented window."""
+
+    frame: int
+    keyword_index: int
+    scores: np.ndarray
+    top_score: float
+    margin: float
+    start_frame: int
+    end_frame: int
+
+
+def best_ctc_candidate(
+    log_probs: np.ndarray,
+    keywords: Sequence[Keyword],
+    *,
+    blank_id: int = 0,
+) -> CtcCandidate:
+    """Select the one globally best keyword candidate from a CTC matrix."""
+
+    scores, starts, ends = ctc_keyword_alignment_traces(log_probs, keywords, blank_id=blank_id)
+    if scores.shape[0] < 1:
+        raise ValueError("CTC output contains no encoder frames")
+    # ``argmax`` intentionally chooses the earliest frame for an exact score
+    # tie, matching the former feature extractor's deterministic behavior.
+    frame = int(np.argmax(np.max(scores, axis=1)))
+    row = scores[frame:frame + 1]
+    top, margin, winner = rank_keyword_scores(row)
+    keyword_index = int(winner[0])
+    start_frame = int(starts[frame, keyword_index])
+    end_frame = int(ends[frame, keyword_index])
+    if start_frame < 0 or end_frame < start_frame:
+        raise RuntimeError("Best CTC candidate has no valid non-blank alignment boundary")
+    return CtcCandidate(
+        frame=frame,
+        keyword_index=keyword_index,
+        scores=np.asarray(row[0], dtype=np.float32),
+        top_score=float(top[0]),
+        margin=float(margin[0]),
+        start_frame=start_frame,
+        end_frame=end_frame,
+    )
 
 
 def stage1_gate(scores: np.ndarray, keywords: Sequence[Keyword]) -> tuple[np.ndarray, np.ndarray]:
@@ -762,46 +948,6 @@ def load_audio(path: Path, sample_rate: int) -> np.ndarray:
     return waveform.squeeze(0).detach().cpu().to(torch.float32).numpy()
 
 
-def fixed_audio_window(
-    audio: np.ndarray,
-    *,
-    target_samples: int,
-    placement: str,
-    seed: int,
-) -> np.ndarray:
-    """Use the same simple placement idea as the existing feature stage."""
-
-    values = np.asarray(audio, dtype=np.float32).reshape(-1)
-    if values.size == target_samples:
-        return values
-    rng = random.Random(seed)
-    if values.size > target_samples:
-        if placement == "start":
-            start = 0
-        elif placement == "end":
-            start = values.size - target_samples
-        elif placement == "center":
-            start = (values.size - target_samples) // 2
-        elif placement == "random":
-            start = rng.randint(0, values.size - target_samples)
-        else:
-            raise ValueError(f"Unknown placement {placement!r}")
-        return values[start:start + target_samples]
-    output = np.zeros(target_samples, dtype=np.float32)
-    if placement == "start":
-        start = 0
-    elif placement == "end":
-        start = target_samples - values.size
-    elif placement == "center":
-        start = (target_samples - values.size) // 2
-    elif placement == "random":
-        start = rng.randint(0, target_samples - values.size)
-    else:
-        raise ValueError(f"Unknown placement {placement!r}")
-    output[start:start + values.size] = values
-    return output
-
-
 def audio_to_fbank(audio: np.ndarray, contract: Stage1Contract) -> np.ndarray:
     """Compute the fbank matrix described by the stage-1 contract.
 
@@ -859,6 +1005,19 @@ def _atomic_write_json(path: Path, value: Any) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _atomic_write_npy(path: Path, value: np.ndarray) -> None:
+    """Write an NPY payload atomically without NumPy changing the suffix."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _temporary_path(path)
+    try:
+        with temporary.open("wb") as handle:
+            np.save(handle, np.asarray(value), allow_pickle=False)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def generate_ctc_wac_feature_bundle(
     *,
     records: Sequence[dict[str, Any]],
@@ -866,14 +1025,13 @@ def generate_ctc_wac_feature_bundle(
     model_path: Path,
     contract_path: Path,
     keywords_path: Path,
-    clip_seconds: float,
-    placement: str,
-    seed: int,
+    candidate_pre_margin_frames: int = 3,
+    candidate_post_margin_frames: int = 0,
     device: str = "cpu",
     overwrite: bool = False,
     index_offset: int = 0,
 ) -> dict[str, Any]:
-    """Generate features and all stage-1 values, without applying the gate.
+    """Generate ragged candidate features and all stage-1 values.
 
     The feature bundle is intentionally all-row.  A later train step applies
     the keyword-specific stage-1 threshold, so a changed threshold never
@@ -888,126 +1046,177 @@ def generate_ctc_wac_feature_bundle(
         return read_json(paths.summary)
     contract = Stage1Contract.from_json(contract_path)
     keywords = load_keywords(keywords_path, require_threshold=False)
-    target_samples = int(round(float(clip_seconds) * contract.sample_rate))
-    if target_samples < 1:
-        raise ValueError("clip_seconds must produce at least one audio sample")
+    if candidate_pre_margin_frames < 0 or candidate_post_margin_frames < 0:
+        raise ValueError("candidate crop margins must be >= 0")
     stage1 = StreamingCtcStage1(model_path, contract, device=device)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     temporary_paths = {name: _temporary_path(path) for name, path in asdict(paths).items()}
-    # asdict converts Path values unchanged; make type checkers and readers happy.
     temporary = {name: Path(value) for name, value in temporary_paths.items()}
-    feature_mmap: np.memmap | None = None
-    score_mmap: np.memmap | None = None
-    top_mmap: np.memmap | None = None
-    margin_mmap: np.memmap | None = None
-    winner_mmap: np.memmap | None = None
+    raw_features = _temporary_path(output_file.with_name(f".{output_file.name}.candidate_features.raw"))
     rows: list[dict[str, Any]] = []
+    score_rows: list[np.ndarray] = []
+    top_rows: list[float] = []
+    margin_rows: list[float] = []
+    winner_rows: list[np.ndarray] = []
+    lengths: list[int] = []
+    offsets = [0]
     errors: list[dict[str, Any]] = []
-    feature_shape: tuple[int, int] | None = None
+    invalid_alignments: list[dict[str, Any]] = []
+    feature_dim: int | None = None
+    input_duration_seconds = 0.0
     row = 0
     try:
-        for local_index, record in enumerate(records):
-            index = int(index_offset) + local_index
-            path_value = record.get("path")
-            try:
-                if not path_value:
-                    raise ValueError("normalized manifest row has no path")
-                audio = load_audio(Path(str(path_value)), contract.sample_rate)
-                window = fixed_audio_window(
-                    audio,
-                    target_samples=target_samples,
-                    placement=placement,
-                    seed=int(seed) + index,
-                )
-                fbank = audio_to_fbank(window, contract)
-                encoder, ctc = stage1.infer_fbank(fbank)
-                if encoder.ndim != 2 or ctc.ndim != 2:
-                    raise RuntimeError("stage-1 inference did not return two time-major matrices")
-                if feature_shape is None:
-                    feature_shape = (int(encoder.shape[0]), int(encoder.shape[1]))
-                    feature_mmap = open_memmap(
-                        temporary["features"],
-                        mode="w+",
-                        dtype=np.float32,
-                        shape=(len(records), *feature_shape),
+        with raw_features.open("ab") as raw_handle:
+            for local_index, record in enumerate(records):
+                index = int(index_offset) + local_index
+                path_value = record.get("path")
+                try:
+                    if not path_value:
+                        raise ValueError("normalized manifest row has no path")
+                    audio = load_audio(Path(str(path_value)), contract.sample_rate)
+                    input_duration_seconds += audio.size / float(contract.sample_rate)
+                    fbank = audio_to_fbank(audio, contract)
+                    encoder, ctc = stage1.infer_fbank(fbank)
+                    if encoder.ndim != 2 or ctc.ndim != 2:
+                        raise RuntimeError("stage-1 inference did not return two time-major matrices")
+                    if encoder.shape[0] != ctc.shape[0]:
+                        raise RuntimeError("stage-1 encoder and CTC output frame counts differ")
+                    if contract.encoder_output_size is not None and encoder.shape[1] != contract.encoder_output_size:
+                        raise RuntimeError(
+                            f"stage-1 encoder dimension {encoder.shape[1]} does not match contract "
+                            f"encoder_output_size {contract.encoder_output_size}"
+                        )
+                    if contract.vocab_size is not None and ctc.shape[1] != contract.vocab_size:
+                        raise RuntimeError(
+                            f"stage-1 CTC vocabulary {ctc.shape[1]} does not match contract vocab_size {contract.vocab_size}"
+                        )
+                    if feature_dim is None:
+                        feature_dim = int(encoder.shape[1])
+                    elif int(encoder.shape[1]) != feature_dim:
+                        raise RuntimeError(
+                            f"stage-1 encoder dimension changed from {feature_dim} to {encoder.shape[1]}"
+                        )
+                    candidate = best_ctc_candidate(ctc, keywords, blank_id=contract.blank_id)
+                    crop_start = max(0, candidate.start_frame - int(candidate_pre_margin_frames))
+                    crop_end = min(
+                        int(encoder.shape[0]),
+                        candidate.end_frame + 1 + int(candidate_post_margin_frames),
                     )
-                    score_mmap = open_memmap(
-                        temporary["all_scores"],
-                        mode="w+",
-                        dtype=np.float32,
-                        shape=(len(records), len(keywords)),
+                    if crop_start >= crop_end:
+                        invalid_alignments.append(
+                            {
+                                "source_index": index,
+                                "id": record.get("id"),
+                                "path": str(path_value),
+                                "reason": "empty_candidate_crop",
+                                "candidate_start_frame": candidate.start_frame,
+                                "candidate_end_frame": candidate.end_frame,
+                            }
+                        )
+                        continue
+                    crop = np.asarray(encoder[crop_start:crop_end], dtype=np.float32)
+                    crop.tofile(raw_handle)
+                    candidate_length = int(crop.shape[0])
+                    score_rows.append(candidate.scores)
+                    top_rows.append(candidate.top_score)
+                    margin_rows.append(candidate.margin)
+                    onehot = np.zeros((len(keywords),), dtype=np.float32)
+                    onehot[candidate.keyword_index] = 1.0
+                    winner_rows.append(onehot)
+                    lengths.append(candidate_length)
+                    offsets.append(offsets[-1] + candidate_length)
+                    rows.append(
+                        {
+                            "row": row,
+                            "source_index": index,
+                            "id": record.get("id"),
+                            "path": str(path_value),
+                            "label": record.get("label"),
+                            "keyword_id": keywords[candidate.keyword_index].id,
+                            "candidate_frame": candidate.frame,
+                            "candidate_start_frame": candidate.start_frame,
+                            "candidate_end_frame": candidate.end_frame,
+                            "crop_start_frame": crop_start,
+                            "crop_end_frame": crop_end,
+                            "candidate_length_frames": candidate_length,
+                            "candidate_duration_ms": candidate_length * contract.encoder_frame_shift_ms,
+                            "top_score": candidate.top_score,
+                            "confidence": candidate.top_score,
+                            "margin": candidate.margin,
+                        }
                     )
-                    top_mmap = open_memmap(temporary["top_score"], mode="w+", dtype=np.float32, shape=(len(records), 1))
-                    margin_mmap = open_memmap(temporary["margin"], mode="w+", dtype=np.float32, shape=(len(records), 1))
-                    winner_mmap = open_memmap(
-                        temporary["winner_onehot"],
-                        mode="w+",
-                        dtype=np.float32,
-                        shape=(len(records), len(keywords)),
+                    row += 1
+                except RuntimeError as exc:
+                    # A CTC matrix with no complete keyword path is expected to
+                    # be rare, but it must not produce a fake all-zero crop.
+                    if "no valid non-blank alignment boundary" in str(exc):
+                        invalid_alignments.append(
+                            {
+                                "source_index": index,
+                                "id": record.get("id"),
+                                "path": str(path_value) if path_value else None,
+                                "reason": "no_valid_ctc_alignment",
+                            }
+                        )
+                        continue
+                    errors.append(
+                        {
+                            "index": index,
+                            "id": record.get("id"),
+                            "path": str(path_value) if path_value else None,
+                            "error": repr(exc),
+                        }
                     )
-                if encoder.shape != feature_shape:
-                    raise RuntimeError(
-                        f"stage-1 encoder shape changed from {feature_shape} to {encoder.shape}; fixed windows must be consistent"
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "index": index,
+                            "id": record.get("id"),
+                            "path": str(path_value) if path_value else None,
+                            "error": repr(exc),
+                        }
                     )
-                score_traces = ctc_keyword_score_traces(ctc, keywords, blank_id=contract.blank_id)
-                # Keep all keyword values from one actual candidate frame.
-                # Taking a separate maximum for every keyword would mix scores
-                # from different moments and give stage 2 a margin it will
-                # never see during streaming evaluation.
-                candidate_frame = int(np.argmax(np.max(score_traces, axis=1)))
-                keyword_scores = score_traces[candidate_frame:candidate_frame + 1]
-                top, margin, winner = rank_keyword_scores(keyword_scores)
-                assert feature_mmap is not None and score_mmap is not None
-                assert top_mmap is not None and margin_mmap is not None and winner_mmap is not None
-                feature_mmap[row] = encoder
-                score_mmap[row] = keyword_scores[0]
-                top_mmap[row, 0] = top[0]
-                margin_mmap[row, 0] = margin[0]
-                winner_mmap[row] = winner_onehot(winner, len(keywords))[0]
-                winning = int(winner[0])
-                rows.append(
-                    {
-                        "row": row,
-                        "source_index": index,
-                        "id": record.get("id"),
-                        "path": str(path_value),
-                        "label": record.get("label"),
-                        "keyword_id": keywords[winning].id,
-                        "candidate_frame": candidate_frame,
-                        "top_score": float(top[0]),
-                        "margin": float(margin[0]),
-                    }
-                )
-                row += 1
-            except Exception as exc:
-                errors.append(
-                    {
-                        "index": index,
-                        "id": record.get("id"),
-                        "path": str(path_value) if path_value else None,
-                        "error": repr(exc),
-                    }
-                )
         if errors:
             sample = "; ".join(f"#{item['index']}: {item['error']}" for item in errors[:3])
             raise RuntimeError(
                 f"CTC-WAC feature generation had {len(errors)} error(s); no partial bundle was published. {sample}"
             )
-        if row != len(records) or feature_shape is None:
-            raise RuntimeError("CTC-WAC feature generation did not produce all requested rows")
-        assert feature_mmap is not None and score_mmap is not None
-        assert top_mmap is not None and margin_mmap is not None and winner_mmap is not None
-        for mmap in (feature_mmap, score_mmap, top_mmap, margin_mmap, winner_mmap):
-            mmap.flush()
-        # Drop references before atomic renames, which matters on Windows and
-        # makes the intent clear on Linux too.
-        del feature_mmap, score_mmap, top_mmap, margin_mmap, winner_mmap
-        feature_mmap = score_mmap = top_mmap = margin_mmap = winner_mmap = None
+        if feature_dim is None:
+            raise RuntimeError("CTC-WAC feature generation did not receive a usable stage-1 encoder output")
+        total_frames = int(offsets[-1])
+        if total_frames:
+            raw = np.memmap(raw_features, mode="r", dtype=np.float32, shape=(total_frames, feature_dim))
+            feature_mmap = open_memmap(
+                temporary["features"],
+                mode="w+",
+                dtype=np.float32,
+                shape=(total_frames, feature_dim),
+            )
+            try:
+                for start in range(0, total_frames, 65536):
+                    feature_mmap[start:start + 65536] = raw[start:start + 65536]
+                feature_mmap.flush()
+            finally:
+                del feature_mmap, raw
+        else:
+            _atomic_write_npy(temporary["features"], np.empty((0, feature_dim), dtype=np.float32))
+        _atomic_write_npy(temporary["offsets"], np.asarray(offsets, dtype=np.int64))
+        _atomic_write_npy(temporary["lengths"], np.asarray(lengths, dtype=np.int32))
+        _atomic_write_npy(temporary["all_scores"], np.asarray(score_rows, dtype=np.float32).reshape(row, len(keywords)))
+        _atomic_write_npy(temporary["top_score"], np.asarray(top_rows, dtype=np.float32).reshape(row, 1))
+        _atomic_write_npy(temporary["margin"], np.asarray(margin_rows, dtype=np.float32).reshape(row, 1))
+        _atomic_write_npy(temporary["winner_onehot"], np.asarray(winner_rows, dtype=np.float32).reshape(row, len(keywords)))
+        length_values = np.asarray(lengths, dtype=np.int64)
         summary = {
             "bundle_schema": BUNDLE_SCHEMA_VERSION,
             "output_file": str(output_file),
             "feature_count": row,
-            "feature_shape": list(feature_shape),
+            "feature_storage_shape": [total_frames, feature_dim],
+            "feature_dim": feature_dim,
+            "candidate_length_frames": {
+                "min": int(length_values.min()) if length_values.size else None,
+                "max": int(length_values.max()) if length_values.size else None,
+            },
             "keyword_count": len(keywords),
             "keyword_ids": [item.id for item in keywords],
             "keyword_token_fingerprint": keyword_token_fingerprint(keywords),
@@ -1017,8 +1226,14 @@ def generate_ctc_wac_feature_bundle(
             "keyword_tokens": str(keywords_path),
             "stage1_providers": stage1.providers,
             "sample_rate": contract.sample_rate,
-            "clip_seconds": float(clip_seconds),
-            "placement": placement,
+            "score_domain": "normalized_log_probability",
+            "encoder_frame_shift_ms": contract.encoder_frame_shift_ms,
+            "input_count": len(records),
+            "input_duration_seconds": input_duration_seconds,
+            "invalid_alignment_rows": len(invalid_alignments),
+            "invalid_alignments": invalid_alignments[:50],
+            "candidate_pre_margin_frames": int(candidate_pre_margin_frames),
+            "candidate_post_margin_frames": int(candidate_post_margin_frames),
             "index_offset": int(index_offset),
             "error_count": 0,
             "errors": [],
@@ -1033,6 +1248,7 @@ def generate_ctc_wac_feature_bundle(
         # A failed extraction never overwrites a last known-good bundle.
         for path in temporary.values():
             path.unlink(missing_ok=True)
+        raw_features.unlink(missing_ok=True)
 
 
 @dataclass
@@ -1044,6 +1260,8 @@ class CtcWacFeatureBlock:
     split: str
     paths: FeatureBundlePaths
     features: np.ndarray
+    offsets: np.ndarray
+    lengths: np.ndarray
     all_scores: np.ndarray
     top_score: np.ndarray
     margin: np.ndarray
@@ -1064,6 +1282,8 @@ class CtcWacFeatureBlock:
                 f"[{block.name}] was generated with different keyword token IDs; regenerate its feature bundle"
             )
         features = np.load(paths.features, mmap_mode="r")
+        offsets = np.load(paths.offsets, mmap_mode="r")
+        lengths = np.load(paths.lengths, mmap_mode="r")
         scores = np.load(paths.all_scores, mmap_mode="r")
         top = np.load(paths.top_score, mmap_mode="r")
         margin = np.load(paths.margin, mmap_mode="r")
@@ -1074,6 +1294,8 @@ class CtcWacFeatureBlock:
             split=str(block.split),
             paths=paths,
             features=features,
+            offsets=offsets,
+            lengths=lengths,
             all_scores=scores,
             top_score=top,
             margin=margin,
@@ -1083,7 +1305,7 @@ class CtcWacFeatureBlock:
 
     @property
     def input_count(self) -> int:
-        return int(self.features.shape[0])
+        return int(self.lengths.shape[0])
 
     @property
     def retained_count(self) -> int:
@@ -1091,12 +1313,42 @@ class CtcWacFeatureBlock:
 
     @property
     def feature_shape(self) -> tuple[int, int]:
-        return (int(self.features.shape[1]), int(self.features.shape[2]))
+        return (int(np.max(self.lengths)) if self.lengths.size else 0, int(self.features.shape[1]))
 
-    def batch(self, indices: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    @property
+    def feature_dim(self) -> int:
+        return int(self.features.shape[1])
+
+    def candidate(self, index: int) -> np.ndarray:
+        start = int(self.offsets[index])
+        end = int(self.offsets[index + 1])
+        return np.asarray(self.features[start:end], dtype=np.float32)
+
+    def retained_bucket_indices(self, bucket_width_frames: int) -> dict[int, np.ndarray]:
+        if bucket_width_frames < 1:
+            raise ValueError("bucket_width_frames must be >= 1")
+        values = np.asarray(self.lengths[self.retained_indices], dtype=np.int64)
+        buckets: dict[int, list[int]] = {}
+        for index, length in zip(self.retained_indices.tolist(), values.tolist()):
+            bucket = (int(length) - 1) // int(bucket_width_frames)
+            buckets.setdefault(bucket, []).append(int(index))
+        return {key: np.asarray(value, dtype=np.int64) for key, value in buckets.items()}
+
+    def batch(self, indices: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         selected = np.asarray(indices, dtype=np.int64)
+        if selected.size < 1:
+            raise ValueError("Cannot construct an empty CTC-WAC batch")
+        lengths = np.asarray(self.lengths[selected], dtype=np.int64)
+        max_frames = int(lengths.max())
+        values = np.zeros((selected.shape[0], max_frames, self.feature_dim), dtype=np.float32)
+        mask = np.zeros((selected.shape[0], max_frames), dtype=np.float32)
+        for row_index, source_index in enumerate(selected.tolist()):
+            candidate = self.candidate(int(source_index))
+            values[row_index, :candidate.shape[0]] = candidate
+            mask[row_index, :candidate.shape[0]] = 1.0
         return (
-            np.asarray(self.features[selected], dtype=np.float32),
+            values,
+            mask,
             np.asarray(self.top_score[selected], dtype=np.float32),
             np.asarray(self.margin[selected], dtype=np.float32),
             np.asarray(self.winner_onehot_values[selected], dtype=np.float32),
@@ -1108,6 +1360,8 @@ class CtcWacFeatureBlock:
             "input_rows": self.input_count,
             "retained_rows": self.retained_count,
             "dropped_rows": self.input_count - self.retained_count,
+            "min_retained_frames": int(np.min(self.lengths[self.retained_indices])) if self.retained_count else 0,
+            "max_retained_frames": int(np.max(self.lengths[self.retained_indices])) if self.retained_count else 0,
         }
 
 
@@ -1160,6 +1414,7 @@ class CtcWacClassifier(torch.nn.Module):
     def forward_logits(
         self,
         encoder_features: torch.Tensor,
+        frame_mask: torch.Tensor,
         top_score: torch.Tensor,
         margin: torch.Tensor,
         winner_onehot_values: torch.Tensor,
@@ -1170,9 +1425,13 @@ class CtcWacClassifier(torch.nn.Module):
                 raise ValueError("encoder_features must have shape [batch, frames, feature_dim]")
             if encoder_features.shape[-1] != self.feature_dim:
                 raise ValueError("encoder_features has the wrong feature dimension")
+            if frame_mask.shape != encoder_features.shape[:2]:
+                raise ValueError("frame_mask must have shape [batch, frames]")
             if winner_onehot_values.ndim != 2 or winner_onehot_values.shape[-1] != self.keyword_count:
                 raise ValueError("winner_onehot has the wrong keyword dimension")
-        pooled = self.frame_net(self.frame_norm(encoder_features)).mean(dim=1)
+        frame_values = self.frame_net(self.frame_norm(encoder_features))
+        mask = frame_mask.to(dtype=frame_values.dtype).unsqueeze(-1)
+        pooled = (frame_values * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
         normalized_score = (top_score.reshape(-1, 1) - self.score_mean) / self.score_std
         normalized_margin = (margin.reshape(-1, 1) - self.margin_mean) / self.margin_std
         context = torch.cat([pooled, normalized_score, normalized_margin, winner_onehot_values], dim=1)
@@ -1181,11 +1440,14 @@ class CtcWacClassifier(torch.nn.Module):
     def forward(
         self,
         encoder_features: torch.Tensor,
+        frame_mask: torch.Tensor,
         top_score: torch.Tensor,
         margin: torch.Tensor,
         winner_onehot_values: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.sigmoid(self.forward_logits(encoder_features, top_score, margin, winner_onehot_values))
+        return torch.sigmoid(
+            self.forward_logits(encoder_features, frame_mask, top_score, margin, winner_onehot_values)
+        )
 
 
 def ctc_wac_model_config(section: dict[str, str], *, section_name: str) -> dict[str, Any]:
@@ -1244,7 +1506,7 @@ def load_stage2_onnx(path: Path) -> tuple[Any, dict[str, tuple[int | None, ...]]
     except ImportError as exc:
         raise RuntimeError("onnxruntime is required for CTC-WAC evaluation") from exc
     session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
-    expected = {"encoder_features", "top_score", "margin", "winner_onehot"}
+    expected = {"encoder_features", "frame_mask", "top_score", "margin", "winner_onehot"}
     available = {item.name: item for item in session.get_inputs()}
     missing = sorted(expected - set(available))
     if missing:

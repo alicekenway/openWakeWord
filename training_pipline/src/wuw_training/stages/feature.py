@@ -71,7 +71,10 @@ def _validate_common_inputs(ctx: Any) -> None:
     split = require(ctx.section, "split", ctx.step).lower()
     if split not in {"train", "dev", "test", "false_positive"}:
         raise ConfigurationError(f"[{ctx.step}] split must be train, dev, test, or false_positive")
-    placement(ctx.section, ctx.step)
+    # CTC-WAC consumes the already augmented waveform verbatim.  Placement is
+    # therefore an augmentation concern, not a feature extraction concern.
+    if _extractor(ctx) != "wenet_ctc_wac":
+        placement(ctx.section, ctx.step)
     _output_file(ctx)
 
 
@@ -92,8 +95,10 @@ def validate(ctx: Any) -> None:
             raise ConfigurationError(
                 f"[{ctx.step}] [main] sample_rate={configured_rate} does not match stage-1 contract sample_rate={contract.sample_rate}"
             )
-        if number(ctx.config.section("main"), "clip_seconds", "main", 2.0) <= 0:
-            raise ConfigurationError("[main] clip_seconds must be > 0")
+        if integer(ctx.section, "candidate_pre_margin_frames", ctx.step, 3) < 0:
+            raise ConfigurationError(f"[{ctx.step}] candidate_pre_margin_frames must be >= 0")
+        if integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0) < 0:
+            raise ConfigurationError(f"[{ctx.step}] candidate_post_margin_frames must be >= 0")
         device = ctx.section.get("device", "cpu").lower()
         if device not in {"auto", "cpu", "gpu"}:
             raise ConfigurationError(f"[{ctx.step}] device must be auto, cpu, or gpu")
@@ -149,20 +154,18 @@ def run(ctx: Any) -> dict[str, Any]:
     normalise_manifest_inputs(
         inputs,
         normalized,
-        default_placement=placement(ctx.section, ctx.step),
+        default_placement=ctx.section.get("placement", "end") if _extractor(ctx) == "wenet_ctc_wac" else placement(ctx.section, ctx.step),
         label=integer(ctx.section, "label", ctx.step),
     )
     if _extractor(ctx) == "wenet_ctc_wac":
-        main = ctx.config.section("main")
         summary = generate_ctc_wac_feature_bundle(
             records=read_jsonl(normalized),
             output_file=_output_file(ctx),
             model_path=_stage1_model(ctx),
             contract_path=_stage1_contract(ctx),
             keywords_path=_keyword_tokens(ctx),
-            clip_seconds=number(main, "clip_seconds", "main", 2.0),
-            placement=placement(ctx.section, ctx.step),
-            seed=integer(main, "seed", "main", 1337),
+            candidate_pre_margin_frames=integer(ctx.section, "candidate_pre_margin_frames", ctx.step, 3),
+            candidate_post_margin_frames=integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0),
             device=ctx.section.get("device", "cpu").lower(),
             overwrite=ctx.force or boolean(ctx.section, "overwrite", ctx.step, False),
         )
@@ -171,7 +174,7 @@ def run(ctx: Any) -> dict[str, Any]:
         return {
             "output_file": str(_output_file(ctx)),
             "feature_count": summary.get("feature_count"),
-            "feature_shape": summary.get("feature_shape"),
+            "feature_shape": summary.get("feature_storage_shape"),
             "keyword_count": summary.get("keyword_count"),
             "stage1_gate_applied": False,
             "label": integer(ctx.section, "label", ctx.step),
@@ -218,7 +221,7 @@ def prepare_slurm_shards(ctx: Any, work_dir: Path, task_count: int) -> list[dict
     normalise_manifest_inputs(
         _inputs(ctx),
         normalized,
-        default_placement=placement(ctx.section, ctx.step),
+        default_placement=ctx.section.get("placement", "end") if _extractor(ctx) == "wenet_ctc_wac" else placement(ctx.section, ctx.step),
         label=integer(ctx.section, "label", ctx.step),
     )
     records = read_jsonl(normalized)
@@ -253,16 +256,14 @@ def run_slurm_shard(ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
     manifest = Path(str(task["input_manifest"])).resolve()
     index_offset = int(task["start"])
     if _extractor(ctx) == "wenet_ctc_wac":
-        main = ctx.config.section("main")
         summary = generate_ctc_wac_feature_bundle(
             records=read_jsonl(manifest),
             output_file=output,
             model_path=_stage1_model(ctx),
             contract_path=_stage1_contract(ctx),
             keywords_path=_keyword_tokens(ctx),
-            clip_seconds=number(main, "clip_seconds", "main", 2.0),
-            placement=placement(ctx.section, ctx.step),
-            seed=integer(main, "seed", "main", 1337),
+            candidate_pre_margin_frames=integer(ctx.section, "candidate_pre_margin_frames", ctx.step, 3),
+            candidate_post_margin_frames=integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0),
             device=ctx.section.get("device", "cpu").lower(),
             overwrite=True,
             index_offset=index_offset,
@@ -382,23 +383,34 @@ def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, 
     output = _output_file(ctx)
     destination = feature_bundle_paths(output)
     source_paths = [feature_bundle_paths(Path(str(task["output_file"])).resolve()) for task in tasks]
-    arrays = ("features", "all_scores", "top_score", "margin", "winner_onehot")
-    count = 0
-    feature_shape: tuple[int, ...] = ()
-    for name in arrays:
-        count_for_array, trailing, _dtype = _atomic_merge_arrays(
+    feature_frames, feature_shape, _dtype = _atomic_merge_arrays(
+        destination.features, [paths.features for paths in source_paths]
+    )
+    row_count, _length_shape, _dtype = _atomic_merge_arrays(
+        destination.lengths, [paths.lengths for paths in source_paths]
+    )
+    for name in ("all_scores", "top_score", "margin", "winner_onehot"):
+        count_for_array, _trailing, _dtype = _atomic_merge_arrays(
             getattr(destination, name), [getattr(paths, name) for paths in source_paths]
         )
-        if name == "features":
-            count = count_for_array
-            feature_shape = trailing
-        elif count_for_array != count:
+        if count_for_array != row_count:
             raise RuntimeError(f"CTC-WAC shard count mismatch while merging {name}")
+    lengths = np.asarray(np.load(destination.lengths, mmap_mode="r"), dtype=np.int64)
+    if int(lengths.sum()) != feature_frames:
+        raise RuntimeError("CTC-WAC merged candidate lengths do not match flat feature frame count")
+    offsets = np.concatenate([np.asarray([0], dtype=np.int64), np.cumsum(lengths, dtype=np.int64)])
+    temporary_offsets = destination.offsets.with_name(f".{destination.offsets.name}.slurm.tmp")
+    try:
+        with temporary_offsets.open("wb") as handle:
+            np.save(handle, offsets, allow_pickle=False)
+        os.replace(temporary_offsets, destination.offsets)
+    finally:
+        temporary_offsets.unlink(missing_ok=True)
     rows: list[dict[str, Any]] = []
     for paths in source_paths:
         rows.extend(read_jsonl(paths.rows))
-    if len(rows) != count:
-        raise RuntimeError("CTC-WAC shard row metadata count does not match merged features")
+    if len(rows) != row_count:
+        raise RuntimeError("CTC-WAC shard row metadata count does not match merged candidates")
     for index, row in enumerate(rows):
         row["row"] = index
     write_jsonl(destination.rows, rows)
@@ -406,8 +418,20 @@ def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, 
     summary.update(
         {
             "output_file": str(output),
-            "feature_count": count,
-            "feature_shape": list(feature_shape),
+            "feature_count": row_count,
+            "feature_storage_shape": [feature_frames, *feature_shape],
+            "feature_dim": int(feature_shape[0]),
+            "candidate_length_frames": {
+                "min": int(lengths.min()) if lengths.size else None,
+                "max": int(lengths.max()) if lengths.size else None,
+            },
+            "input_count": sum(int(read_json(paths.summary).get("input_count", 0)) for paths in source_paths),
+            "input_duration_seconds": sum(
+                float(read_json(paths.summary).get("input_duration_seconds", 0.0)) for paths in source_paths
+            ),
+            "invalid_alignment_rows": sum(
+                int(read_json(paths.summary).get("invalid_alignment_rows", 0)) for paths in source_paths
+            ),
             "error_count": 0,
             "errors": [],
         }
@@ -416,8 +440,8 @@ def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, 
     write_json(destination.summary, summary)
     return {
         "output_file": str(output),
-        "feature_count": count,
-        "feature_shape": list(feature_shape),
+        "feature_count": row_count,
+        "feature_shape": [int(lengths.max()) if lengths.size else 0, int(feature_shape[0])],
         "keyword_count": summary.get("keyword_count"),
         "stage1_gate_applied": False,
         "label": integer(ctx.section, "label", ctx.step),

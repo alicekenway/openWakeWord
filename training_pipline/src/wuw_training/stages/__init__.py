@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import augment, export, feature, summary, testing, train
+from . import augment, export, feature, stage1_report, summary, testing, train
 
 
 @dataclass(frozen=True)
@@ -94,6 +94,13 @@ HANDLERS: dict[str, StageHandler] = {
         summary.validate_outputs,
         summary.run,
     ),
+    "stage1_report": StageHandler(
+        stage1_report.validate,
+        stage1_report.input_paths,
+        stage1_report.output_paths,
+        stage1_report.validate_outputs,
+        stage1_report.run,
+    ),
 }
 
 
@@ -103,6 +110,6 @@ def handler_for_step(step: str) -> StageHandler:
         raise KeyError(prefix)
     if prefix in {"augment", "feature", "testing"} and "." not in step:
         raise KeyError(f"{prefix} stages require a named sub-block, for example {prefix}.positive_train")
-    if prefix in {"train", "export", "summary"} and step != prefix:
+    if prefix in {"train", "export", "summary", "stage1_report"} and step != prefix:
         raise KeyError(f"{prefix} must be listed as exactly '{prefix}'")
     return HANDLERS[prefix]

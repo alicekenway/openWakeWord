@@ -20,7 +20,7 @@ from ..ctc_wac import (
     Stage1Contract,
     StreamingCtcStage1,
     audio_to_fbank,
-    ctc_keyword_score_traces,
+    ctc_keyword_alignment_traces,
     load_audio,
     load_keywords,
     load_stage2_onnx,
@@ -135,6 +135,10 @@ def validate(ctx: Any) -> None:
             raise ConfigurationError(f"[{ctx.step}] stage1_device must be auto, cpu, or gpu")
         if number(ctx.section, "debounce_seconds", ctx.step, 1.0) < 0:
             raise ConfigurationError(f"[{ctx.step}] debounce_seconds must be >= 0")
+        if integer(ctx.section, "candidate_pre_margin_frames", ctx.step, 3) < 0:
+            raise ConfigurationError(f"[{ctx.step}] candidate_pre_margin_frames must be >= 0")
+        if integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0) < 0:
+            raise ConfigurationError(f"[{ctx.step}] candidate_post_margin_frames must be >= 0")
         _output_report(ctx)
         return
     model_dir = _model_dir(ctx)
@@ -269,26 +273,38 @@ def _markdown_report(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _ctc_wac_stage2_shape(shapes: dict[str, tuple[int | None, ...]]) -> tuple[int, int, int]:
+def _ctc_wac_stage2_shape(shapes: dict[str, tuple[int | None, ...]]) -> tuple[int, int]:
     encoder = shapes["encoder_features"]
+    mask = shapes["frame_mask"]
     winner = shapes["winner_onehot"]
-    if len(encoder) != 3 or encoder[1] is None or encoder[2] is None:
+    if len(encoder) != 3 or encoder[2] is None:
         raise ConfigurationError(
-            "CTC-WAC stage-2 ONNX must have encoder_features shaped [batch, fixed_frames, feature_dim]"
+            "CTC-WAC stage-2 ONNX must have encoder_features shaped [batch, frames, feature_dim]"
         )
+    if len(mask) != 2 or (encoder[1] is not None and mask[1] is not None and encoder[1] != mask[1]):
+        raise ConfigurationError("CTC-WAC stage-2 ONNX must have frame_mask shaped [batch, frames]")
     if len(winner) != 2 or winner[1] is None:
         raise ConfigurationError("CTC-WAC stage-2 ONNX must have winner_onehot shaped [batch, keyword_count]")
-    return int(encoder[1]), int(encoder[2]), int(winner[1])
+    return int(encoder[2]), int(winner[1])
 
 
-def _ctc_wac_window(encoder: np.ndarray, end_index: int, time_steps: int) -> np.ndarray:
-    """Return the last fixed-size encoder window, zero-padding startup audio."""
+def _ctc_wac_candidate_features(
+    encoder: np.ndarray,
+    *,
+    start_frame: int,
+    end_frame: int,
+    pre_margin_frames: int,
+    post_margin_frames: int,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Crop the exact stage-1 candidate region and return its all-one mask."""
 
-    result = np.zeros((time_steps, encoder.shape[1]), dtype=np.float32)
-    start = max(0, end_index + 1 - time_steps)
-    values = encoder[start:end_index + 1]
-    result[-values.shape[0]:] = values
-    return result
+    crop_start = max(0, int(start_frame) - int(pre_margin_frames))
+    crop_end = min(int(encoder.shape[0]), int(end_frame) + 1 + int(post_margin_frames))
+    if crop_start >= crop_end:
+        raise RuntimeError("CTC candidate crop is empty")
+    values = np.asarray(encoder[crop_start:crop_end], dtype=np.float32)[np.newaxis, ...]
+    mask = np.ones((1, values.shape[1]), dtype=np.float32)
+    return values, mask, crop_start, crop_end
 
 
 def _ctc_wac_record(
@@ -297,9 +313,10 @@ def _ctc_wac_record(
     stage1: StreamingCtcStage1,
     keywords: list[Any],
     stage2: Any,
-    time_steps: int,
     feature_dim: int,
     expected_label: int,
+    candidate_pre_margin_frames: int = 3,
+    candidate_post_margin_frames: int = 0,
 ) -> dict[str, Any]:
     """Run both stages on one full audio record and retain candidate details."""
 
@@ -313,7 +330,14 @@ def _ctc_wac_record(
         raise RuntimeError(
             f"Stage-1 encoder has {encoder.shape[1]} dimensions but stage-2 expects {feature_dim}"
         )
-    score_traces = ctc_keyword_score_traces(ctc, keywords, blank_id=stage1.contract.blank_id)
+    expected_vocab = getattr(stage1.contract, "vocab_size", None)
+    if expected_vocab is not None and ctc.shape[1] != int(expected_vocab):
+        raise RuntimeError(
+            f"Stage-1 CTC vocabulary has {ctc.shape[1]} outputs but contract expects {expected_vocab}"
+        )
+    score_traces, start_traces, end_traces = ctc_keyword_alignment_traces(
+        ctc, keywords, blank_id=stage1.contract.blank_id
+    )
     if score_traces.shape[1] == 0:
         raise RuntimeError("Stage-1 CTC scorer returned no keyword scores")
     thresholds = np.asarray([item.threshold for item in keywords], dtype=np.float32)
@@ -328,23 +352,40 @@ def _ctc_wac_record(
         previous_above = above_by_keyword
         if not is_candidate:
             continue
-        features = _ctc_wac_window(encoder, index, time_steps)[np.newaxis, ...]
+        start_frame = int(start_traces[index, winner_index])
+        end_frame = int(end_traces[index, winner_index])
+        if start_frame < 0 or end_frame < start_frame:
+            continue
+        features, frame_mask, crop_start, crop_end = _ctc_wac_candidate_features(
+            encoder,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            pre_margin_frames=candidate_pre_margin_frames,
+            post_margin_frames=candidate_post_margin_frames,
+        )
         onehot = winner_onehot(winner, len(keywords))
         probability = stage2.run(
             None,
             {
                 "encoder_features": features,
+                "frame_mask": frame_mask,
                 "top_score": top.reshape(1, 1).astype(np.float32),
                 "margin": margin.reshape(1, 1).astype(np.float32),
                 "winner_onehot": onehot,
             },
         )[0]
-        end_time = duration * (index + 1) / max(1, score_traces.shape[0])
+        frame_shift = float(getattr(stage1.contract, "encoder_frame_shift_ms", 40.0)) / 1000.0
         candidates.append(
             {
                 "keyword_id": keywords[winner_index].id,
-                "frame": index,
-                "end_time": float(end_time),
+                "trigger_frame": index,
+                "candidate_start_frame": start_frame,
+                "candidate_end_frame": end_frame,
+                "crop_start_frame": crop_start,
+                "crop_end_frame": crop_end,
+                "start_time": float(start_frame * frame_shift),
+                "end_time": float((end_frame + 1) * frame_shift),
+                "candidate_duration_frames": end_frame - start_frame + 1,
                 "stage1_score": float(top[0]),
                 "margin": float(margin[0]),
                 "score": float(np.asarray(probability).reshape(-1)[0]),
@@ -433,7 +474,7 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
         device=ctx.section.get("stage1_device", "cpu").lower(),
     )
     stage2, shapes = load_stage2_onnx(_model(ctx))
-    time_steps, feature_dim, keyword_count = _ctc_wac_stage2_shape(shapes)
+    feature_dim, keyword_count = _ctc_wac_stage2_shape(shapes)
     if keyword_count != len(keywords):
         raise ConfigurationError(
             f"Stage-2 ONNX expects {keyword_count} keywords but {len(keywords)} are configured"
@@ -468,9 +509,10 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
                     stage1=stage1,
                     keywords=keywords,
                     stage2=stage2,
-                    time_steps=time_steps,
                     feature_dim=feature_dim,
                     expected_label=expected_label,
+                    candidate_pre_margin_frames=integer(ctx.section, "candidate_pre_margin_frames", ctx.step, 3),
+                    candidate_post_margin_frames=integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0),
                 )
                 temporary_handle.write(json.dumps(detail) + "\n")
                 candidates = list(detail["stage1_candidates"])

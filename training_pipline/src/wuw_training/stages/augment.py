@@ -12,6 +12,22 @@ from ..legacy import get_legacy_module
 from .common import boolean, integer, number, placement, require, stage_work_path
 
 
+def _ctc_context(ctx: Any) -> bool:
+    return boolean(ctx.section, "ctc_context", ctx.step, False)
+
+
+def _window_seconds(ctx: Any) -> float:
+    main = ctx.config.section("main")
+    default = number(main, "ctc_context_seconds", "main", number(main, "clip_seconds", "main", 2.0))
+    return number(ctx.section, "window_seconds", ctx.step, default) if _ctc_context(ctx) else number(
+        main, "clip_seconds", "main", 2.0
+    )
+
+
+def _long_audio_mode(ctx: Any) -> str:
+    return ctx.section.get("long_audio_mode", "random").strip().lower()
+
+
 def _noise_dirs(ctx: Any) -> list[Path]:
     raw = ctx.section.get("noise_dir")
     if not raw:
@@ -75,6 +91,13 @@ def validate(ctx: Any) -> None:
     if not 0.0 <= probability <= 1.0:
         raise ConfigurationError(f"[{ctx.step}] artificial_probability must be between 0 and 1")
     placement(ctx.section, ctx.step)
+    if _ctc_context(ctx):
+        if _window_seconds(ctx) <= 0:
+            raise ConfigurationError(f"[{ctx.step}] window_seconds must be > 0")
+        if _long_audio_mode(ctx) not in {"filter", "start", "end", "random"}:
+            raise ConfigurationError(
+                f"[{ctx.step}] long_audio_mode must be filter, start, end, or random"
+            )
     _output_dir(ctx)
     _output_manifest(ctx)
 
@@ -97,7 +120,9 @@ def validate_outputs(ctx: Any) -> bool:
         return False
     try:
         summary = read_json(summary_path)
-        return int(summary.get("error_count", -1)) == 0 and int(summary.get("output_count", -1)) == len(read_jsonl(manifest))
+        return int(summary.get("error_count", -1)) == 0 and int(summary.get("output_count", -1)) == len(
+            read_jsonl(manifest, allow_empty=True)
+        )
     except Exception:
         return False
 
@@ -131,12 +156,14 @@ def run(ctx: Any) -> dict[str, Any]:
             snr_high=number(ctx.section, "snr_high", ctx.step, 15.0),
             artificial_prob=number(ctx.section, "artificial_probability", ctx.step, 0.0),
             random_gain_db=number(ctx.section, "random_gain_db", ctx.step, 0.0),
-            clip_seconds=number(ctx.config.section("main"), "clip_seconds", "main", 2.0),
+            clip_seconds=_window_seconds(ctx),
             sample_rate=integer(ctx.config.section("main"), "sample_rate", "main", 16000),
             placement=placement(ctx.section, ctx.step),
             seed=integer(ctx.config.section("main"), "seed", "main", 1337),
             overwrite=ctx.force or boolean(ctx.section, "overwrite", ctx.step, False),
             workers=integer(ctx.section, "workers", ctx.step, 1),
+            ctc_context=_ctc_context(ctx),
+            long_audio_mode=_long_audio_mode(ctx),
         )
     )
     if not validate_outputs(ctx):
@@ -212,13 +239,15 @@ def run_slurm_shard(ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
             snr_high=number(ctx.section, "snr_high", ctx.step, 15.0),
             artificial_prob=number(ctx.section, "artificial_probability", ctx.step, 0.0),
             random_gain_db=number(ctx.section, "random_gain_db", ctx.step, 0.0),
-            clip_seconds=number(ctx.config.section("main"), "clip_seconds", "main", 2.0),
+            clip_seconds=_window_seconds(ctx),
             sample_rate=integer(ctx.config.section("main"), "sample_rate", "main", 16000),
             placement=placement(ctx.section, ctx.step),
             seed=integer(ctx.config.section("main"), "seed", "main", 1337),
             overwrite=True,
             workers=integer(ctx.section, "workers", ctx.step, 1),
             index_offset=int(task["start"]),
+            ctc_context=_ctc_context(ctx),
+            long_audio_mode=_long_audio_mode(ctx),
         )
     )
     summary = read_json(Path(str(task["output_manifest"])).with_suffix(".summary.json"))
@@ -238,8 +267,7 @@ def validate_slurm_shard(ctx: Any, task: dict[str, Any]) -> bool:
         return (
             int(summary.get("error_count", -1)) == 0
             and int(summary.get("input_count", -1)) == int(task["count"])
-            and int(summary.get("output_count", -1)) == int(task["count"]) * integer(ctx.section, "rounds", ctx.step, 1)
-            and len(read_jsonl(output_manifest)) == int(summary["output_count"])
+            and len(read_jsonl(output_manifest, allow_empty=True)) == int(summary["output_count"])
         )
     except Exception:
         return False
@@ -250,7 +278,7 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
     shard_summaries: list[dict[str, Any]] = []
     for task in tasks:
         output_manifest = Path(str(task["output_manifest"])).resolve()
-        merged.extend(read_jsonl(output_manifest))
+        merged.extend(read_jsonl(output_manifest, allow_empty=True))
         shard_summaries.append(read_json(output_manifest.with_suffix(".summary.json")))
     merged.sort(key=lambda record: (int(record.get("augmentation_round", 0)), int(record.get("_slurm_index", -1))))
     for record in merged:
@@ -263,16 +291,22 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
     items = legacy.feature_items_from_feature_inputs(
         [str(normalized)], [], placement(ctx.section, ctx.step)
     )
-    first = shard_summaries[0]
     summary = {
         "input_count": len(items),
         "output_count": len(merged),
         "rounds": integer(ctx.section, "rounds", ctx.step, 1),
-        "noise_count": first.get("noise_count"),
+        "eligible_input_count": sum(int(value.get("eligible_input_count", 0)) for value in shard_summaries),
+        "filtered_long_audio_count": sum(int(value.get("filtered_long_audio_count", 0)) for value in shard_summaries),
+        # A filtered-only shard has no reason to enumerate background files,
+        # so do not let such a first shard erase the real shared noise count.
+        "noise_count": max(int(value.get("noise_count", 0)) for value in shard_summaries),
         "snr_low": number(ctx.section, "snr_low", ctx.step, -5.0),
         "snr_high": number(ctx.section, "snr_high", ctx.step, 15.0),
         "artificial_prob": number(ctx.section, "artificial_probability", ctx.step, 0.0),
         "placement": placement(ctx.section, ctx.step),
+        "ctc_context": _ctc_context(ctx),
+        "long_audio_mode": _long_audio_mode(ctx) if _ctc_context(ctx) else None,
+        "target_samples": int(round(_window_seconds(ctx) * integer(ctx.config.section("main"), "sample_rate", "main", 16000))),
         "placement_counts": legacy.placement_counts(value for _path, value in items),
         "input_signature": legacy.feature_input_signature(items),
         "workers": integer(ctx.section, "workers", ctx.step, 1),

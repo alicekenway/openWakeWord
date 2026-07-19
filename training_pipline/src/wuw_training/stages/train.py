@@ -70,7 +70,7 @@ def _feature_block(ctx: Any, name: str) -> FeatureBlock:
     if path.is_file():
         try:
             array = np.load(path, mmap_mode="r")
-            if array.ndim < 2 or array.shape[0] < 1:
+            if array.ndim < 2 or (array.shape[0] < 1 and _structure(ctx) != "ctc_wac"):
                 raise ValueError("expected a non-empty feature array")
             return FeatureBlock(name, path, label, split, tuple(int(v) for v in array.shape[1:]), int(array.shape[0]))
         except Exception as exc:
@@ -401,6 +401,8 @@ def _validate_ctc_wac(ctx: Any) -> None:
         raise ConfigurationError(f"[{ctx.step}] keep_checkpoints must be >= 1")
     if integer(ctx.section, "log_interval_steps", ctx.step, 100) < 1:
         raise ConfigurationError(f"[{ctx.step}] log_interval_steps must be >= 1")
+    if integer(ctx.section, "length_bucket_width_frames", ctx.step, 8) < 1:
+        raise ConfigurationError(f"[{ctx.step}] length_bucket_width_frames must be >= 1")
     if (
         boolean(ctx.section, "require_cuda", ctx.step, False)
         and getattr(ctx, "execution_role", "controller") != "slurm_controller"
@@ -442,6 +444,7 @@ def validate_outputs(ctx: Any) -> bool:
                 and int(summary.get("completed_phases", 0)) >= 1
                 and isinstance(checkpoint, dict)
                 and checkpoint.get("structure") == "ctc_wac"
+                and int(checkpoint.get("schema_version", 0)) == 2
                 and "model_state_dict" in checkpoint
             )
         return summary.get("output_model") == str(model_path) and int(summary.get("completed_phases", 0)) >= 1
@@ -596,7 +599,7 @@ class ResumableAutoTrainer:
     def _checkpoint_payload(self) -> dict[str, Any]:
         cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         return {
-            "schema_version": 2,
+            "schema_version": 1,
             "config_fingerprint": self.config_fingerprint,
             "inputs_fingerprint": self.inputs_fingerprint,
             "model_state_dict": _cpu_state_dict(self.network),
@@ -1004,36 +1007,63 @@ class ResumableAutoTrainer:
 
 
 class CtcWacBatchSampler:
-    """Balanced random batches drawn only from rows that pass the stage-1 gate."""
+    """Balanced, length-bucketed batches drawn after the stage-1 gate."""
 
-    def __init__(self, groups: list[tuple[CtcWacFeatureBlock, int]], seed: int):
+    def __init__(
+        self,
+        groups: list[tuple[CtcWacFeatureBlock, int]],
+        seed: int,
+        *,
+        bucket_width_frames: int = 8,
+    ):
         self.groups = groups
         self.rng = np.random.default_rng(seed)
+        self.bucket_width_frames = int(bucket_width_frames)
+        if self.bucket_width_frames < 1:
+            raise ValueError("bucket_width_frames must be >= 1")
+        self.buckets = [block.retained_bucket_indices(self.bucket_width_frames) for block, _count in groups]
+        self.available_buckets = sorted({key for values in self.buckets for key in values})
+        if not self.available_buckets:
+            raise RuntimeError("No retained stage-1 candidates are available for CTC-WAC batching")
 
-    def next_batch(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        feature_parts: list[np.ndarray] = []
+    @staticmethod
+    def _nearest_bucket(values: dict[int, np.ndarray], requested: int) -> np.ndarray:
+        if requested in values:
+            return values[requested]
+        nearest = min(values, key=lambda value: (abs(value - requested), value))
+        return values[nearest]
+
+    def next_batch(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        feature_rows: list[np.ndarray] = []
         score_parts: list[np.ndarray] = []
         margin_parts: list[np.ndarray] = []
         winner_parts: list[np.ndarray] = []
         label_parts: list[np.ndarray] = []
-        for block, count in self.groups:
+        requested_bucket = int(self.rng.choice(self.available_buckets))
+        for (block, count), buckets in zip(self.groups, self.buckets):
             if block.retained_count < 1:
                 raise RuntimeError(f"No retained stage-1 candidates remain in {block.name}")
-            positions = self.rng.integers(0, block.retained_count, size=count)
-            indices = block.retained_indices[positions]
-            features, score, margin, winner, labels = block.batch(indices)
-            feature_parts.append(features)
-            score_parts.append(score)
-            margin_parts.append(margin)
-            winner_parts.append(winner)
-            label_parts.append(labels)
-        features = np.concatenate(feature_parts, axis=0)
+            indices_for_bucket = self._nearest_bucket(buckets, requested_bucket)
+            positions = self.rng.integers(0, indices_for_bucket.shape[0], size=count)
+            indices = indices_for_bucket[positions]
+            feature_rows.extend(block.candidate(int(index)) for index in indices.tolist())
+            score_parts.append(np.asarray(block.top_score[indices], dtype=np.float32))
+            margin_parts.append(np.asarray(block.margin[indices], dtype=np.float32))
+            winner_parts.append(np.asarray(block.winner_onehot_values[indices], dtype=np.float32))
+            label_parts.append(np.full(count, block.label, dtype=np.float32))
+        max_frames = max(int(value.shape[0]) for value in feature_rows)
+        feature_dim = int(feature_rows[0].shape[1])
+        features = np.zeros((len(feature_rows), max_frames, feature_dim), dtype=np.float32)
+        mask = np.zeros((len(feature_rows), max_frames), dtype=np.float32)
+        for row, value in enumerate(feature_rows):
+            features[row, :value.shape[0]] = value
+            mask[row, :value.shape[0]] = 1.0
         scores = np.concatenate(score_parts, axis=0)
         margins = np.concatenate(margin_parts, axis=0)
         winners = np.concatenate(winner_parts, axis=0)
         labels = np.concatenate(label_parts, axis=0)
         order = self.rng.permutation(labels.shape[0])
-        return features[order], scores[order], margins[order], winners[order], labels[order]
+        return features[order], mask[order], scores[order], margins[order], winners[order], labels[order]
 
     def state_dict(self) -> dict[str, Any]:
         return copy.deepcopy(dict(self.rng.bit_generator.state))
@@ -1103,13 +1133,14 @@ class CtcWacTrainer:
         self.keywords = load_keywords(keywords_path)
         if not train_blocks:
             raise RuntimeError("CTC-WAC trainer received no training blocks")
-        self.feature_shape = train_blocks[0].feature_shape
+        self.feature_dim = train_blocks[0].feature_dim
         all_blocks = [*train_blocks, *validation_blocks]
-        mismatched = [block.name for block in all_blocks if block.feature_shape != self.feature_shape]
+        mismatched = [block.name for block in all_blocks if block.feature_dim != self.feature_dim]
         if mismatched:
             raise ConfigurationError(
-                f"All CTC-WAC feature bundles must have the same [frames, dimensions]; mismatched: {', '.join(mismatched)}"
+                f"All CTC-WAC feature bundles must have the same encoder feature dimension; mismatched: {', '.join(mismatched)}"
             )
+        self.max_candidate_frames = max(block.feature_shape[0] for block in all_blocks)
         if any(block.winner_onehot_values.shape[1] != len(self.keywords) for block in all_blocks):
             raise ConfigurationError("CTC-WAC feature bundle keyword count does not match the training keyword config")
         self.model_config = ctc_wac_model_config(ctx.section, section_name=ctx.step)
@@ -1117,7 +1148,7 @@ class CtcWacTrainer:
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.use_amp = boolean(ctx.section, "mixed_precision", ctx.step, False) and self.device.type == "cuda"
         self.network = make_ctc_wac_model(
-            feature_dim=self.feature_shape[1],
+            feature_dim=self.feature_dim,
             keyword_count=len(self.keywords),
             model_config=self.model_config,
             **self.scalar_normalization,
@@ -1132,6 +1163,7 @@ class CtcWacTrainer:
         self.sampler = CtcWacBatchSampler(
             [(block, _batch_count(ctx, block.name)) for block in train_blocks],
             seed,
+            bucket_width_frames=integer(ctx.section, "length_bucket_width_frames", ctx.step, 8),
         )
         self.seed = seed
         self.phase_index = 0
@@ -1149,7 +1181,7 @@ class CtcWacTrainer:
                 "section": ctx.section,
                 "structure": "ctc_wac",
                 "keywords_fingerprint": keyword_fingerprint(self.keywords),
-                "schema": 1,
+                "schema": 2,
             }
         )
         self.inputs_fingerprint = _ctc_wac_feature_signature(all_blocks)
@@ -1176,7 +1208,7 @@ class CtcWacTrainer:
 
     def _checkpoint_payload(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "structure": "ctc_wac",
             "config_fingerprint": self.config_fingerprint,
             "inputs_fingerprint": self.inputs_fingerprint,
@@ -1221,6 +1253,7 @@ class CtcWacTrainer:
                 if (
                     not isinstance(state, dict)
                     or state.get("structure") != "ctc_wac"
+                    or int(state.get("schema_version", 0)) != 2
                     or state.get("config_fingerprint") != self.config_fingerprint
                     or state.get("inputs_fingerprint") != self.inputs_fingerprint
                 ):
@@ -1264,8 +1297,8 @@ class CtcWacTrainer:
 
     def _to_device(
         self,
-        batch: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return tuple(torch.from_numpy(value).to(self.device) for value in batch)  # type: ignore[return-value]
 
     def _validation(self) -> dict[str, Any]:
@@ -1283,8 +1316,8 @@ class CtcWacTrainer:
                     if indices.size == 0:
                         continue
                     batch = block.batch(indices)
-                    x, score, margin, winner, labels = self._to_device(batch)
-                    logits = self.network.forward_logits(x, score, margin, winner).reshape(-1)
+                    x, mask, score, margin, winner, labels = self._to_device(batch)
+                    logits = self.network.forward_logits(x, mask, score, margin, winner).reshape(-1)
                     loss = functional.binary_cross_entropy_with_logits(logits, labels, reduction="sum")
                     block_examples += int(labels.numel())
                     block_loss += float(loss.cpu().item())
@@ -1314,13 +1347,13 @@ class CtcWacTrainer:
 
     def _train_step(self, learning_rate: float) -> float:
         batch = self.sampler.next_batch()
-        x, score, margin, winner, labels = self._to_device(batch)
+        x, mask, score, margin, winner, labels = self._to_device(batch)
         for group in self.optimizer.param_groups:
             group["lr"] = learning_rate
         self.optimizer.zero_grad(set_to_none=True)
         context = torch.autocast(device_type="cuda", enabled=self.use_amp) if self.device.type == "cuda" else torch.autocast(device_type="cpu", enabled=False)
         with context:
-            logits = self.network.forward_logits(x, score, margin, winner).reshape(-1)
+            logits = self.network.forward_logits(x, mask, score, margin, winner).reshape(-1)
             weights = torch.where(
                 labels == 0,
                 torch.full_like(labels, number(self.ctx.section, "max_negative_weight", self.ctx.step, 1.0)),
@@ -1407,12 +1440,13 @@ class CtcWacTrainer:
             self.network.load_state_dict(self.best_state)
         model_path = _output_model(self.ctx)
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "structure": "ctc_wac",
             "model_state_dict": _cpu_state_dict(self.network),
-            "input_shape": list(self.feature_shape),
-            "time_steps": self.feature_shape[0],
-            "feature_dim": self.feature_shape[1],
+            "input_shape": [self.max_candidate_frames, self.feature_dim],
+            "feature_dim": self.feature_dim,
+            "max_candidate_frames": self.max_candidate_frames,
+            "length_bucket_width_frames": integer(self.ctx.section, "length_bucket_width_frames", self.ctx.step, 8),
             "keyword_count": len(self.keywords),
             "keyword_ids": [item.id for item in self.keywords],
             "keywords_fingerprint": keyword_fingerprint(self.keywords),
@@ -1424,6 +1458,7 @@ class CtcWacTrainer:
         }
         _atomic_torch_save(model_path, payload)
         summary = {
+            "schema_version": 2,
             "structure": "ctc_wac",
             "output_model": str(model_path),
             "model_checkpoint_dir": str(self.checkpoint_dir),
@@ -1431,7 +1466,8 @@ class CtcWacTrainer:
             "completed_phases": len(self.plan),
             "global_steps": self.global_step,
             "phase_plan": self.plan,
-            "input_shape": list(self.feature_shape),
+            "input_shape": [self.max_candidate_frames, self.feature_dim],
+            "length_bucket_width_frames": integer(self.ctx.section, "length_bucket_width_frames", self.ctx.step, 8),
             "keyword_ids": payload["keyword_ids"],
             "keywords_fingerprint": payload["keywords_fingerprint"],
             "model_config": self.model_config,

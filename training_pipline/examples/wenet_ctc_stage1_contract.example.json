@@ -1,4 +1,5 @@
 {
+  "schema_version": 2,
   "sample_rate": 16000,
   "fbank": {
     "num_mel_bins": 80,
@@ -22,6 +23,11 @@
     "ctc_log_probs": "ctc_log_probs"
   },
   "ctc_output_is_log_probs": true,
+  "encoder_frame_shift_ms": 40.0,
+  "encoder_output_size": 256,
+  "vocab_size": 78,
+  "subsampling_factor": 4,
+  "encoder_chunk_frames": 16,
   "constant_inputs": {
     "required_cache_size": 64
   },

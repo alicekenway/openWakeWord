@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -21,16 +23,21 @@ from wuw_training.ctc_wac import (  # noqa: E402
     CtcWacFeatureBlock,
     Stage1Contract,
     StreamingCtcStage1,
+    ctc_keyword_alignment_trace,
     ctc_keyword_score_trace,
     feature_bundle_paths,
+    feature_bundle_valid,
     keyword_token_fingerprint,
     load_keywords,
+    make_ctc_wac_model,
     rank_keyword_scores,
 )
 from wuw_training.runner import PipelineRunner  # noqa: E402
 from wuw_training.config import load_ini_config  # noqa: E402
 from wuw_training.stages.train import FeatureBlock  # noqa: E402
+from wuw_training.stages.feature import _merge_ctc_wac_features  # noqa: E402
 from wuw_training.stages.testing import _ctc_wac_record  # noqa: E402
+import wuw_training.ctc_wac as ctc_wac_module  # noqa: E402
 
 
 def _keyword_file(root: Path) -> Path:
@@ -50,7 +57,9 @@ def _keyword_file(root: Path) -> Path:
 def _write_bundle(path: Path, *, label: int, keywords_path: Path, seed: int) -> None:
     keywords = load_keywords(keywords_path)
     rng = np.random.default_rng(seed)
-    features = rng.standard_normal((4, 6, 5), dtype=np.float32)
+    lengths = np.asarray([3, 6, 4, 5], dtype=np.int32)
+    offsets = np.concatenate([np.asarray([0], dtype=np.int64), np.cumsum(lengths, dtype=np.int64)])
+    features = rng.standard_normal((int(offsets[-1]), 5), dtype=np.float32)
     # Three rows pass stage 1. The final row must remain in the artifact but be
     # dropped only by the CTC-WAC train loader.
     scores = np.asarray(
@@ -61,18 +70,22 @@ def _write_bundle(path: Path, *, label: int, keywords_path: Path, seed: int) -> 
     onehot[np.arange(scores.shape[0]), winner] = 1.0
     paths = feature_bundle_paths(path)
     np.save(paths.features, features)
+    np.save(paths.offsets, offsets)
+    np.save(paths.lengths, lengths)
     np.save(paths.all_scores, scores)
     np.save(paths.top_score, top.reshape(-1, 1))
     np.save(paths.margin, margin.reshape(-1, 1))
     np.save(paths.winner_onehot, onehot)
-    write_jsonl(paths.rows, [{"row": index, "label": label} for index in range(features.shape[0])])
+    write_jsonl(paths.rows, [{"row": index, "label": label} for index in range(lengths.shape[0])])
     write_json(
         paths.summary,
         {
             "bundle_schema": BUNDLE_SCHEMA_VERSION,
-            "feature_count": int(features.shape[0]),
-            "feature_shape": [6, 5],
+            "feature_count": int(lengths.shape[0]),
+            "feature_storage_shape": list(features.shape),
+            "feature_dim": 5,
             "keyword_count": len(keywords),
+            "keyword_ids": [item.id for item in keywords],
             "keyword_token_fingerprint": keyword_token_fingerprint(keywords),
             "error_count": 0,
         },
@@ -95,6 +108,132 @@ def test_ctc_viterbi_trace_prefers_the_right_token_order() -> None:
     assert np.isfinite(right).all()
     assert right[-1] > wrong[-1]
     assert np.isfinite(repeated[-1])
+
+
+def test_ctc_alignment_trace_reports_token_boundaries_not_trailing_blanks() -> None:
+    probabilities = np.asarray(
+        [
+            [0.02, 0.96, 0.02],  # token 1
+            [0.95, 0.03, 0.02],  # blank
+            [0.02, 0.02, 0.96],  # token 2
+            [0.99, 0.005, 0.005],  # trailing blank
+        ],
+        dtype=np.float32,
+    )
+    trace = ctc_keyword_alignment_trace(np.log(probabilities), [1, 2], blank_id=0)
+    assert trace.starts[2] == 0
+    assert trace.ends[2] == 2
+    assert trace.ends[3] == 2
+
+
+def test_feature_bundle_crops_variable_length_ctc_candidates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    keywords_path = _keyword_file(tmp_path)
+    contract_path = tmp_path / "contract.json"
+    write_json(
+        contract_path,
+        {
+            "schema_version": 2,
+            "sample_rate": 16000,
+            "fbank": {"num_mel_bins": 80, "frame_length_ms": 25.0, "frame_shift_ms": 10.0, "dither": 0.0},
+            "chunk_frames": 7,
+            "chunk_stride_frames": 7,
+            "minimum_input_frames": 1,
+            "pad_final_chunk": False,
+            "inputs": {"features": "chunk"},
+            "outputs": {"encoder": "encoder_out", "ctc_log_probs": "ctc_log_probs"},
+            "ctc_output_is_log_probs": True,
+            "encoder_frame_shift_ms": 40.0,
+            "encoder_output_size": 3,
+            "vocab_size": 3,
+        },
+    )
+
+    class FakeStage1:
+        providers = ["fake"]
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def infer_fbank(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            frames = int(values[0, 0])
+            encoder = np.arange(frames * 3, dtype=np.float32).reshape(frames, 3)
+            probabilities = np.full((frames, 3), 0.005, dtype=np.float32)
+            probabilities[:, 0] = 0.99
+            probabilities[0] = [0.025, 0.95, 0.025]
+            probabilities[-1] = [0.025, 0.025, 0.95]
+            return encoder, np.log(probabilities)
+
+    monkeypatch.setattr(ctc_wac_module, "StreamingCtcStage1", FakeStage1)
+    monkeypatch.setattr(
+        ctc_wac_module,
+        "load_audio",
+        lambda path, _sample_rate: np.zeros(5 if path.name == "one.wav" else 7, dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        ctc_wac_module,
+        "audio_to_fbank",
+        lambda audio, _contract: np.asarray([[audio.size]], dtype=np.float32),
+    )
+    output = tmp_path / "bundle.npy"
+    summary = ctc_wac_module.generate_ctc_wac_feature_bundle(
+        records=[{"id": "one", "path": str(tmp_path / "one.wav")}, {"id": "two", "path": str(tmp_path / "two.wav")}],
+        output_file=output,
+        model_path=tmp_path / "stage1.onnx",
+        contract_path=contract_path,
+        keywords_path=keywords_path,
+        candidate_pre_margin_frames=1,
+    )
+    paths = feature_bundle_paths(output)
+    lengths = np.load(paths.lengths)
+    offsets = np.load(paths.offsets)
+    assert summary["feature_count"] == 2
+    assert lengths.tolist() == [5, 7]
+    assert offsets.tolist() == [0, 5, 12]
+    assert np.load(paths.features).shape == (12, 3)
+
+
+def test_masked_wac_pooling_ignores_tail_padding() -> None:
+    model = make_ctc_wac_model(
+        feature_dim=3,
+        keyword_count=2,
+        model_config={"frame_hidden": 4, "frame_layers": 1, "head_hidden": 4, "dropout": 0.0},
+    ).eval()
+    features = torch.zeros((1, 4, 3), dtype=torch.float32)
+    mask = torch.tensor([[1.0, 1.0, 0.0, 0.0]], dtype=torch.float32)
+    scalar = torch.zeros((1, 1), dtype=torch.float32)
+    winner = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    with torch.inference_mode():
+        first = model(features, mask, scalar, scalar, winner)
+        features[:, 2:] = 1000.0
+        second = model(features, mask, scalar, scalar, winner)
+    assert torch.allclose(first, second, rtol=1e-6, atol=1e-6)
+
+
+def test_slurm_merge_rebuilds_ragged_offsets(tmp_path: Path) -> None:
+    keywords_path = _keyword_file(tmp_path)
+    first = tmp_path / "shard_a.npy"
+    second = tmp_path / "shard_b.npy"
+    output = tmp_path / "merged.npy"
+    _write_bundle(first, label=1, keywords_path=keywords_path, seed=3)
+    _write_bundle(second, label=1, keywords_path=keywords_path, seed=4)
+    ctx = SimpleNamespace(
+        step="feature.positive_train",
+        section={"output_file": str(output), "label": "1", "split": "train"},
+        config=SimpleNamespace(resolve_path=lambda value: Path(value).resolve()),
+    )
+    result = _merge_ctc_wac_features(
+        ctx,
+        [{"output_file": str(first)}, {"output_file": str(second)}],
+    )
+    paths = feature_bundle_paths(output)
+    lengths = np.load(paths.lengths)
+    offsets = np.load(paths.offsets)
+    rows = [json.loads(line) for line in paths.rows.read_text(encoding="utf-8").splitlines()]
+    assert feature_bundle_valid(output)
+    assert result["feature_count"] == 8
+    assert lengths.tolist() == [3, 6, 4, 5, 3, 6, 4, 5]
+    assert offsets.tolist() == [0, 3, 9, 13, 18, 21, 27, 31, 36]
+    assert [row["row"] for row in rows] == list(range(8))
 
 
 def test_generated_contract_fields_and_first_chunk_attention_mask(tmp_path: Path) -> None:
@@ -159,12 +298,12 @@ def test_bundle_keeps_all_rows_but_loader_applies_stage1_threshold(tmp_path: Pat
     assert changed_loaded.retained_count == 0
 
 
-def test_cascade_record_feeds_all_four_wac_inputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_cascade_record_feeds_all_masked_wac_inputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     keywords_path = _keyword_file(tmp_path)
     keywords = load_keywords(keywords_path)
 
     class FakeStage1:
-        contract = SimpleNamespace(sample_rate=16000, blank_id=0)
+        contract = SimpleNamespace(sample_rate=16000, blank_id=0, encoder_frame_shift_ms=40.0)
 
         def infer_fbank(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             encoder = np.arange(20, dtype=np.float32).reshape(4, 5)
@@ -193,18 +332,19 @@ def test_cascade_record_feeds_all_four_wac_inputs(monkeypatch: pytest.MonkeyPatc
         stage1=FakeStage1(),  # type: ignore[arg-type]
         keywords=keywords,
         stage2=stage2,
-        time_steps=6,
         feature_dim=5,
         expected_label=1,
     )
     assert detail["stage1_candidate_count"] >= 1
     assert stage2.feed is not None
-    assert set(stage2.feed) == {"encoder_features", "top_score", "margin", "winner_onehot"}
-    assert stage2.feed["encoder_features"].shape == (1, 6, 5)
+    assert set(stage2.feed) == {"encoder_features", "frame_mask", "top_score", "margin", "winner_onehot"}
+    assert stage2.feed["encoder_features"].shape[0] == 1
+    assert stage2.feed["encoder_features"].shape[2] == 5
+    assert np.all(stage2.feed["frame_mask"] == 1.0)
     assert stage2.feed["winner_onehot"].shape == (1, 2)
 
 
-def test_ctc_wac_train_and_export_four_input_onnx(tmp_path: Path) -> None:
+def test_ctc_wac_train_and_export_masked_dynamic_onnx(tmp_path: Path) -> None:
     has_onnx = importlib.util.find_spec("onnx") is not None
     has_ort = importlib.util.find_spec("onnxruntime") is not None
     if has_ort:
@@ -292,6 +432,7 @@ opset_version = 13
     session = ort.InferenceSession(str(tmp_path / "experiment" / "model.onnx"), providers=["CPUExecutionProvider"])
     assert {item.name for item in session.get_inputs()} == {
         "encoder_features",
+        "frame_mask",
         "top_score",
         "margin",
         "winner_onehot",
@@ -299,7 +440,8 @@ opset_version = 13
     output = session.run(
         None,
         {
-            "encoder_features": np.zeros((1, 6, 5), dtype=np.float32),
+            "encoder_features": np.zeros((1, 4, 5), dtype=np.float32),
+            "frame_mask": np.ones((1, 4), dtype=np.float32),
             "top_score": np.zeros((1, 1), dtype=np.float32),
             "margin": np.zeros((1, 1), dtype=np.float32),
             "winner_onehot": np.asarray([[1.0, 0.0]], dtype=np.float32),
@@ -307,3 +449,44 @@ opset_version = 13
     )[0]
     assert output.shape == (1, 1)
     assert 0.0 <= float(output[0, 0]) <= 1.0
+
+
+def test_stage1_report_summarizes_ragged_candidate_scores(tmp_path: Path) -> None:
+    keywords_path = _keyword_file(tmp_path)
+    positive = tmp_path / "positive.npy"
+    negative = tmp_path / "negative.npy"
+    _write_bundle(positive, label=1, keywords_path=keywords_path, seed=1)
+    _write_bundle(negative, label=0, keywords_path=keywords_path, seed=2)
+    config = tmp_path / "report.ini"
+    config.write_text(
+        f"""[main]
+experiment_dir = {tmp_path / 'experiment'}
+
+[steps]
+steps = stage1_report
+
+[feature.positive]
+output_file = {positive}
+label = 1
+split = train
+
+[feature.negative]
+output_file = {negative}
+label = 0
+split = train
+
+[stage1_report]
+features = feature.positive, feature.negative
+output_json = ${{main:experiment_dir}}/report.json
+output_report = ${{main:experiment_dir}}/report.md
+threshold_start = -5
+threshold_stop = 0
+threshold_step = 1
+""",
+        encoding="utf-8",
+    )
+    PipelineRunner(load_ini_config(config)).run()
+    payload = json.loads((tmp_path / "experiment" / "report.json").read_text(encoding="utf-8"))
+    assert payload["report_schema"] == 1
+    assert "train:positive" in payload["aggregates"]
+    assert payload["per_keyword"]["wake_a"]["candidate_rows"] >= 1
