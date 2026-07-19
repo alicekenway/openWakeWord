@@ -12,6 +12,30 @@ Readers still accept legacy aliases such as `audiofile_path`, but any tool that
 creates new audio (conversion, VAD trimming, or augmentation) replaces the old
 audio reference instead of retaining source-path copies.
 
+## Filter JSONL By Unwanted Text
+
+Remove every JSONL record whose `text` value is listed in a plain-text file:
+
+```bash
+python data_processing_tools/filter_jsonl_by_text.py \
+  --input-jsonl /path/to/input.jsonl \
+  --exclude-text-file /path/to/unwanted_text.txt \
+  --output-jsonl /path/to/cleaned.jsonl
+```
+
+Put one unwanted value on each non-empty line of `unwanted_text.txt`:
+
+```text
+transcript to remove
+another transcript to remove
+```
+
+Matching is exact: text case and spaces must match. Records without a `text`
+field are treated as input errors, rather than being silently retained. Use
+`--text-field name` if the transcript is stored under another JSON key. The
+tool writes `cleaned.summary.json` next to the retained JSONL with input,
+removed, and written row counts.
+
 ## Wake Words To Phoneme Keyword Tokens
 
 Create the token-only keyword JSON used by the WeNet CTC-WAC feature stages:
