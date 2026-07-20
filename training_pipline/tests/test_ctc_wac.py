@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import random
 import sys
 from types import SimpleNamespace
@@ -275,6 +276,64 @@ def test_ctc_context_augmentation_uses_variable_real_background_context(
     assert record["ctc_window_samples"] == source.numel() + record["ctc_leading_context_samples"]
     assert requested_background_lengths == [record["ctc_window_samples"]]
     assert saved_lengths == [record["ctc_window_samples"]]
+
+
+def test_ctc_background_window_decodes_only_the_requested_segment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pytest.importorskip("torchaudio")
+    legacy = get_legacy_module()
+    background = tmp_path / "hour_long_background.wav"
+    target_samples = 81_920
+    source_sample_rate = 48_000
+    source_total_frames = source_sample_rate * 3600
+    info_calls: list[str] = []
+    load_calls: list[dict[str, int]] = []
+
+    def fake_info(path: str) -> SimpleNamespace:
+        info_calls.append(path)
+        return SimpleNamespace(sample_rate=source_sample_rate, num_frames=source_total_frames)
+
+    def fake_load(path: str, *, frame_offset: int, num_frames: int) -> tuple[torch.Tensor, int]:
+        load_calls.append({"frame_offset": frame_offset, "num_frames": num_frames})
+        return torch.ones((1, num_frames), dtype=torch.float32), source_sample_rate
+
+    monkeypatch.setattr(legacy.torchaudio, "info", fake_info)
+    monkeypatch.setattr(legacy.torchaudio, "load", fake_load)
+    monkeypatch.setattr(
+        legacy,
+        "waveform_to_float",
+        lambda waveform, decoded_sample_rate, sr: torch.ones(target_samples + 1, dtype=torch.float32),
+    )
+    monkeypatch.setattr(
+        legacy,
+        "load_audio_float",
+        lambda *_args, **_kwargs: pytest.fail("full background recording must not be decoded"),
+    )
+    legacy._CTC_BACKGROUND_INFO_CACHE.clear()
+
+    first = legacy._ctc_background_window(
+        background,
+        target_samples=target_samples,
+        rng=random.Random(7),
+        sample_rate=16_000,
+    )
+    second = legacy._ctc_background_window(
+        background,
+        target_samples=target_samples,
+        rng=random.Random(8),
+        sample_rate=16_000,
+    )
+
+    expected_source_frames = math.ceil(target_samples * source_sample_rate / 16_000) + 2
+    assert first.shape == second.shape == (target_samples,)
+    assert info_calls == [str(background)]
+    assert len(load_calls) == 2
+    assert all(call["num_frames"] == expected_source_frames for call in load_calls)
+    assert all(
+        0 <= call["frame_offset"] <= source_total_frames - expected_source_frames
+        for call in load_calls
+    )
 
 
 def test_feature_bundle_crops_variable_length_ctc_candidates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

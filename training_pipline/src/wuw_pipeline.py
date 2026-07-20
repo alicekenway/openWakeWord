@@ -135,6 +135,7 @@ RUN_EXPERIMENT_DEFAULTS: dict[str, Any] = {
 }
 _CONVERT_WORKER_CONFIG: dict[str, Any] = {}
 _AUGMENT_WORKER_CONFIG: dict[str, Any] = {}
+_CTC_BACKGROUND_INFO_CACHE: dict[str, tuple[int, int]] = {}
 
 
 def json_default(value: Any) -> Any:
@@ -620,7 +621,52 @@ def _ctc_background_window(
     rng: random.Random,
     sample_rate: int,
 ) -> torch.Tensor:
-    """Load one complete random background window without zero-padding it."""
+    """Decode one random background window without loading the full recording.
+
+    Background manifests commonly point at hour-long recordings.  Audio
+    metadata gives us the source sample rate and frame count, so choose a
+    source-frame offset first and ask torchaudio to decode only the few seconds
+    needed for this augmented example.  The full-file path remains as a
+    compatibility fallback for backends or formats that cannot seek.
+    """
+
+    cache_key = str(path)
+    audio_info = _CTC_BACKGROUND_INFO_CACHE.get(cache_key)
+    if audio_info is None:
+        try:
+            info = torchaudio.info(str(path))
+            if info.sample_rate > 0 and info.num_frames > 0:
+                audio_info = (int(info.sample_rate), int(info.num_frames))
+                _CTC_BACKGROUND_INFO_CACHE[cache_key] = audio_info
+        except Exception:
+            audio_info = None
+
+    if audio_info is not None:
+        source_sample_rate, source_total_frames = audio_info
+        source_frames = int(math.ceil(target_samples * source_sample_rate / sample_rate))
+        # Resampling can round the output length at a fractional boundary.
+        # Two extra source frames keep the decoded result safely long enough;
+        # they are removed after conversion to the requested sample rate.
+        if source_sample_rate != sample_rate:
+            source_frames += 2
+        if source_total_frames < source_frames:
+            raise ValueError(
+                f"Background is shorter than the required CTC context window after resampling: {path}"
+            )
+        frame_offset = rng.randint(0, source_total_frames - source_frames)
+        try:
+            waveform, decoded_sample_rate = torchaudio.load(
+                str(path),
+                frame_offset=frame_offset,
+                num_frames=source_frames,
+            )
+            noise = waveform_to_float(waveform, decoded_sample_rate, sr=sample_rate)
+            if noise.numel() >= target_samples:
+                return noise[:target_samples]
+        except Exception:
+            # Some compressed-audio backends do not implement random seeking.
+            # Preserve compatibility for those inputs with the former loader.
+            pass
 
     noise = load_audio_float(path, sr=sample_rate)
     if noise.numel() < target_samples:
