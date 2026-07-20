@@ -28,10 +28,11 @@ from .artifacts import hash_payload, read_json, write_json, write_jsonl
 from .config import ConfigurationError
 
 
-# Schema 2 stores variable-length candidate features as one flat matrix plus
-# row offsets.  It deliberately cannot be confused with the old fixed-window
-# ``[N, T, D]`` artifact format.
-BUNDLE_SCHEMA_VERSION = 2
+# Schema 3 stores variable-length candidate features as one flat matrix plus
+# row offsets and records the expected wake word for positive examples. It
+# deliberately cannot be confused with the old fixed-window ``[N, T, D]``
+# artifact format.
+BUNDLE_SCHEMA_VERSION = 3
 
 # torchaudio.load returns floating-point PCM in roughly [-1, 1], while
 # WeNet's dataset frontend converts it back to the signed-16-bit amplitude
@@ -364,6 +365,24 @@ def load_keywords(path: Path, *, require_threshold: bool = True) -> list[Keyword
             raise ConfigurationError(f"Keyword config {path}: invalid tokens or threshold at keywords[{index}]")
         parsed.append(Keyword(key_id, display_text, token_ids, threshold))
     return parsed
+
+
+def _expected_keyword_id(
+    record: dict[str, Any],
+    *,
+    keyword_ids: set[str],
+    keyword_by_text: dict[str, str],
+) -> str | None:
+    """Resolve a positive record's expected keyword without using its CTC winner."""
+
+    for field in ("expected_keyword_id", "keyword_id", "wakeword_id"):
+        value = record.get(field)
+        if isinstance(value, str) and value in keyword_ids:
+            return value
+    text = record.get("text")
+    if isinstance(text, str):
+        return keyword_by_text.get(text.strip().casefold())
+    return None
 
 
 def keyword_fingerprint(keywords: Sequence[Keyword]) -> str:
@@ -1315,6 +1334,8 @@ def generate_ctc_wac_feature_bundle(
     ):
         return read_json(paths.summary)
     keywords = load_keywords(keywords_path, require_threshold=False)
+    keyword_ids = {item.id for item in keywords}
+    keyword_by_text = {item.display_text.strip().casefold(): item.id for item in keywords}
     if candidate_pre_margin_frames < 0 or candidate_post_margin_frames < 0:
         raise ValueError("candidate crop margins must be >= 0")
     if max_search_frames is not None and int(max_search_frames) < 1:
@@ -1333,6 +1354,8 @@ def generate_ctc_wac_feature_bundle(
     offsets = [0]
     errors: list[dict[str, Any]] = []
     invalid_alignments: list[dict[str, Any]] = []
+    expected_keyword_counts = {item.id: 0 for item in keywords}
+    expected_keyword_invalid_alignment_counts = {item.id: 0 for item in keywords}
     feature_dim: int | None = None
     input_duration_seconds = 0.0
     row = 0
@@ -1341,7 +1364,23 @@ def generate_ctc_wac_feature_bundle(
             for local_index, record in enumerate(records):
                 index = int(index_offset) + local_index
                 path_value = record.get("path")
+                expected_keyword_id: str | None = None
                 try:
+                    try:
+                        is_positive = int(record.get("label", 0)) == 1
+                    except (TypeError, ValueError):
+                        raise ValueError(f"record {index} has an invalid label {record.get('label')!r}")
+                    if is_positive:
+                        expected_keyword_id = _expected_keyword_id(
+                            record,
+                            keyword_ids=keyword_ids,
+                            keyword_by_text=keyword_by_text,
+                        )
+                        if expected_keyword_id is None:
+                            raise ValueError(
+                                f"positive record {index} has no expected keyword ID and text does not match keywords"
+                            )
+                        expected_keyword_counts[expected_keyword_id] += 1
                     if not path_value:
                         raise ValueError("normalized manifest row has no path")
                     audio = load_audio(Path(str(path_value)), contract.sample_rate)
@@ -1379,12 +1418,15 @@ def generate_ctc_wac_feature_bundle(
                         candidate.end_frame + 1 + int(candidate_post_margin_frames),
                     )
                     if crop_start >= crop_end:
+                        if expected_keyword_id is not None:
+                            expected_keyword_invalid_alignment_counts[expected_keyword_id] += 1
                         invalid_alignments.append(
                             {
                                 "source_index": index,
                                 "id": record.get("id"),
                                 "path": str(path_value),
                                 "reason": "empty_candidate_crop",
+                                "expected_keyword_id": expected_keyword_id,
                                 "candidate_start_frame": candidate.start_frame,
                                 "candidate_end_frame": candidate.end_frame,
                             }
@@ -1408,6 +1450,7 @@ def generate_ctc_wac_feature_bundle(
                             "id": record.get("id"),
                             "path": str(path_value),
                             "label": record.get("label"),
+                            "expected_keyword_id": expected_keyword_id,
                             "keyword_id": keywords[candidate.keyword_index].id,
                             "candidate_frame": candidate.frame,
                             "candidate_start_frame": candidate.start_frame,
@@ -1426,12 +1469,15 @@ def generate_ctc_wac_feature_bundle(
                     # A CTC matrix with no complete keyword path is expected to
                     # be rare, but it must not produce a fake all-zero crop.
                     if "no valid non-blank alignment boundary" in str(exc):
+                        if expected_keyword_id is not None:
+                            expected_keyword_invalid_alignment_counts[expected_keyword_id] += 1
                         invalid_alignments.append(
                             {
                                 "source_index": index,
                                 "id": record.get("id"),
                                 "path": str(path_value) if path_value else None,
                                 "reason": "no_valid_ctc_alignment",
+                                "expected_keyword_id": expected_keyword_id,
                             }
                         )
                         continue
@@ -1496,6 +1542,8 @@ def generate_ctc_wac_feature_bundle(
             "keyword_count": len(keywords),
             "keyword_ids": [item.id for item in keywords],
             "keyword_token_fingerprint": keyword_token_fingerprint(keywords),
+            "expected_keyword_counts": expected_keyword_counts,
+            "expected_keyword_invalid_alignment_counts": expected_keyword_invalid_alignment_counts,
             "stage1_contract_fingerprint": contract.fingerprint(),
             "stage1_model": str(model_path),
             "stage1_contract": str(contract_path),

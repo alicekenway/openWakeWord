@@ -152,8 +152,11 @@ There is an opt-in pipeline for the design we discussed:
 Stage 1 and stage 2 are trained separately. This repository does **not** train
 the CTC model; fine-tune and export it with WeNet. The feature stage retains
 every valid best candidate in a ragged bundle, plus its score, margin, keyword
-winner, and crop boundaries. `[stage1_report]` writes JSON and Markdown
-quantiles and threshold sweeps before any filtering. The
+winner, crop boundaries, and (for positives) the expected keyword ID.
+`[stage1_report]` writes a threshold-by-keyword table before any filtering:
+each positive cell is `Acc / FR`, while each negative cell is the stage-1
+candidate `FA/h`. Positive `FR` includes examples where no complete CTC
+alignment was found. The
 `[train] structure = ctc_wac` step applies each wake word's manual stage-1
 threshold later, immediately before training the WAC model. That means you can
 choose a threshold and retrain stage 2 without rerunning the expensive CTC

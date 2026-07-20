@@ -83,7 +83,20 @@ def _write_bundle(path: Path, *, label: int, keywords_path: Path, seed: int) -> 
     np.save(paths.top_score, top.reshape(-1, 1))
     np.save(paths.margin, margin.reshape(-1, 1))
     np.save(paths.winner_onehot, onehot)
-    write_jsonl(paths.rows, [{"row": index, "label": label} for index in range(lengths.shape[0])])
+    expected_keyword_ids = (
+        ["wake_a", "wake_b", "wake_a", "wake_b"] if label == 1 else [None] * len(lengths)
+    )
+    write_jsonl(
+        paths.rows,
+        [
+            {
+                "row": index,
+                "label": label,
+                "expected_keyword_id": expected_keyword_ids[index],
+            }
+            for index in range(lengths.shape[0])
+        ],
+    )
     write_json(
         paths.summary,
         {
@@ -94,6 +107,14 @@ def _write_bundle(path: Path, *, label: int, keywords_path: Path, seed: int) -> 
             "keyword_count": len(keywords),
             "keyword_ids": [item.id for item in keywords],
             "keyword_token_fingerprint": keyword_token_fingerprint(keywords),
+            "input_count": int(lengths.shape[0]),
+            "input_duration_seconds": 3600.0,
+            "invalid_alignment_rows": 0,
+            "expected_keyword_counts": {
+                "wake_a": 2 if label == 1 else 0,
+                "wake_b": 2 if label == 1 else 0,
+            },
+            "expected_keyword_invalid_alignment_counts": {"wake_a": 0, "wake_b": 0},
             "error_count": 0,
         },
     )
@@ -462,7 +483,10 @@ def test_feature_bundle_crops_variable_length_ctc_candidates(monkeypatch: pytest
     )
     output = tmp_path / "bundle.npy"
     summary = ctc_wac_module.generate_ctc_wac_feature_bundle(
-        records=[{"id": "one", "path": str(tmp_path / "one.wav")}, {"id": "two", "path": str(tmp_path / "two.wav")}],
+        records=[
+            {"id": "one", "path": str(tmp_path / "one.wav"), "label": 1, "text": "wake a"},
+            {"id": "two", "path": str(tmp_path / "two.wav"), "label": 1, "text": "wake b"},
+        ],
         output_file=output,
         model_path=tmp_path / "stage1.onnx",
         contract_path=contract_path,
@@ -473,9 +497,13 @@ def test_feature_bundle_crops_variable_length_ctc_candidates(monkeypatch: pytest
     lengths = np.load(paths.lengths)
     offsets = np.load(paths.offsets)
     assert summary["feature_count"] == 2
+    assert summary["expected_keyword_counts"] == {"wake_a": 1, "wake_b": 1}
+    assert summary["expected_keyword_invalid_alignment_counts"] == {"wake_a": 0, "wake_b": 0}
     assert lengths.tolist() == [5, 7]
     assert offsets.tolist() == [0, 5, 12]
     assert np.load(paths.features).shape == (12, 3)
+    rows = [json.loads(line) for line in paths.rows.read_text(encoding="utf-8").splitlines()]
+    assert [row["expected_keyword_id"] for row in rows] == ["wake_a", "wake_b"]
 
 
 def test_masked_wac_pooling_ignores_tail_padding() -> None:
@@ -520,6 +548,9 @@ def test_slurm_merge_rebuilds_ragged_offsets(tmp_path: Path) -> None:
     assert lengths.tolist() == [3, 6, 4, 5, 3, 6, 4, 5]
     assert offsets.tolist() == [0, 3, 9, 13, 18, 21, 27, 31, 36]
     assert [row["row"] for row in rows] == list(range(8))
+    summary = json.loads(paths.summary.read_text(encoding="utf-8"))
+    assert summary["expected_keyword_counts"] == {"wake_a": 4, "wake_b": 4}
+    assert summary["expected_keyword_invalid_alignment_counts"] == {"wake_a": 0, "wake_b": 0}
 
 
 def test_generated_contract_fields_and_first_chunk_attention_mask(tmp_path: Path) -> None:
@@ -773,6 +804,18 @@ threshold_step = 1
     )
     PipelineRunner(load_ini_config(config)).run()
     payload = json.loads((tmp_path / "experiment" / "report.json").read_text(encoding="utf-8"))
-    assert payload["report_schema"] == 1
-    assert "train:positive" in payload["aggregates"]
-    assert payload["per_keyword"]["wake_a"]["candidate_rows"] >= 1
+    assert payload["report_schema"] == 2
+    positive_table = payload["blocks"][0]["threshold_table"]
+    negative_table = payload["blocks"][1]["threshold_table"]
+    positive_at_minus_two = next(item for item in positive_table if item["threshold"] == -2.0)
+    negative_at_minus_two = next(item for item in negative_table if item["threshold"] == -2.0)
+    assert positive_at_minus_two["keywords"]["wake_a"]["accuracy"] == 1.0
+    assert positive_at_minus_two["keywords"]["wake_a"]["false_rejection_rate"] == 0.0
+    assert positive_at_minus_two["keywords"]["wake_b"]["accuracy"] == 0.5
+    assert positive_at_minus_two["keywords"]["wake_b"]["false_rejection_rate"] == 0.5
+    assert negative_at_minus_two["keywords"]["wake_a"]["false_accepts_per_hour"] == 2.0
+    assert negative_at_minus_two["keywords"]["wake_b"]["false_accepts_per_hour"] == 1.0
+    markdown = (tmp_path / "experiment" / "report.md").read_text(encoding="utf-8")
+    assert "Acc / FR" in markdown
+    assert "FA/h" in markdown
+    assert "quantile" not in markdown.lower()

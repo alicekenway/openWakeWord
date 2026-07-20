@@ -447,13 +447,46 @@ def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, 
         temporary_offsets.unlink(missing_ok=True)
     rows: list[dict[str, Any]] = []
     for paths in source_paths:
-        rows.extend(read_jsonl(paths.rows))
+        rows.extend(read_jsonl(paths.rows, allow_empty=True))
     if len(rows) != row_count:
         raise RuntimeError("CTC-WAC shard row metadata count does not match merged candidates")
     for index, row in enumerate(rows):
         row["row"] = index
     write_jsonl(destination.rows, rows)
-    summary = read_json(source_paths[0].summary)
+    shard_summaries = [read_json(paths.summary) for paths in source_paths]
+    summary = dict(shard_summaries[0])
+    keyword_ids = [str(value) for value in summary.get("keyword_ids", [])]
+    if not keyword_ids:
+        raise RuntimeError("CTC-WAC feature shards have no keyword IDs")
+    for shard_summary in shard_summaries[1:]:
+        if [str(value) for value in shard_summary.get("keyword_ids", [])] != keyword_ids:
+            raise RuntimeError("CTC-WAC feature shards use different keyword ID orderings")
+        if shard_summary.get("keyword_token_fingerprint") != summary.get("keyword_token_fingerprint"):
+            raise RuntimeError("CTC-WAC feature shards use different keyword token files")
+        if shard_summary.get("stage1_contract_fingerprint") != summary.get("stage1_contract_fingerprint"):
+            raise RuntimeError("CTC-WAC feature shards use different stage-1 contracts")
+
+    def summed_keyword_counts(name: str) -> dict[str, int]:
+        totals = {keyword_id: 0 for keyword_id in keyword_ids}
+        for shard_summary in shard_summaries:
+            raw = shard_summary.get(name)
+            if not isinstance(raw, dict):
+                raise RuntimeError(f"CTC-WAC shard summary has no {name}")
+            for keyword_id in keyword_ids:
+                try:
+                    value = int(raw.get(keyword_id, 0))
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(f"CTC-WAC shard has invalid {name}[{keyword_id!r}]") from exc
+                if value < 0:
+                    raise RuntimeError(f"CTC-WAC shard has negative {name}[{keyword_id!r}]")
+                totals[keyword_id] += value
+        return totals
+
+    invalid_alignments = [
+        item
+        for shard_summary in shard_summaries
+        for item in shard_summary.get("invalid_alignments", [])
+    ][:50]
     summary.update(
         {
             "output_file": str(output),
@@ -464,12 +497,13 @@ def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, 
                 "min": int(lengths.min()) if lengths.size else None,
                 "max": int(lengths.max()) if lengths.size else None,
             },
-            "input_count": sum(int(read_json(paths.summary).get("input_count", 0)) for paths in source_paths),
-            "input_duration_seconds": sum(
-                float(read_json(paths.summary).get("input_duration_seconds", 0.0)) for paths in source_paths
-            ),
-            "invalid_alignment_rows": sum(
-                int(read_json(paths.summary).get("invalid_alignment_rows", 0)) for paths in source_paths
+            "input_count": sum(int(item.get("input_count", 0)) for item in shard_summaries),
+            "input_duration_seconds": sum(float(item.get("input_duration_seconds", 0.0)) for item in shard_summaries),
+            "invalid_alignment_rows": sum(int(item.get("invalid_alignment_rows", 0)) for item in shard_summaries),
+            "invalid_alignments": invalid_alignments,
+            "expected_keyword_counts": summed_keyword_counts("expected_keyword_counts"),
+            "expected_keyword_invalid_alignment_counts": summed_keyword_counts(
+                "expected_keyword_invalid_alignment_counts"
             ),
             "error_count": 0,
             "errors": [],
