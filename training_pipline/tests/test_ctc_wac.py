@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import random
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -20,10 +21,14 @@ if str(SRC) not in sys.path:
 from wuw_training.artifacts import write_json, write_jsonl  # noqa: E402
 from wuw_training.ctc_wac import (  # noqa: E402
     BUNDLE_SCHEMA_VERSION,
+    BoundedCtcKeywordScorer,
     CtcWacFeatureBlock,
+    Keyword,
     Stage1Contract,
     StreamingCtcStage1,
+    best_ctc_candidate,
     ctc_keyword_alignment_trace,
+    ctc_keyword_alignment_traces,
     ctc_keyword_score_trace,
     feature_bundle_paths,
     feature_bundle_valid,
@@ -34,6 +39,7 @@ from wuw_training.ctc_wac import (  # noqa: E402
 )
 from wuw_training.runner import PipelineRunner  # noqa: E402
 from wuw_training.config import load_ini_config  # noqa: E402
+from wuw_training.legacy import get_legacy_module  # noqa: E402
 from wuw_training.stages.train import FeatureBlock  # noqa: E402
 from wuw_training.stages.feature import _merge_ctc_wac_features  # noqa: E402
 from wuw_training.stages.testing import _ctc_wac_record  # noqa: E402
@@ -124,6 +130,151 @@ def test_ctc_alignment_trace_reports_token_boundaries_not_trailing_blanks() -> N
     assert trace.starts[2] == 0
     assert trace.ends[2] == 2
     assert trace.ends[3] == 2
+
+
+def test_bounded_ctc_trace_matches_an_exact_rolling_reference() -> None:
+    """A finite horizon must discard old prefixes without resetting CTC state."""
+
+    rng = np.random.default_rng(19)
+    probabilities = rng.random((11, 4), dtype=np.float32)
+    probabilities /= probabilities.sum(axis=1, keepdims=True)
+    log_probs = np.log(probabilities)
+    tokens = [1, 2]
+    horizon = 4
+
+    bounded = ctc_keyword_alignment_trace(
+        log_probs,
+        tokens,
+        blank_id=0,
+        max_search_frames=horizon,
+    )
+    incremental = BoundedCtcKeywordScorer(tokens, blank_id=0, max_search_frames=horizon)
+    for frame_index in range(log_probs.shape[0]):
+        start = max(0, frame_index - horizon + 1)
+        reference = ctc_keyword_alignment_trace(log_probs[start:frame_index + 1], tokens, blank_id=0)
+        score, candidate_start, candidate_end = incremental.push(log_probs[frame_index])
+        expected_start = -1 if reference.starts[-1] < 0 else int(reference.starts[-1] + start)
+        expected_end = -1 if reference.ends[-1] < 0 else int(reference.ends[-1] + start)
+        assert np.isclose(bounded.scores[frame_index], reference.scores[-1])
+        assert (int(bounded.starts[frame_index]), int(bounded.ends[frame_index])) == (
+            expected_start,
+            expected_end,
+        )
+        assert np.isclose(score, reference.scores[-1])
+        assert (candidate_start, candidate_end) == (expected_start, expected_end)
+        if candidate_start >= 0:
+            assert candidate_start >= start
+
+
+def test_best_ctc_candidate_obeys_the_configured_search_horizon() -> None:
+    probabilities = np.asarray(
+        [
+            [0.02, 0.96, 0.02],  # token 1, frame 0
+            [0.96, 0.02, 0.02],  # blank
+            [0.02, 0.02, 0.96],  # token 2, frame 2
+            [0.98, 0.01, 0.01],  # trailing blank
+            [0.98, 0.01, 0.01],
+            [0.98, 0.01, 0.01],
+        ],
+        dtype=np.float32,
+    )
+    keyword = Keyword("wake", "wake", (1, 2), -3.0)
+    candidate = best_ctc_candidate(
+        np.log(probabilities),
+        [keyword],
+        blank_id=0,
+        max_search_frames=3,
+    )
+    assert candidate.start_frame >= candidate.frame - 2
+    traces, starts, _ends = ctc_keyword_alignment_traces(
+        np.log(probabilities),
+        [keyword],
+        blank_id=0,
+        max_search_frames=3,
+    )
+    assert candidate.start_frame == int(starts[candidate.frame, candidate.keyword_index])
+    assert candidate.top_score == pytest.approx(float(traces[candidate.frame, candidate.keyword_index]))
+
+
+def test_ctc_context_augmentation_uses_variable_real_background_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pytest.importorskip("torchaudio")
+    legacy = get_legacy_module()
+    source_path = tmp_path / "source.wav"
+    noise_path = tmp_path / "background.wav"
+    source = torch.full((48_000,), 0.1, dtype=torch.float32)  # 3 seconds
+    long_source = torch.full((80_000,), 0.1, dtype=torch.float32)
+    monkeypatch.setattr(
+        legacy,
+        "load_audio_float",
+        lambda path, sr: long_source.clone() if Path(path).name == "near_limit.wav" else source.clone(),
+    )
+
+    signal, active, context = legacy._ctc_context_signal(
+        source_path,
+        target_samples=81_920,  # 2 * 2.56 seconds at 16 kHz
+        long_audio_mode="filter",
+        rng=random.Random(11),
+        sample_rate=16_000,
+        leading_context_range_samples=(16_000, 32_000),
+    )
+    assert 16_000 <= context <= 32_000
+    assert signal.numel() == source.numel() + context
+    assert torch.equal(signal[context:], active)
+
+    capped_signal, _capped_active, capped_context = legacy._ctc_context_signal(
+        tmp_path / "near_limit.wav",
+        target_samples=81_920,
+        long_audio_mode="filter",
+        rng=random.Random(11),
+        sample_rate=16_000,
+        leading_context_range_samples=(16_000, 32_000),
+    )
+    assert capped_context == 1_920
+    assert capped_signal.numel() == 81_920
+
+    requested_background_lengths: list[int] = []
+    saved_lengths: list[int] = []
+    monkeypatch.setattr(
+        legacy,
+        "_ctc_background_window",
+        lambda _path, *, target_samples, rng, sample_rate: (
+            requested_background_lengths.append(target_samples)
+            or torch.ones(target_samples, dtype=torch.float32)
+        ),
+    )
+    monkeypatch.setattr(
+        legacy,
+        "save_wav",
+        lambda _path, values, sr: saved_lengths.append(int(values.numel())),
+    )
+    legacy._init_augment_worker(
+        {
+            "output_dir": str(tmp_path / "augmented"),
+            "noise_paths": [str(noise_path)],
+            "target_samples": 81_920,
+            "snr_low": 0.0,
+            "snr_high": 0.0,
+            "artificial_prob": 0.0,
+            "random_gain_db": 0.0,
+            "sample_rate": 16_000,
+            "placement": "end",
+            "ctc_context": True,
+            "long_audio_mode": "filter",
+            "leading_context_range_samples": (16_000, 32_000),
+            "seed": 29,
+            "overwrite": True,
+        }
+    )
+    result = legacy._augment_audio_worker((0, 0, {"path": str(source_path)}))
+    record = result["record"]
+    assert record is not None
+    assert record["ctc_source_samples"] == source.numel()
+    assert 16_000 <= record["ctc_leading_context_samples"] <= 32_000
+    assert record["ctc_window_samples"] == source.numel() + record["ctc_leading_context_samples"]
+    assert requested_background_lengths == [record["ctc_window_samples"]]
+    assert saved_lengths == [record["ctc_window_samples"]]
 
 
 def test_feature_bundle_crops_variable_length_ctc_candidates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

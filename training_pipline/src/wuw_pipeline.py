@@ -566,12 +566,20 @@ def _ctc_context_signal(
     long_audio_mode: str,
     rng: random.Random,
     sample_rate: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    leading_context_range_samples: tuple[int, int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Build the source signal for one CTC context window.
 
-    Short audio is always placed at the end.  Long audio was optionally
-    filtered by the controller; when retained it is cropped by the requested
-    start/end/random policy and fills the window exactly.
+    ``target_samples`` is the maximum CTC search window.  With no leading
+    context range, this keeps the original fixed-length behavior: short audio
+    is zero-front-padded to that maximum.  With a range, it builds a
+    variable-length signal made of sampled leading context plus the active
+    source.  Mixing it with a same-length background bed turns that leading
+    context into real audio instead of a deterministic zero prefix.
+
+    Long audio is filtered or cropped by the requested start/end/random policy.
+    A retained long crop fills the maximum window and receives no extra
+    leading context.
     """
 
     source = load_audio_float(path, sr=sample_rate)
@@ -589,10 +597,20 @@ def _ctc_context_signal(
         else:
             raise ValueError(f"Unknown CTC long_audio_mode {long_audio_mode!r}")
         source = source[start:start + target_samples]
-    signal = torch.zeros(target_samples, dtype=torch.float32)
-    start = target_samples - source.numel()
-    signal[start:start + source.numel()] = source
-    return signal, source
+    available_context = max(0, target_samples - int(source.numel()))
+    if leading_context_range_samples is None:
+        leading_context_samples = available_context
+    else:
+        requested_minimum, requested_maximum = leading_context_range_samples
+        if requested_minimum < 0 or requested_maximum < requested_minimum:
+            raise ValueError("CTC leading context sample range must satisfy 0 <= min <= max")
+        effective_maximum = min(int(requested_maximum), available_context)
+        effective_minimum = min(int(requested_minimum), effective_maximum)
+        leading_context_samples = rng.randint(effective_minimum, effective_maximum)
+
+    signal = torch.zeros(leading_context_samples + int(source.numel()), dtype=torch.float32)
+    signal[leading_context_samples:] = source
+    return signal, source, leading_context_samples
 
 
 def _ctc_background_window(
@@ -672,16 +690,23 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
     out_name = f"{round_ndx:02d}_{ndx:08d}_{stable_id(str(src), ndx)}.wav"
     out_path = Path(cfg["output_dir"]) / out_name
     placement = validate_placement(record.get("placement", cfg["placement"]))
+    ctc_metadata: dict[str, int] = {}
     try:
         if not out_path.exists() or cfg["overwrite"]:
             if cfg.get("ctc_context", False):
-                audio, active_source = _ctc_context_signal(
+                audio, active_source, leading_context_samples = _ctc_context_signal(
                     src,
                     target_samples=cfg["target_samples"],
                     long_audio_mode=cfg["long_audio_mode"],
                     rng=rng,
                     sample_rate=cfg["sample_rate"],
+                    leading_context_range_samples=cfg.get("leading_context_range_samples"),
                 )
+                ctc_metadata = {
+                    "ctc_source_samples": int(active_source.numel()),
+                    "ctc_leading_context_samples": int(leading_context_samples),
+                    "ctc_window_samples": int(audio.numel()),
+                }
             else:
                 audio = load_fixed_length_audio(
                     src,
@@ -695,7 +720,7 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
             if cfg.get("ctc_context", False):
                 noise = _ctc_background_window(
                     noise_src,
-                    target_samples=cfg["target_samples"],
+                    target_samples=int(audio.numel()),
                     rng=rng,
                     sample_rate=cfg["sample_rate"],
                 )
@@ -723,6 +748,7 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
                 "placement": placement,
                 "ctc_context": bool(cfg.get("ctc_context", False)),
                 "long_audio_mode": cfg.get("long_audio_mode") if cfg.get("ctc_context", False) else None,
+                **ctc_metadata,
             }
         )
         return {"record": new_record, "error": None}
@@ -926,9 +952,28 @@ def command_augment_audio(args: argparse.Namespace) -> None:
     long_audio_mode = str(getattr(args, "long_audio_mode", "random")).strip().lower()
     if ctc_context and long_audio_mode not in {"filter", "start", "end", "random"}:
         raise ValueError("CTC --long-audio-mode must be one of: filter, start, end, random")
-    target_samples = int(round(args.clip_seconds * args.sample_rate))
+    window_count = int(getattr(args, "window_count", 1) or 1)
+    if window_count < 1:
+        raise ValueError("CTC --window-count must be >= 1")
+    base_window_samples = int(round(args.clip_seconds * args.sample_rate))
+    target_samples = base_window_samples * window_count
     if target_samples < 1:
         raise ValueError("clip_seconds must produce at least one audio sample")
+    leading_context_range_samples: tuple[int, int] | None = None
+    leading_context_seconds_range = getattr(args, "leading_context_seconds_range", None)
+    if ctc_context and leading_context_seconds_range is not None:
+        if len(leading_context_seconds_range) != 2:
+            raise ValueError("CTC --leading-context-seconds-range needs exactly two values: min max")
+        try:
+            context_minimum, context_maximum = (float(value) for value in leading_context_seconds_range)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("CTC --leading-context-seconds-range values must be numbers") from exc
+        if context_minimum < 0 or context_maximum < context_minimum:
+            raise ValueError("CTC leading context range must satisfy 0 <= min <= max")
+        leading_context_range_samples = (
+            int(round(context_minimum * args.sample_rate)),
+            int(round(context_maximum * args.sample_rate)),
+        )
     eligible_records: list[tuple[int, dict[str, Any]]] = []
     filtered_long_records: list[dict[str, Any]] = []
     for index, record in enumerate(input_records):
@@ -958,6 +1003,11 @@ def command_augment_audio(args: argparse.Namespace) -> None:
                 "eligible_input_count": len(eligible_records),
                 "filtered_long_audio_count": len(filtered_long_records),
                 "target_samples": target_samples,
+                "window_count": window_count,
+                "base_window_samples": base_window_samples,
+                "leading_context_range_samples": list(leading_context_range_samples)
+                if leading_context_range_samples is not None
+                else None,
             }
         )
     if not getattr(args, "overwrite", False) and augmented_manifest_complete(output_manifest, total, expected_summary):
@@ -995,6 +1045,11 @@ def command_augment_audio(args: argparse.Namespace) -> None:
                 "ctc_context": True,
                 "long_audio_mode": long_audio_mode,
                 "target_samples": target_samples,
+                "window_count": window_count,
+                "base_window_samples": base_window_samples,
+                "leading_context_range_samples": list(leading_context_range_samples)
+                if leading_context_range_samples is not None
+                else None,
                 "input_signature": input_signature,
                 "workers": max(1, args.workers),
                 "index_offset": int(getattr(args, "index_offset", 0) or 0),
@@ -1020,7 +1075,8 @@ def command_augment_audio(args: argparse.Namespace) -> None:
         if not eligible_noise_paths:
             raise ValueError(
                 f"No background recording is at least {args.clip_seconds:.6g} seconds after resampling; "
-                "CTC context augmentation requires a full-window background bed"
+                f"CTC context augmentation requires a full {target_samples / args.sample_rate:.6g}-second "
+                "maximum-window background bed"
             )
         noise_paths = eligible_noise_paths
     augmented: list[dict[str, Any]] = []
@@ -1038,6 +1094,7 @@ def command_augment_audio(args: argparse.Namespace) -> None:
         "placement": default_placement,
         "ctc_context": ctc_context,
         "long_audio_mode": long_audio_mode if ctc_context else None,
+        "leading_context_range_samples": leading_context_range_samples,
         "seed": args.seed,
         "overwrite": args.overwrite or force_output_overwrite,
     }
@@ -1086,6 +1143,11 @@ def command_augment_audio(args: argparse.Namespace) -> None:
             "ctc_context": ctc_context,
             "long_audio_mode": long_audio_mode if ctc_context else None,
             "target_samples": target_samples,
+            "window_count": window_count if ctc_context else None,
+            "base_window_samples": base_window_samples if ctc_context else None,
+            "leading_context_range_samples": list(leading_context_range_samples)
+            if leading_context_range_samples is not None
+            else None,
             "input_signature": input_signature,
             "workers": workers,
             "index_offset": index_offset,
@@ -3346,7 +3408,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--long-audio-mode",
         choices=["filter", "start", "end", "random"],
         default="random",
-        help="CTC context policy for source audio longer than --clip-seconds",
+        help="CTC context policy for source audio longer than --clip-seconds times --window-count",
+    )
+    p.add_argument(
+        "--window-count",
+        type=int,
+        default=1,
+        help="Number of base CTC windows forming the maximum search range",
+    )
+    p.add_argument(
+        "--leading-context-seconds-range",
+        nargs=2,
+        type=float,
+        metavar=("MIN", "MAX"),
+        help="Sample variable leading background context in this seconds range instead of zero-padding to the maximum",
     )
     p.add_argument("--workers", type=int, default=DEFAULT_IO_WORKERS)
     p.add_argument("--overwrite", action="store_true")

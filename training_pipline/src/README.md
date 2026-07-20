@@ -159,12 +159,27 @@ threshold later, immediately before training the WAC model. That means you can
 choose a threshold and retrain stage 2 without rerunning the expensive CTC
 model.
 
-For CTC training, use `ctc_context = yes` and a `window_seconds` of about
-`2.56`. A short source is placed at the tail of the window and mixed with a
-full-window background recording, so its leading context is real background
-instead of a learned run of zeros. `long_audio_mode` supports `filter`,
-`start`, `end`, and `random`; the supplied examples filter long positives and
-randomly crop long negatives.
+For CTC training, use `ctc_context = yes` and a base `window_seconds` of about
+`2.56`. Set `window_count = 2` when a wake word plus natural surrounding speech
+needs up to `5.12` seconds. With
+`leading_context_seconds_range = [1.0, 2.0]`, a short source is **not** padded
+to the 5.12-second maximum: the pipeline samples 1--2 seconds of leading
+background context, appends the source, and mixes the whole variable-length
+signal with a same-length background crop. If the source is near the maximum,
+that context range is automatically capped to what still fits. `filter` drops
+only sources longer than the maximum; `start`, `end`, and `random` crop such
+sources to the maximum and add no context. The supplied examples filter long
+positives and randomly crop long negatives.
+
+Use the same `window_seconds` and `window_count` in every CTC feature and test
+section. Feature generation scores the continuous `[T, V]` output with that
+bounded horizon and records the best candidate's score, margin, and exact
+non-blank encoder crop. Evaluation also keeps the stage-1 ONNX cache
+continuous; it does not run independent overlapping audio windows. It simply
+allows paths beginning in the most recent configured horizon, then passes
+newly rising stage-1 candidates to stage 2. Recalibrate stage-1 and final
+thresholds after changing the horizon, because a longer search range changes
+the maximum-score distribution on negative audio.
 
 The intended first-run workflow is:
 
@@ -239,11 +254,11 @@ floating tensors. Do not expose only an int8 encoder tensor. The stage-2
 classifier needs the real dequantized encoder values, and feature extraction
 and evaluation should use the same stage-1 ONNX file.
 
-The CTC-WAC evaluator runs both ONNX files. It uses the same CTC boundary
-scorer and candidate crop as feature generation, then supplies an all-one
-mask for the unpadded crop. It reports the stage-1 candidate rate, the final
-false-accept/false-reject threshold sweep, candidate counts by winning wake
-word, and real-time factor.
+The CTC-WAC evaluator runs both ONNX files. It uses the same bounded CTC
+boundary scorer and candidate crop as feature generation, then supplies an
+all-one mask for the unpadded crop. It reports the effective rolling CTC
+horizon, stage-1 candidate rate, final false-accept/false-reject threshold
+sweep, candidate counts by winning wake word, and real-time factor.
 
 ### CNN and attention model choices
 

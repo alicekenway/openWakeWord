@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,33 @@ def _keyword_tokens(ctx: Any) -> Path:
     return ctx.config.resolve_path(value) if value else _keywords(ctx)
 
 
+def _ctc_max_search_frames(ctx: Any, contract: Stage1Contract) -> int | None:
+    """Convert an explicitly configured CTC window count into encoder frames.
+
+    Existing feature configurations had no bounded search, so absence of
+    ``window_count`` preserves that behavior.  New configurations set both
+    ``window_seconds`` (the base streaming window) and ``window_count`` (the
+    maximum number of consecutive base windows to inspect).
+    """
+
+    if "window_count" not in ctx.section:
+        return None
+    count = integer(ctx.section, "window_count", ctx.step)
+    if count < 1:
+        raise ConfigurationError(f"[{ctx.step}] window_count must be >= 1")
+    main = ctx.config.section("main")
+    default_seconds = number(
+        main,
+        "ctc_context_seconds",
+        "main",
+        number(main, "clip_seconds", "main", 2.0),
+    )
+    seconds = number(ctx.section, "window_seconds", ctx.step, default_seconds)
+    if seconds <= 0:
+        raise ConfigurationError(f"[{ctx.step}] window_seconds must be > 0")
+    return max(1, int(math.ceil(seconds * count * 1000.0 / contract.encoder_frame_shift_ms)))
+
+
 def _validate_common_inputs(ctx: Any) -> None:
     inputs = _inputs(ctx)
     for item in inputs:
@@ -99,6 +127,7 @@ def validate(ctx: Any) -> None:
             raise ConfigurationError(f"[{ctx.step}] candidate_pre_margin_frames must be >= 0")
         if integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0) < 0:
             raise ConfigurationError(f"[{ctx.step}] candidate_post_margin_frames must be >= 0")
+        _ctc_max_search_frames(ctx, contract)
         device = ctx.section.get("device", "cpu").lower()
         if device not in {"auto", "cpu", "gpu"}:
             raise ConfigurationError(f"[{ctx.step}] device must be auto, cpu, or gpu")
@@ -166,6 +195,7 @@ def run(ctx: Any) -> dict[str, Any]:
             keywords_path=_keyword_tokens(ctx),
             candidate_pre_margin_frames=integer(ctx.section, "candidate_pre_margin_frames", ctx.step, 3),
             candidate_post_margin_frames=integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0),
+            max_search_frames=_ctc_max_search_frames(ctx, Stage1Contract.from_json(_stage1_contract(ctx))),
             device=ctx.section.get("device", "cpu").lower(),
             overwrite=ctx.force or boolean(ctx.section, "overwrite", ctx.step, False),
         )
@@ -264,6 +294,7 @@ def run_slurm_shard(ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
             keywords_path=_keyword_tokens(ctx),
             candidate_pre_margin_frames=integer(ctx.section, "candidate_pre_margin_frames", ctx.step, 3),
             candidate_post_margin_frames=integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0),
+            max_search_frames=_ctc_max_search_frames(ctx, Stage1Contract.from_json(_stage1_contract(ctx))),
             device=ctx.section.get("device", "cpu").lower(),
             overwrite=True,
             index_offset=index_offset,

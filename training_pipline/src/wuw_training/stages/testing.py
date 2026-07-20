@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import time
@@ -77,6 +78,27 @@ def _keywords(ctx: Any) -> Path:
     return ctx.config.resolve_path(require(ctx.section, "keywords", ctx.step))
 
 
+def _ctc_max_search_frames(ctx: Any, contract: Stage1Contract) -> int | None:
+    """Return an optional bounded CTC search horizon in encoder frames."""
+
+    if "window_count" not in ctx.section:
+        return None
+    count = integer(ctx.section, "window_count", ctx.step)
+    if count < 1:
+        raise ConfigurationError(f"[{ctx.step}] window_count must be >= 1")
+    main = ctx.config.section("main")
+    default_seconds = number(
+        main,
+        "ctc_context_seconds",
+        "main",
+        number(main, "clip_seconds", "main", 2.0),
+    )
+    seconds = number(ctx.section, "window_seconds", ctx.step, default_seconds)
+    if seconds <= 0:
+        raise ConfigurationError(f"[{ctx.step}] window_seconds must be > 0")
+    return max(1, int(math.ceil(seconds * count * 1000.0 / contract.encoder_frame_shift_ms)))
+
+
 def _thresholds(ctx: Any) -> list[Decimal]:
     range_text = ctx.section.get("threshold_range")
     if range_text is not None:
@@ -139,6 +161,7 @@ def validate(ctx: Any) -> None:
             raise ConfigurationError(f"[{ctx.step}] candidate_pre_margin_frames must be >= 0")
         if integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0) < 0:
             raise ConfigurationError(f"[{ctx.step}] candidate_post_margin_frames must be >= 0")
+        _ctc_max_search_frames(ctx, contract)
         _output_report(ctx)
         return
     model_dir = _model_dir(ctx)
@@ -317,6 +340,7 @@ def _ctc_wac_record(
     expected_label: int,
     candidate_pre_margin_frames: int = 3,
     candidate_post_margin_frames: int = 0,
+    max_search_frames: int | None = None,
 ) -> dict[str, Any]:
     """Run both stages on one full audio record and retain candidate details."""
 
@@ -336,7 +360,10 @@ def _ctc_wac_record(
             f"Stage-1 CTC vocabulary has {ctc.shape[1]} outputs but contract expects {expected_vocab}"
         )
     score_traces, start_traces, end_traces = ctc_keyword_alignment_traces(
-        ctc, keywords, blank_id=stage1.contract.blank_id
+        ctc,
+        keywords,
+        blank_id=stage1.contract.blank_id,
+        max_search_frames=max_search_frames,
     )
     if score_traces.shape[1] == 0:
         raise RuntimeError("Stage-1 CTC scorer returned no keyword scores")
@@ -421,6 +448,8 @@ def _ctc_wac_markdown_report(
     stage1_candidate_events: int,
     inference_seconds: float,
     per_keyword: dict[str, int],
+    max_search_frames: int | None,
+    encoder_frame_shift_ms: float,
 ) -> str:
     base = _markdown_report(
         step=ctx.step,
@@ -442,6 +471,12 @@ def _ctc_wac_markdown_report(
         "",
         f"- Stage-1 ONNX: `{_stage1_model(ctx)}`",
         f"- Contract: `{_stage1_contract(ctx)}`",
+        (
+            f"- Rolling CTC search horizon: `{max_search_frames}` encoder frames "
+            f"({max_search_frames * encoder_frame_shift_ms / 1000.0:.6g} seconds)"
+            if max_search_frames is not None
+            else "- Rolling CTC search horizon: `unbounded` (legacy configuration)"
+        ),
         f"- Candidate clips: `{stage1_candidate_clips}` / `{evaluated}`",
         f"- Candidate events: `{stage1_candidate_events}`",
         f"- Candidate events/hour: `{stage1_candidate_events / hours if hours else 0.0:.6f}`",
@@ -467,6 +502,7 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
     if expected_label == 1 and positive_limit is not None:
         records = records[:positive_limit]
     contract = Stage1Contract.from_json(_stage1_contract(ctx))
+    max_search_frames = _ctc_max_search_frames(ctx, contract)
     keywords = load_keywords(_keywords(ctx))
     stage1 = StreamingCtcStage1(
         _stage1_model(ctx),
@@ -513,6 +549,7 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
                     expected_label=expected_label,
                     candidate_pre_margin_frames=integer(ctx.section, "candidate_pre_margin_frames", ctx.step, 3),
                     candidate_post_margin_frames=integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0),
+                    max_search_frames=max_search_frames,
                 )
                 temporary_handle.write(json.dumps(detail) + "\n")
                 candidates = list(detail["stage1_candidates"])
@@ -568,6 +605,8 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
             stage1_candidate_events=stage1_candidate_events,
             inference_seconds=inference_seconds,
             per_keyword=per_keyword,
+            max_search_frames=max_search_frames,
+            encoder_frame_shift_ms=contract.encoder_frame_shift_ms,
         ),
         encoding="utf-8",
     )

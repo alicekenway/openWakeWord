@@ -28,6 +28,39 @@ def _long_audio_mode(ctx: Any) -> str:
     return ctx.section.get("long_audio_mode", "random").strip().lower()
 
 
+def _window_count(ctx: Any) -> int:
+    """Return the number of base CTC windows in the maximum search range."""
+
+    return integer(ctx.section, "window_count", ctx.step, 1) if _ctc_context(ctx) else 1
+
+
+def _leading_context_seconds_range(ctx: Any) -> tuple[float, float] | None:
+    """Optional variable leading-context range for CTC augmentation.
+
+    Absence deliberately preserves the old fixed-window, zero-front-padding
+    behavior.  Supplying the option activates the variable-length background
+    context design.
+    """
+
+    raw = ctx.section.get("leading_context_seconds_range")
+    if raw is None:
+        return None
+    parsed = parse_json(raw, f"[{ctx.step}] leading_context_seconds_range", list)
+    if len(parsed) != 2:
+        raise ConfigurationError(f"[{ctx.step}] leading_context_seconds_range must be [min_seconds, max_seconds]")
+    try:
+        minimum, maximum = (float(value) for value in parsed)
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(
+            f"[{ctx.step}] leading_context_seconds_range values must be numbers"
+        ) from exc
+    if minimum < 0 or maximum < minimum:
+        raise ConfigurationError(
+            f"[{ctx.step}] leading_context_seconds_range must satisfy 0 <= min <= max"
+        )
+    return minimum, maximum
+
+
 def _noise_dirs(ctx: Any) -> list[Path]:
     raw = ctx.section.get("noise_dir")
     if not raw:
@@ -94,6 +127,9 @@ def validate(ctx: Any) -> None:
     if _ctc_context(ctx):
         if _window_seconds(ctx) <= 0:
             raise ConfigurationError(f"[{ctx.step}] window_seconds must be > 0")
+        if _window_count(ctx) < 1:
+            raise ConfigurationError(f"[{ctx.step}] window_count must be >= 1")
+        _leading_context_seconds_range(ctx)
         if _long_audio_mode(ctx) not in {"filter", "start", "end", "random"}:
             raise ConfigurationError(
                 f"[{ctx.step}] long_audio_mode must be filter, start, end, or random"
@@ -164,6 +200,8 @@ def run(ctx: Any) -> dict[str, Any]:
             workers=integer(ctx.section, "workers", ctx.step, 1),
             ctc_context=_ctc_context(ctx),
             long_audio_mode=_long_audio_mode(ctx),
+            window_count=_window_count(ctx),
+            leading_context_seconds_range=_leading_context_seconds_range(ctx),
         )
     )
     if not validate_outputs(ctx):
@@ -248,6 +286,8 @@ def run_slurm_shard(ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
             index_offset=int(task["start"]),
             ctc_context=_ctc_context(ctx),
             long_audio_mode=_long_audio_mode(ctx),
+            window_count=_window_count(ctx),
+            leading_context_seconds_range=_leading_context_seconds_range(ctx),
         )
     )
     summary = read_json(Path(str(task["output_manifest"])).with_suffix(".summary.json"))
@@ -306,7 +346,27 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
         "placement": placement(ctx.section, ctx.step),
         "ctc_context": _ctc_context(ctx),
         "long_audio_mode": _long_audio_mode(ctx) if _ctc_context(ctx) else None,
-        "target_samples": int(round(_window_seconds(ctx) * integer(ctx.config.section("main"), "sample_rate", "main", 16000))),
+        "target_samples": int(
+            round(
+                _window_seconds(ctx)
+                * _window_count(ctx)
+                * integer(ctx.config.section("main"), "sample_rate", "main", 16000)
+            )
+        ),
+        "window_count": _window_count(ctx) if _ctc_context(ctx) else None,
+        "base_window_samples": int(
+            round(_window_seconds(ctx) * integer(ctx.config.section("main"), "sample_rate", "main", 16000))
+        )
+        if _ctc_context(ctx)
+        else None,
+        "leading_context_range_samples": (
+            [
+                int(round(value * integer(ctx.config.section("main"), "sample_rate", "main", 16000)))
+                for value in _leading_context_seconds_range(ctx)
+            ]
+            if _ctc_context(ctx) and _leading_context_seconds_range(ctx) is not None
+            else None
+        ),
         "placement_counts": legacy.placement_counts(value for _path, value in items),
         "input_signature": legacy.feature_input_signature(items),
         "workers": integer(ctx.section, "workers", ctx.step, 1),

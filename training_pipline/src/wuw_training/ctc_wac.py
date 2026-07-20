@@ -510,6 +510,7 @@ def ctc_keyword_alignment_trace(
     token_ids: Sequence[int],
     *,
     blank_id: int = 0,
+    max_search_frames: int | None = None,
 ) -> CtcKeywordAlignmentTrace:
     """Return normalized CTC scores and token start/end frames.
 
@@ -528,6 +529,20 @@ def ctc_keyword_alignment_trace(
         raise ValueError("CTC keyword token ID is outside the output vocabulary")
     if blank_id in tokens:
         raise ValueError("CTC keyword token IDs must not include the blank ID")
+
+    if max_search_frames is not None:
+        if int(max_search_frames) < 1:
+            raise ValueError("max_search_frames must be >= 1 when configured")
+        # Augmentation caps every training waveform at the same maximum range.
+        # In that common case the whole matrix already lies inside the rolling
+        # horizon, so the original O(T * states) scorer is exact and much
+        # faster for large feature-generation corpora.
+        if values.shape[0] > int(max_search_frames):
+            return BoundedCtcKeywordScorer(
+                tokens,
+                blank_id=blank_id,
+                max_search_frames=int(max_search_frames),
+            ).process(values)
 
     # [blank, token_0, blank, token_1, ..., blank]
     extended: list[int] = [blank_id]
@@ -582,10 +597,187 @@ def ctc_keyword_alignment_trace(
     return CtcKeywordAlignmentTrace(trace, starts, ends)
 
 
-def ctc_keyword_score_trace(log_probs: np.ndarray, token_ids: Sequence[int], *, blank_id: int = 0) -> np.ndarray:
+class BoundedCtcKeywordScorer:
+    """Incremental restartable CTC Viterbi scorer with a finite search horizon.
+
+    The frozen ONNX model still runs as one continuous stream.  This class only
+    limits which CTC *candidate paths* may be considered at a given output
+    frame: their first keyword token must have been emitted within the most
+    recent ``max_search_frames`` encoder frames.  This prevents an old prefix
+    from influencing a later candidate while preserving all ONNX cache context.
+
+    One dynamic-programming row is retained for each possible first-token
+    frame in the horizon.  That is necessary for exact bounded scoring: keeping
+    only the single best historical path would lose a lower-scoring path that
+    becomes valid after the old best path expires.
+    """
+
+    def __init__(
+        self,
+        token_ids: Sequence[int],
+        *,
+        blank_id: int = 0,
+        max_search_frames: int,
+    ) -> None:
+        self.tokens = tuple(int(item) for item in token_ids)
+        if not self.tokens:
+            raise ValueError("A CTC keyword needs at least one token")
+        if int(max_search_frames) < 1:
+            raise ValueError("max_search_frames must be >= 1")
+        if blank_id < 0 or blank_id in self.tokens:
+            raise ValueError("CTC keyword token IDs must be valid non-blank IDs")
+        self.blank_id = int(blank_id)
+        self.max_search_frames = int(max_search_frames)
+        self.extended: tuple[int, ...] = tuple(
+            symbol for token in self.tokens for symbol in (self.blank_id, token)
+        ) + (self.blank_id,)
+        self.state_count = len(self.extended)
+        self.negative_infinity = np.float32(-1.0e30)
+        self._scores = np.full(
+            (self.max_search_frames, self.state_count), self.negative_infinity, dtype=np.float32
+        )
+        self._ends = np.full((self.max_search_frames, self.state_count), -1, dtype=np.int64)
+        self._starts = np.full(self.max_search_frames, -1, dtype=np.int64)
+        self._frame_index = 0
+        self._vocabulary_size: int | None = None
+
+    def _validate_frame(self, frame: np.ndarray) -> np.ndarray:
+        values = np.asarray(frame, dtype=np.float32)
+        if values.ndim != 1:
+            raise ValueError(f"CTC frame must have shape [vocabulary], got {values.shape}")
+        if self._vocabulary_size is None:
+            self._vocabulary_size = int(values.shape[0])
+            if (
+                self.blank_id >= self._vocabulary_size
+                or any(item < 0 or item >= self._vocabulary_size for item in self.tokens)
+            ):
+                raise ValueError("CTC keyword token ID is outside the output vocabulary")
+        elif int(values.shape[0]) != self._vocabulary_size:
+            raise ValueError("CTC vocabulary size changed during streaming scoring")
+        return values
+
+    @staticmethod
+    def _take_better_predecessor(
+        best_score: np.ndarray,
+        best_end: np.ndarray,
+        score: np.ndarray,
+        end: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorized form of ``_better_alignment`` for one fixed start row."""
+
+        take = (score > best_score) | ((score == best_score) & (end < best_end))
+        return np.where(take, score, best_score), np.where(take, end, best_end)
+
+    def push(self, frame: np.ndarray) -> tuple[np.float32, int, int]:
+        """Consume one continuous CTC frame and return its bounded best path."""
+
+        values = self._validate_frame(frame)
+        frame_index = self._frame_index
+        slot = frame_index % self.max_search_frames
+
+        # The circular slot contains exactly the candidate whose first token
+        # was emitted ``max_search_frames`` frames ago.  It is out of range at
+        # this frame and must disappear before any transition is made.
+        self._scores[slot].fill(self.negative_infinity)
+        self._ends[slot].fill(-1)
+        self._starts[slot] = -1
+
+        previous_score = self._scores
+        previous_end = self._ends
+        current_score = np.full_like(previous_score, self.negative_infinity)
+        current_end = np.full_like(previous_end, -1)
+
+        # State zero is intentionally not stored per candidate.  Before the
+        # first keyword token, a direct restart at the current frame always
+        # dominates a path containing preceding blank log-probabilities.
+        # State one below seeds exactly that direct restart for this frame.
+        for state in range(1, self.state_count):
+            best_score = previous_score[:, state].copy()
+            best_end = previous_end[:, state].copy()
+            best_score, best_end = self._take_better_predecessor(
+                best_score,
+                best_end,
+                previous_score[:, state - 1],
+                previous_end[:, state - 1],
+            )
+            if state % 2 == 1 and state > 1 and self.extended[state] != self.extended[state - 2]:
+                best_score, best_end = self._take_better_predecessor(
+                    best_score,
+                    best_end,
+                    previous_score[:, state - 2],
+                    previous_end[:, state - 2],
+                )
+            current_score[:, state] = best_score + np.float32(values[self.extended[state]])
+            valid = best_score > self.negative_infinity / 2
+            if state % 2 == 1:
+                current_end[:, state] = np.where(valid, frame_index, -1)
+            else:
+                current_end[:, state] = np.where(valid, best_end, -1)
+
+        self._scores = current_score
+        self._ends = current_end
+        # Start a fresh path on the first keyword token at this encoder frame.
+        self._starts[slot] = frame_index
+        self._scores[slot, 1] = np.float32(values[self.tokens[0]])
+        self._ends[slot, 1] = frame_index
+
+        final_score = self._scores[:, -2].copy()
+        final_end = self._ends[:, -2].copy()
+        final_score, final_end = self._take_better_predecessor(
+            final_score,
+            final_end,
+            self._scores[:, -1],
+            self._ends[:, -1],
+        )
+        valid_slots = np.flatnonzero(final_score > self.negative_infinity / 2)
+        self._frame_index += 1
+        if valid_slots.size == 0:
+            return np.float32(self.negative_infinity / np.float32(len(self.tokens))), -1, -1
+
+        best = (self.negative_infinity, -1, -1)
+        for candidate_slot in valid_slots.tolist():
+            best = _better_alignment(
+                best,
+                (
+                    np.float32(final_score[candidate_slot]),
+                    int(self._starts[candidate_slot]),
+                    int(final_end[candidate_slot]),
+                ),
+            )
+        return np.float32(best[0] / np.float32(len(self.tokens))), int(best[1]), int(best[2])
+
+    def process(self, log_probs: np.ndarray) -> CtcKeywordAlignmentTrace:
+        """Return the bounded trace for a complete, continuously inferred matrix."""
+
+        values = np.asarray(log_probs, dtype=np.float32)
+        if values.ndim != 2:
+            raise ValueError(f"CTC scores must have shape [frames, vocabulary], got {values.shape}")
+        scores = np.full(values.shape[0], self.negative_infinity, dtype=np.float32)
+        starts = np.full(values.shape[0], -1, dtype=np.int64)
+        ends = np.full(values.shape[0], -1, dtype=np.int64)
+        for index, frame in enumerate(values):
+            score, start, end = self.push(frame)
+            scores[index] = score
+            starts[index] = start
+            ends[index] = end
+        return CtcKeywordAlignmentTrace(scores, starts, ends)
+
+
+def ctc_keyword_score_trace(
+    log_probs: np.ndarray,
+    token_ids: Sequence[int],
+    *,
+    blank_id: int = 0,
+    max_search_frames: int | None = None,
+) -> np.ndarray:
     """Return the best length-normalized CTC alignment score at each frame."""
 
-    return ctc_keyword_alignment_trace(log_probs, token_ids, blank_id=blank_id).scores
+    return ctc_keyword_alignment_trace(
+        log_probs,
+        token_ids,
+        blank_id=blank_id,
+        max_search_frames=max_search_frames,
+    ).scores
 
 
 def ctc_keyword_score_traces(
@@ -593,13 +785,22 @@ def ctc_keyword_score_traces(
     keywords: Sequence[Keyword],
     *,
     blank_id: int = 0,
+    max_search_frames: int | None = None,
 ) -> np.ndarray:
     """Return ``[frames, keyword_count]`` normalized CTC scores."""
 
     if not keywords:
         raise ValueError("At least one keyword is required")
     return np.stack(
-        [ctc_keyword_score_trace(log_probs, item.token_ids, blank_id=blank_id) for item in keywords],
+        [
+            ctc_keyword_score_trace(
+                log_probs,
+                item.token_ids,
+                blank_id=blank_id,
+                max_search_frames=max_search_frames,
+            )
+            for item in keywords
+        ],
         axis=1,
     ).astype(np.float32, copy=False)
 
@@ -609,12 +810,21 @@ def ctc_keyword_alignment_traces(
     keywords: Sequence[Keyword],
     *,
     blank_id: int = 0,
+    max_search_frames: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return score, start, and end matrices with shape ``[frames, keywords]``."""
 
     if not keywords:
         raise ValueError("At least one keyword is required")
-    traces = [ctc_keyword_alignment_trace(log_probs, item.token_ids, blank_id=blank_id) for item in keywords]
+    traces = [
+        ctc_keyword_alignment_trace(
+            log_probs,
+            item.token_ids,
+            blank_id=blank_id,
+            max_search_frames=max_search_frames,
+        )
+        for item in keywords
+    ]
     return (
         np.stack([item.scores for item in traces], axis=1).astype(np.float32, copy=False),
         np.stack([item.starts for item in traces], axis=1).astype(np.int64, copy=False),
@@ -662,10 +872,16 @@ def best_ctc_candidate(
     keywords: Sequence[Keyword],
     *,
     blank_id: int = 0,
+    max_search_frames: int | None = None,
 ) -> CtcCandidate:
     """Select the one globally best keyword candidate from a CTC matrix."""
 
-    scores, starts, ends = ctc_keyword_alignment_traces(log_probs, keywords, blank_id=blank_id)
+    scores, starts, ends = ctc_keyword_alignment_traces(
+        log_probs,
+        keywords,
+        blank_id=blank_id,
+        max_search_frames=max_search_frames,
+    )
     if scores.shape[0] < 1:
         raise ValueError("CTC output contains no encoder frames")
     # ``argmax`` intentionally chooses the earliest frame for an exact score
@@ -1027,6 +1243,7 @@ def generate_ctc_wac_feature_bundle(
     keywords_path: Path,
     candidate_pre_margin_frames: int = 3,
     candidate_post_margin_frames: int = 0,
+    max_search_frames: int | None = None,
     device: str = "cpu",
     overwrite: bool = False,
     index_offset: int = 0,
@@ -1048,6 +1265,8 @@ def generate_ctc_wac_feature_bundle(
     keywords = load_keywords(keywords_path, require_threshold=False)
     if candidate_pre_margin_frames < 0 or candidate_post_margin_frames < 0:
         raise ValueError("candidate crop margins must be >= 0")
+    if max_search_frames is not None and int(max_search_frames) < 1:
+        raise ValueError("max_search_frames must be >= 1 when configured")
     stage1 = StreamingCtcStage1(model_path, contract, device=device)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     temporary_paths = {name: _temporary_path(path) for name, path in asdict(paths).items()}
@@ -1096,7 +1315,12 @@ def generate_ctc_wac_feature_bundle(
                         raise RuntimeError(
                             f"stage-1 encoder dimension changed from {feature_dim} to {encoder.shape[1]}"
                         )
-                    candidate = best_ctc_candidate(ctc, keywords, blank_id=contract.blank_id)
+                    candidate = best_ctc_candidate(
+                        ctc,
+                        keywords,
+                        blank_id=contract.blank_id,
+                        max_search_frames=max_search_frames,
+                    )
                     crop_start = max(0, candidate.start_frame - int(candidate_pre_margin_frames))
                     crop_end = min(
                         int(encoder.shape[0]),
@@ -1234,6 +1458,12 @@ def generate_ctc_wac_feature_bundle(
             "invalid_alignments": invalid_alignments[:50],
             "candidate_pre_margin_frames": int(candidate_pre_margin_frames),
             "candidate_post_margin_frames": int(candidate_post_margin_frames),
+            "max_search_frames": int(max_search_frames) if max_search_frames is not None else None,
+            "max_search_seconds": (
+                float(max_search_frames) * contract.encoder_frame_shift_ms / 1000.0
+                if max_search_frames is not None
+                else None
+            ),
             "index_offset": int(index_offset),
             "error_count": 0,
             "errors": [],
