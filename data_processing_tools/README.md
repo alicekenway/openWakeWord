@@ -154,6 +154,31 @@ python /home/alicekenway/Dev/project/WUW/openWakeWord/data_processing_tools/wav_
   --seed 1337
 ```
 
+## Merge WAV Directory
+
+Concatenate WAV files in sorted path order. Each merged output reaches at least
+the requested duration before the next output begins:
+
+```bash
+python data_processing_tools/merge_wav_dir.py \
+  --wav-dir /path/to/input_wavs \
+  --output-dir /path/to/merged_dataset \
+  --length 3600
+```
+
+Merged files are written under `merged_dataset/wav/`, and the corresponding
+manifest is `merged_dataset/metadata.jsonl`:
+
+```json
+{"duration": 3601.25, "path": "wav/merged_00000000.wav", "text": ""}
+```
+
+The tool concatenates WAV sample frames without decoding or resampling, so all
+inputs must have the same sample rate, channel count, sample width, and
+compression type. The last output is still written when the remaining audio is
+shorter than `--length`. Add `--absolute-paths` to store absolute paths in the
+manifest, or `--overwrite` to replace files from an earlier run.
+
 ## Group-Safe JSONL Split
 
 Split a metadata JSONL into train/val/test without breaking consecutive groups.
