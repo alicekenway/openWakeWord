@@ -216,6 +216,9 @@ feature, CTC output, attention mask, and streaming cache. It also records the
 fbank and overlapping-window settings. Normally, do not write or edit this
 file yourself; point the pipeline INI at the file created by the exporter.
 The example contract is only there to make the format easy to inspect.
+For WeNet models, `fbank.waveform_scale` is `32768`: WeNet converts normalized
+floating-point PCM back to signed-16-bit amplitude before Kaldi fbank. The
+pipeline defaults to this value for older contracts that do not record it.
 
 The code does not assume BPE or phonemes. Put the correct `token_ids` for each
 wake word in the keyword JSON. For a BPE/character CTC model, use its

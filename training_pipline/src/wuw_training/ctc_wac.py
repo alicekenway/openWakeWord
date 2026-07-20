@@ -33,6 +33,13 @@ from .config import ConfigurationError
 # ``[N, T, D]`` artifact format.
 BUNDLE_SCHEMA_VERSION = 2
 
+# torchaudio.load returns floating-point PCM in roughly [-1, 1], while
+# WeNet's dataset frontend converts it back to the signed-16-bit amplitude
+# range before calling torchaudio.compliance.kaldi.fbank. The exported
+# encoder contains the global CMVN learned from those features, so omitting
+# this scale makes an otherwise healthy CTC model emit almost only blanks.
+WENET_WAVEFORM_SCALE = float(1 << 15)
+
 
 @dataclass(frozen=True)
 class Keyword:
@@ -77,6 +84,7 @@ class Stage1Contract:
     frame_length_ms: float
     frame_shift_ms: float
     dither: float
+    waveform_scale: float
     chunk_frames: int
     chunk_stride_frames: int
     minimum_input_frames: int
@@ -134,6 +142,7 @@ class Stage1Contract:
             frame_length_ms = float(fbank.get("frame_length_ms", 25.0))
             frame_shift_ms = float(fbank.get("frame_shift_ms", 10.0))
             dither = float(fbank.get("dither", 0.0))
+            waveform_scale = float(fbank.get("waveform_scale", WENET_WAVEFORM_SCALE))
             chunk_frames = int(raw["chunk_frames"])
             chunk_stride_frames = int(raw.get("chunk_stride_frames", chunk_frames))
             minimum_input_frames = int(raw.get("minimum_input_frames", 1))
@@ -152,6 +161,8 @@ class Stage1Contract:
             or num_mel_bins < 1
             or frame_length_ms <= 0
             or frame_shift_ms <= 0
+            or not math.isfinite(waveform_scale)
+            or waveform_scale <= 0
             or chunk_frames < 1
             or chunk_stride_frames < 1
             or minimum_input_frames < 1
@@ -276,6 +287,7 @@ class Stage1Contract:
             frame_length_ms=frame_length_ms,
             frame_shift_ms=frame_shift_ms,
             dither=dither,
+            waveform_scale=waveform_scale,
             chunk_frames=chunk_frames,
             chunk_stride_frames=chunk_stride_frames,
             minimum_input_frames=minimum_input_frames,
@@ -422,7 +434,12 @@ def feature_bundle_paths(features: Path) -> FeatureBundlePaths:
     )
 
 
-def feature_bundle_valid(features: Path, *, require_complete: bool = True) -> bool:
+def feature_bundle_valid(
+    features: Path,
+    *,
+    require_complete: bool = True,
+    expected_stage1_contract_fingerprint: str | None = None,
+) -> bool:
     """Check the shapes and summary needed by CTC-WAC training.
 
     It is intentionally inexpensive: it reads NPY headers through memory maps
@@ -447,6 +464,11 @@ def feature_bundle_valid(features: Path, *, require_complete: bool = True) -> bo
         valid = (
             int(summary.get("bundle_schema", -1)) == BUNDLE_SCHEMA_VERSION
             and (not require_complete or int(summary.get("error_count", -1)) == 0)
+            and (
+                expected_stage1_contract_fingerprint is None
+                or summary.get("stage1_contract_fingerprint")
+                == expected_stage1_contract_fingerprint
+            )
             and int(summary.get("feature_count", -1)) == n
             and x.ndim == 2
             and x.shape[1] >= 1
@@ -958,6 +980,22 @@ def _onnx_numpy_dtype(onnx_type: str) -> np.dtype[Any]:
     return mapping[onnx_type]
 
 
+def _onnx_intra_op_threads() -> int:
+    """Respect a Slurm/OMP CPU allocation and avoid ORT oversubscription."""
+
+    for name in ("SLURM_CPUS_PER_TASK", "OMP_NUM_THREADS"):
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+        except ValueError:
+            continue
+        if parsed > 0:
+            return parsed
+    return 1
+
+
 class StreamingCtcStage1:
     """Run a contracted ONNX CTC model chunk by chunk, including its caches."""
 
@@ -977,7 +1015,14 @@ class StreamingCtcStage1:
         providers = ["CPUExecutionProvider"]
         if requested == "gpu" or (requested == "auto" and "CUDAExecutionProvider" in available):
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        self.session = ort.InferenceSession(str(model_path), providers=providers)
+        session_options = ort.SessionOptions()
+        session_options.intra_op_num_threads = _onnx_intra_op_threads()
+        session_options.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(
+            str(model_path),
+            sess_options=session_options,
+            providers=providers,
+        )
         self.model_path = model_path
         self.contract = contract
         self._inputs = {item.name: item for item in self.session.get_inputs()}
@@ -1173,7 +1218,11 @@ def audio_to_fbank(audio: np.ndarray, contract: Stage1Contract) -> np.ndarray:
     """
 
     _torch, torchaudio = _torchaudio()
+    # Match wenet.dataset.processor.compute_fbank. load_audio() returns
+    # normalized floating-point PCM, but WeNet scales it to the signed-16-bit
+    # range before Kaldi fbank extraction.
     waveform = torch.from_numpy(np.asarray(audio, dtype=np.float32)).reshape(1, -1)
+    waveform = waveform * float(contract.waveform_scale)
     values = torchaudio.compliance.kaldi.fbank(
         waveform,
         sample_frequency=float(contract.sample_rate),
@@ -1259,9 +1308,12 @@ def generate_ctc_wac_feature_bundle(
         raise ValueError("Cannot create a CTC-WAC feature bundle from an empty manifest")
     output_file = output_file.resolve()
     paths = feature_bundle_paths(output_file)
-    if not overwrite and feature_bundle_valid(output_file):
-        return read_json(paths.summary)
     contract = Stage1Contract.from_json(contract_path)
+    if not overwrite and feature_bundle_valid(
+        output_file,
+        expected_stage1_contract_fingerprint=contract.fingerprint(),
+    ):
+        return read_json(paths.summary)
     keywords = load_keywords(keywords_path, require_threshold=False)
     if candidate_pre_margin_frames < 0 or candidate_post_margin_frames < 0:
         raise ValueError("candidate crop margins must be >= 0")

@@ -99,6 +99,82 @@ def _write_bundle(path: Path, *, label: int, keywords_path: Path, seed: int) -> 
     )
 
 
+def test_audio_to_fbank_matches_wenet_pcm_scaling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    contract_path = tmp_path / "contract.json"
+    write_json(
+        contract_path,
+        {
+            "schema_version": 2,
+            "sample_rate": 16000,
+            "fbank": {
+                "num_mel_bins": 3,
+                "frame_length_ms": 25.0,
+                "frame_shift_ms": 10.0,
+                "dither": 0.0,
+            },
+            "chunk_frames": 7,
+            "inputs": {"features": "chunk"},
+            "outputs": {"encoder": "encoder_out", "ctc_log_probs": "ctc_log_probs"},
+        },
+    )
+    contract = Stage1Contract.from_json(contract_path)
+    captured: dict[str, torch.Tensor] = {}
+
+    class FakeKaldi:
+        @staticmethod
+        def fbank(waveform: torch.Tensor, **_kwargs: object) -> torch.Tensor:
+            captured["waveform"] = waveform.clone()
+            return torch.ones((2, 3), dtype=torch.float32)
+
+    fake_torchaudio = SimpleNamespace(compliance=SimpleNamespace(kaldi=FakeKaldi()))
+    monkeypatch.setattr(ctc_wac_module, "_torchaudio", lambda: (torch, fake_torchaudio))
+
+    result = ctc_wac_module.audio_to_fbank(
+        np.asarray([-1.0, 0.5, 1.0], dtype=np.float32), contract
+    )
+
+    assert contract.waveform_scale == float(1 << 15)
+    assert torch.equal(
+        captured["waveform"],
+        torch.tensor([[-32768.0, 16384.0, 32768.0]], dtype=torch.float32),
+    )
+    assert result.shape == (2, 3)
+
+
+def test_feature_bundle_rejects_a_stale_stage1_contract(
+    tmp_path: Path,
+) -> None:
+    keywords_path = _keyword_file(tmp_path)
+    features = tmp_path / "features.npy"
+    _write_bundle(features, label=1, keywords_path=keywords_path, seed=3)
+
+    assert feature_bundle_valid(features)
+    assert not feature_bundle_valid(
+        features,
+        expected_stage1_contract_fingerprint="new-contract",
+    )
+
+    paths = feature_bundle_paths(features)
+    summary = json.loads(paths.summary.read_text(encoding="utf-8"))
+    summary["stage1_contract_fingerprint"] = "new-contract"
+    write_json(paths.summary, summary)
+    assert feature_bundle_valid(
+        features,
+        expected_stage1_contract_fingerprint="new-contract",
+    )
+
+
+def test_onnx_threads_follow_slurm_allocation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "2")
+    assert ctc_wac_module._onnx_intra_op_threads() == 2
+
+    monkeypatch.delenv("SLURM_CPUS_PER_TASK")
+    assert ctc_wac_module._onnx_intra_op_threads() == 8
+
+
 def test_ctc_viterbi_trace_prefers_the_right_token_order() -> None:
     probabilities = np.asarray(
         [

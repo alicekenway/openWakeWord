@@ -123,6 +123,9 @@ def _fbank_config(
         # feature generation and evaluation must be deterministic, so the
         # exporter uses the explicit inference value instead.
         "dither": float(inference_dither),
+        # WeNet's dataset processor multiplies normalized floating-point PCM
+        # by 2**15 immediately before Kaldi fbank extraction.
+        "waveform_scale": float(1 << 15),
     }
 
 

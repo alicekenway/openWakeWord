@@ -165,7 +165,11 @@ def output_paths(ctx: Any) -> list[Path]:
 
 def validate_outputs(ctx: Any) -> bool:
     if _extractor(ctx) == "wenet_ctc_wac":
-        return feature_bundle_valid(_output_file(ctx))
+        contract = Stage1Contract.from_json(_stage1_contract(ctx))
+        return feature_bundle_valid(
+            _output_file(ctx),
+            expected_stage1_contract_fingerprint=contract.fingerprint(),
+        )
     output, summary_path = output_paths(ctx)
     if not output.is_file() or not summary_path.is_file():
         return False
@@ -330,7 +334,11 @@ def run_slurm_shard(ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
 def validate_slurm_shard(ctx: Any, task: dict[str, Any]) -> bool:
     output = Path(str(task["output_file"])).resolve()
     if _extractor(ctx) == "wenet_ctc_wac":
-        return feature_bundle_valid(output)
+        contract = Stage1Contract.from_json(_stage1_contract(ctx))
+        return feature_bundle_valid(
+            output,
+            expected_stage1_contract_fingerprint=contract.fingerprint(),
+        )
     summary_path = output.with_suffix(".summary.json")
     if not output.is_file() or not summary_path.is_file():
         return False

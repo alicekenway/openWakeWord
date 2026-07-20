@@ -5,7 +5,8 @@
     "num_mel_bins": 80,
     "frame_length_ms": 25.0,
     "frame_shift_ms": 10.0,
-    "dither": 0.0
+    "dither": 0.0,
+    "waveform_scale": 32768.0
   },
   "chunk_frames": 67,
   "chunk_stride_frames": 64,
