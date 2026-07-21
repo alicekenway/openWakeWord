@@ -86,6 +86,10 @@ output_report = ${{main:experiment_dir}}/REPORT.md
     assert [row["threshold"] for row in payload["thresholds"]] == [0.1, 0.3, 0.5]
     assert payload["thresholds"][0]["sets"]["testing.positive"]["recall"] == 1.0
     assert payload["thresholds"][2]["sets"]["testing.positive"]["false_reject_rate"] == 0.0
+    assert payload["thresholds"][0]["sets"]["testing.negative"]["false_accept_rate"] == 1.0
+    assert payload["thresholds"][0]["combined_negative"]["false_accept_rate"] == 1.0
+    report = (tmp_path / "experiment" / "REPORT.md").read_text(encoding="utf-8")
+    assert "Combined negative FA rate" in report
 
     second = runner.run()
     assert second["steps"]["summary"]["status"] == "skipped"
@@ -188,6 +192,7 @@ def test_threshold_metrics_and_markdown_are_per_set() -> None:
     ]
     rows = _metric_rows(accumulators, expected_label=0, evaluated=10, evaluated_seconds=3600.0)
     assert rows[0]["false_accepts_per_hour"] == 4.0
+    assert rows[0]["false_accept_rate"] == 0.3
     assert rows[0]["false_reject_rate"] is None
     report = _markdown_report(
         step="testing.negative",
@@ -201,8 +206,8 @@ def test_threshold_metrics_and_markdown_are_per_set() -> None:
         errors=[],
         rows=rows,
     )
-    assert "| Threshold | FA events | FA clips | FA/hour | False rejects | FR rate |" in report
-    assert "| 0.1 | 4 | 3 | 4.000000 | n/a | n/a |" in report
+    assert "| Threshold | FA events | FA clips | FA/hour | FA rate | False rejects | FR rate |" in report
+    assert "| 0.1 | 4 | 3 | 4.000000 | 0.300000 | n/a | n/a |" in report
 
 
 def test_score_details_do_not_contain_threshold_or_abnormal_fields(monkeypatch: Any, tmp_path: Path) -> None:

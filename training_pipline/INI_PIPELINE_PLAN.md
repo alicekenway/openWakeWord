@@ -17,8 +17,9 @@ registry is used.
   feature blocks for train/dev/false-positive validation and supplies one
   `batch.<feature-block> = N` line for every training source.
 - `[export]` converts the final PyTorch training artifact to ONNX.
-- Each `testing.*` block scores its set once and writes a Markdown FA/hour or
-  FR-rate table over its own inclusive threshold range.
+- Each `testing.*` block scores its set once and writes a Markdown FA/hour plus
+  FA-rate table for negatives or an FR-rate table for positives over its own
+  inclusive threshold range.
 
 ## Modular Layout
 
@@ -63,9 +64,9 @@ opset 14 or newer automatically.
 
 Each `testing.*` block writes its own Markdown threshold summary and raw,
 threshold-independent sliding-window details. It reports FR rate for positive
-sets and FA/hour for negative sets without abnormal-case output. Thresholds
-such as `0.1` through `0.9` at `0.2` increments are configured independently
-for every test block.
+sets and both FA/hour and per-clip FA rate for negative sets without
+abnormal-case output. Thresholds such as `0.1` through `0.9` at `0.2`
+increments are configured independently for every test block.
 
 ## Verification
 

@@ -111,7 +111,8 @@ trusted `setup_commands` when compute nodes need a different environment.
   its configured inclusive threshold range over the resulting window scores,
   and writes `threshold_summary.md` plus threshold-independent score details.
   Positive reports show false-reject rate; negative reports show false accepts
-  per hour. No abnormal-case file or JSON summary is produced.
+  per hour and false-accept rate (the share of evaluated clips with at least
+  one false accept). No abnormal-case file or JSON summary is produced.
 
 Configure a per-set threshold sweep explicitly or interpolate common values:
 
@@ -155,8 +156,9 @@ every valid best candidate in a ragged bundle, plus its score, margin, keyword
 winner, crop boundaries, and (for positives) the expected keyword ID.
 `[stage1_report]` writes a threshold-by-keyword table before any filtering:
 each positive cell is `Acc / FR`, while each negative cell is the stage-1
-candidate `FA/h`. Positive `FR` includes examples where no complete CTC
-alignment was found. The
+candidate `FA/h / FA rate`. Here FA rate is the share of all input negative
+clips whose candidate passed the threshold. Positive `FR` includes examples
+where no complete CTC alignment was found. The
 `[train] structure = ctc_wac` step applies each wake word's manual stage-1
 threshold later, immediately before training the WAC model. That means you can
 choose a threshold and retrain stage 2 without rerunning the expensive CTC

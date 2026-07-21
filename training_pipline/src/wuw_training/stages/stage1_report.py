@@ -230,6 +230,16 @@ def _negative_table(
         raise RuntimeError(f"{block.name} has an invalid input_duration_seconds") from exc
     if duration_seconds <= 0:
         raise RuntimeError(f"{block.name} needs a positive input_duration_seconds to calculate FA/h")
+    try:
+        input_rows = int(summary.get("input_count", scores.shape[0]))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{block.name} has an invalid input_count") from exc
+    if input_rows <= 0:
+        raise RuntimeError(f"{block.name} needs a positive input_count to calculate FA rate")
+    if scores.shape[0] > input_rows:
+        raise RuntimeError(
+            f"{block.name} has {scores.shape[0]} candidate rows but only {input_rows} input rows"
+        )
     duration_hours = duration_seconds / 3600.0
     table: list[dict[str, Any]] = []
     for threshold in thresholds:
@@ -239,10 +249,12 @@ def _negative_table(
             values[keyword_id] = {
                 "false_accepts": false_accepts,
                 "false_accepts_per_hour": false_accepts / duration_hours,
+                "false_accept_rate": false_accepts / input_rows,
             }
         table.append({"threshold": threshold, "keywords": values})
     return {
         "metric": "stage1_false_accept_candidates_per_hour",
+        "input_rows": input_rows,
         "input_duration_seconds": duration_seconds,
         "threshold_table": table,
     }
@@ -298,7 +310,10 @@ def _markdown(payload: dict[str, Any]) -> str:
         "",
         "Each row is one configured normalized CTC log-score threshold.",
         "For positives, `Acc / FR` means the expected keyword score passed the threshold / did not pass it; no CTC alignment counts as FR.",
-        "For negatives, `FA/h` is the stage-1 candidate count per source-audio hour; it is not final system FA/h.",
+        (
+            "For negatives, `FA/h` is the stage-1 candidate count per source-audio hour and `FA rate` is "
+            "the share of all input clips whose candidate passed the threshold; neither is a final system metric."
+        ),
     ]
     for block in payload["blocks"]:
         keyword_ids = block["keyword_ids"]
@@ -331,15 +346,20 @@ def _markdown(payload: dict[str, Any]) -> str:
                 [
                     f"Negative set. Source duration: {duration:.6f} h.",
                     "",
-                    "| Threshold | " + " | ".join(f"{keyword_id} (FA/h)" for keyword_id in keyword_ids) + " |",
+                    "| Threshold | "
+                    + " | ".join(f"{keyword_id} (FA/h / FA rate)" for keyword_id in keyword_ids)
+                    + " |",
                     "| ---: | " + " | ".join("---:" for _ in keyword_ids) + " |",
                 ]
             )
             for threshold_row in block["threshold_table"]:
-                cells = [
-                    f"{threshold_row['keywords'][keyword_id]['false_accepts_per_hour']:.4f}"
-                    for keyword_id in keyword_ids
-                ]
+                cells = []
+                for keyword_id in keyword_ids:
+                    value = threshold_row["keywords"][keyword_id]
+                    cells.append(
+                        f"{value['false_accepts_per_hour']:.4f} / "
+                        f"{_format_percent(value['false_accept_rate'])}"
+                    )
                 lines.append(f"| {threshold_row['threshold']:.6g} | " + " | ".join(cells) + " |")
     return "\n".join(lines).rstrip() + "\n"
 

@@ -202,7 +202,7 @@ def validate_outputs(ctx: Any) -> bool:
         return False
     try:
         text = report.read_text(encoding="utf-8")
-        return "| Threshold |" in text and "FA/hour" in text and "FR rate" in text
+        return "| Threshold |" in text and "FA/hour" in text and "FA rate" in text and "FR rate" in text
     except OSError:
         return False
 
@@ -238,6 +238,9 @@ def _metric_rows(
             "false_accept_clips": values["false_accept_clips"] if expected_label == 0 else None,
             "false_accepts_per_hour": (
                 values["false_accept_events"] / hours if expected_label == 0 and hours else None
+            ),
+            "false_accept_rate": (
+                values["false_accept_clips"] / evaluated if expected_label == 0 and evaluated else None
             ),
             "false_rejects": values["false_rejects"] if expected_label == 1 else None,
             "false_reject_rate": (
@@ -277,8 +280,8 @@ def _markdown_report(
         f"- Evaluated duration: `{evaluated_seconds / 3600.0:.6f}` hours",
         f"- Evaluation errors: `{len(errors)}`",
         "",
-        "| Threshold | FA events | FA clips | FA/hour | False rejects | FR rate |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Threshold | FA events | FA clips | FA/hour | FA rate | False rejects | FR rate |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         fa_events = "n/a" if row["false_accept_events"] is None else str(row["false_accept_events"])
@@ -286,7 +289,8 @@ def _markdown_report(
         false_rejects = "n/a" if row["false_rejects"] is None else str(row["false_rejects"])
         lines.append(
             f"| {row['threshold']:.6g} | {fa_events} | {fa_clips} | "
-            f"{_format_metric(row['false_accepts_per_hour'])} | {false_rejects} | "
+            f"{_format_metric(row['false_accepts_per_hour'])} | "
+            f"{_format_metric(row['false_accept_rate'])} | {false_rejects} | "
             f"{_format_metric(row['false_reject_rate'])} |"
         )
     if errors:

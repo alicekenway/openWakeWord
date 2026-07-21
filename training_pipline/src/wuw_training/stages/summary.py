@@ -150,6 +150,7 @@ def _metrics(records: list[dict[str, Any]], expected_label: int, threshold: floa
                 "false_accept_clips": false_accept_clips,
                 "false_accept_events": false_accept_events,
                 "false_accepts_per_hour": (false_accept_events / (seconds / 3600.0)) if seconds else None,
+                "false_accept_rate": (false_accept_clips / evaluated) if evaluated else None,
             }
         )
     return result
@@ -167,6 +168,7 @@ def _combined_negative(values: list[dict[str, Any]]) -> dict[str, Any]:
         "false_accept_clips": accept_clips,
         "false_accept_events": accepts,
         "false_accepts_per_hour": accepts / (seconds / 3600.0) if seconds else None,
+        "false_accept_rate": accept_clips / clips if clips else None,
     }
 
 
@@ -177,8 +179,8 @@ def _markdown_report(payload: dict[str, Any]) -> str:
         f"- Debounce: `{payload['debounce_seconds']}` seconds",
         f"- Test blocks: `{', '.join(payload['tests'])}`",
         "",
-        "| Threshold | Recall / FRR by positive set | Combined negative FA/hour |",
-        "| --- | --- | --- |",
+        "| Threshold | Recall / FRR by positive set | Combined negative FA/hour | Combined negative FA rate |",
+        "| --- | --- | --- | --- |",
     ]
     for item in payload["thresholds"]:
         positive_parts = []
@@ -192,7 +194,12 @@ def _markdown_report(payload: dict[str, Any]) -> str:
                     positive_parts.append(f"{name}: {recall:.4f} / {frr:.4f}")
         combined = item.get("combined_negative", {}).get("false_accepts_per_hour")
         combined_text = "n/a" if combined is None else f"{combined:.4f}"
-        lines.append(f"| {item['threshold']:.6g} | {'; '.join(positive_parts) or 'n/a'} | {combined_text} |")
+        combined_rate = item.get("combined_negative", {}).get("false_accept_rate")
+        combined_rate_text = "n/a" if combined_rate is None else f"{combined_rate:.2%}"
+        lines.append(
+            f"| {item['threshold']:.6g} | {'; '.join(positive_parts) or 'n/a'} | "
+            f"{combined_text} | {combined_rate_text} |"
+        )
 
     for item in payload["thresholds"]:
         lines.extend(["", f"## Threshold {item['threshold']:.6g}", ""])

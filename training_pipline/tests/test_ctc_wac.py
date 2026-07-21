@@ -815,7 +815,10 @@ threshold_step = 1
     assert positive_at_minus_two["keywords"]["wake_b"]["false_rejection_rate"] == 0.5
     assert negative_at_minus_two["keywords"]["wake_a"]["false_accepts_per_hour"] == 2.0
     assert negative_at_minus_two["keywords"]["wake_b"]["false_accepts_per_hour"] == 1.0
+    assert negative_at_minus_two["keywords"]["wake_a"]["false_accept_rate"] == 0.5
+    assert negative_at_minus_two["keywords"]["wake_b"]["false_accept_rate"] == 0.25
     markdown = (tmp_path / "experiment" / "report.md").read_text(encoding="utf-8")
     assert "Acc / FR" in markdown
     assert "FA/h" in markdown
+    assert "FA rate" in markdown
     assert "quantile" not in markdown.lower()

@@ -2379,11 +2379,13 @@ def finalize_eval_metrics(
         )
     else:
         false_accept_events = int(accumulator["false_accept_events"])
+        false_accept_clips = int(accumulator["false_accept_clips"])
         metrics.update(
             {
-                "false_accept_clips": int(accumulator["false_accept_clips"]),
+                "false_accept_clips": false_accept_clips,
                 "false_accept_events": false_accept_events,
                 "false_accepts_per_hour": false_accept_events / hours if hours else None,
+                "false_accept_rate": false_accept_clips / evaluated if evaluated else None,
             }
         )
     return metrics
@@ -3322,8 +3324,14 @@ def write_experiment_report(exp: Path, eval_json: Path, training_json: Path, sta
             "## Notes",
             "",
             *data_notes,
-            "- Evaluation is a sliding-window test. Each per-case detail row records score windows, threshold crossings, events, and abnormal FA/FR cases.",
-            "- False accept metrics are event counts over the evaluated negative duration with debounce applied.",
+            (
+                "- Evaluation is a sliding-window test. Each per-case detail row records score windows, "
+                "threshold crossings, events, and abnormal FA/FR cases."
+            ),
+            (
+                "- FA/hour counts debounced events over evaluated negative duration; FA rate is the share "
+                "of evaluated negative clips with at least one event."
+            ),
         ]
     )
     (exp / "REPORT.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -3336,18 +3344,24 @@ def experiment_conclusion(evaluation: dict[str, Any]) -> str:
     false_reject_rate = positive.get("false_reject_rate")
     negative_fa = negative.get("false_accepts_per_hour")
     background_fa = background.get("false_accepts_per_hour")
+    negative_fa_rate = negative.get("false_accept_rate")
+    background_fa_rate = background.get("false_accept_rate")
+    negative_fa_rate_text = "n/a" if negative_fa_rate is None else f"{float(negative_fa_rate):.2%}"
+    background_fa_rate_text = "n/a" if background_fa_rate is None else f"{float(background_fa_rate):.2%}"
     if false_reject_rate is None:
         return "Evaluation did not include a positive test set, so wake-word recall was not measured."
     if false_reject_rate > 0.2:
         return (
             "This run verifies that the pipeline executes end to end, but the trained model is not ready to use. "
             f"The positive false-reject rate was {false_reject_rate:.3f}; false accepts/hour were "
-            f"{negative_fa} on negative audio and {background_fa} on background audio."
+            f"{negative_fa} on negative audio and {background_fa} on background audio; per-clip false-accept "
+            f"rates were {negative_fa_rate_text} and {background_fa_rate_text}, respectively."
         )
     return (
         "This run produced a usable candidate for further threshold tuning. "
         f"The positive false-reject rate was {false_reject_rate:.3f}; false accepts/hour were "
-        f"{negative_fa} on negative audio and {background_fa} on background audio."
+        f"{negative_fa} on negative audio and {background_fa} on background audio; per-clip false-accept "
+        f"rates were {negative_fa_rate_text} and {background_fa_rate_text}, respectively."
     )
 
 
