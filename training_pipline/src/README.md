@@ -158,12 +158,14 @@ compares the selected keyword against the strongest non-keyword CTC sequence
 found by prefix beam search on exactly the same candidate frames.
 `[stage1_report]` writes threshold-by-keyword tables before any filtering.
 Each row has one selected stage-1 keyword: the highest-scoring keyword for
-that candidate. A positive cell is `Acc / FR` only when that selected keyword
-is the expected keyword and the score for that table passes the threshold. A negative cell is
-the selected-candidate `FA/h / FA rate`; a negative clip contributes to at
-most one keyword column. Here FA rate is the share of all input negative clips
-whose selected candidate passed the threshold. Positive `FR` includes examples
-where no complete CTC alignment was found. The
+that candidate. Positive tables give each keyword's FR using only that
+keyword's expected examples as its denominator. They also show a separate
+no-pass FR over all positive examples: a case is counted only when its selected
+candidate does not pass the threshold. A passed wrong keyword is shown
+separately. Negative tables give total `FA/h` and total FA rate over all input
+clips, followed by the share of false accepts assigned to each winning keyword;
+a negative clip contributes to at most one keyword. Positive FR includes
+examples where no complete CTC alignment was found. The
 `[train] structure = ctc_wac` step applies each wake word's manual stage-1
 threshold later, immediately before training the WAC model. That means you can
 choose a threshold and retrain stage 2 without rerunning the expensive CTC

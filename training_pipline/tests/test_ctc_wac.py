@@ -1048,13 +1048,14 @@ normalized_confidence_threshold_step = 0.5
     )
     PipelineRunner(load_ini_config(config)).run()
     payload = json.loads((tmp_path / "experiment" / "report.json").read_text(encoding="utf-8"))
-    assert payload["report_schema"] == 4
+    assert payload["report_schema"] == 5
     positive_tables = payload["blocks"][0]["score_tables"]
     negative_tables = payload["blocks"][1]["score_tables"]
     positive_table = positive_tables["normalized_ctc_score"]["threshold_table"]
     negative_table = negative_tables["normalized_ctc_score"]["threshold_table"]
     positive_at_minus_two = next(item for item in positive_table if item["threshold"] == -2.0)
     negative_at_minus_two = next(item for item in negative_table if item["threshold"] == -2.0)
+    negative_at_zero = next(item for item in negative_table if item["threshold"] == 0.0)
     assert positive_at_minus_two["keywords"]["wake_a"]["accuracy"] == 1.0
     assert positive_at_minus_two["keywords"]["wake_a"]["false_rejection_rate"] == 0.0
     assert positive_at_minus_two["keywords"]["wake_b"]["accuracy"] == 0.5
@@ -1063,6 +1064,17 @@ normalized_confidence_threshold_step = 0.5
     assert negative_at_minus_two["keywords"]["wake_b"]["false_accepts_per_hour"] == 1.0
     assert negative_at_minus_two["keywords"]["wake_a"]["false_accept_rate"] == 0.5
     assert negative_at_minus_two["keywords"]["wake_b"]["false_accept_rate"] == 0.25
+    assert negative_at_minus_two["overall"]["false_accepts"] == 3
+    assert negative_at_minus_two["overall"]["false_accepts_per_hour"] == 3.0
+    assert negative_at_minus_two["overall"]["false_accept_rate"] == 0.75
+    assert negative_at_minus_two["keywords"]["wake_a"]["false_accept_share"] == pytest.approx(2.0 / 3.0)
+    assert negative_at_minus_two["keywords"]["wake_b"]["false_accept_share"] == pytest.approx(1.0 / 3.0)
+    assert negative_at_zero["overall"]["false_accepts"] == 0
+    assert negative_at_zero["keywords"]["wake_a"]["false_accept_share"] is None
+    assert negative_at_zero["keywords"]["wake_b"]["false_accept_share"] is None
+    assert positive_at_minus_two["overall"]["false_rejections"] == 0
+    assert positive_at_minus_two["overall"]["false_rejection_rate"] == 0.0
+    assert positive_at_minus_two["overall"]["wrong_keyword_passes"] == 1
     positive_confidence_at_half = next(
         item for item in positive_tables["confidence"]["threshold_table"] if item["threshold"] == 0.5
     )
@@ -1073,10 +1085,16 @@ normalized_confidence_threshold_step = 0.5
     assert positive_confidence_at_half["keywords"]["wake_b"]["accuracy"] == 0.0
     assert negative_confidence_at_half["keywords"]["wake_a"]["false_accept_rate"] == 0.5
     assert negative_confidence_at_half["keywords"]["wake_b"]["false_accept_rate"] == 0.0
+    assert negative_confidence_at_half["overall"]["false_accepts"] == 2
+    assert negative_confidence_at_half["overall"]["false_accept_rate"] == 0.5
+    assert negative_confidence_at_half["keywords"]["wake_a"]["false_accept_share"] == 1.0
+    assert negative_confidence_at_half["keywords"]["wake_b"]["false_accept_share"] == 0.0
+    assert positive_confidence_at_half["overall"]["false_rejections"] == 2
+    assert positive_confidence_at_half["overall"]["false_rejection_rate"] == 0.5
     markdown = (tmp_path / "experiment" / "report.md").read_text(encoding="utf-8")
-    assert "Acc / FR" in markdown
-    assert "FA/h" in markdown
-    assert "FA rate" in markdown
+    assert "No-pass FR" in markdown
+    assert "Total FA/h" in markdown
+    assert "share of FAs" in markdown
     assert "Keyword-versus-filler confidence" in markdown
     assert "Length-normalized keyword-versus-filler confidence" in markdown
     assert "quantile" not in markdown.lower()

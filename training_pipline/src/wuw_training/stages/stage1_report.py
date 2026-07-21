@@ -176,7 +176,7 @@ def validate_outputs(ctx: Any) -> bool:
         return False
     try:
         payload = read_json(output_json)
-        return payload.get("report_schema") == 4 and "Stage-1 Threshold Tables" in output_report.read_text(
+        return payload.get("report_schema") == 5 and "Stage-1 Threshold Tables" in output_report.read_text(
             encoding="utf-8"
         )
     except Exception:
@@ -297,8 +297,21 @@ def _positive_table(
         keyword_ids=keyword_ids,
         summary=summary,
     )
+    expected_columns = np.full(scores.shape[0], -1, dtype=np.int64)
+    for column, keyword_id in enumerate(keyword_ids):
+        expected_columns[rows_by_keyword[keyword_id]] = column
+    if np.any(expected_columns < 0):
+        raise RuntimeError(f"{block.name} positive rows are missing an expected keyword column")
+    total_expected_rows = sum(expected_counts.values())
     table: list[dict[str, Any]] = []
     for threshold in thresholds:
+        passes = selected_scores >= threshold
+        # Each feature row holds one stage-1 winner for one source clip.  A
+        # passed winner means the clip has an accepted candidate; invalid CTC
+        # alignments have no row and count as a no-pass false rejection.
+        any_keyword_passes = int(np.count_nonzero(passes))
+        no_keyword_passes = total_expected_rows - any_keyword_passes
+        wrong_keyword_passes = int(np.count_nonzero(passes & (winners != expected_columns)))
         values: dict[str, Any] = {}
         for column, keyword_id in enumerate(keyword_ids):
             total = expected_counts[keyword_id]
@@ -316,10 +329,28 @@ def _positive_table(
                 "accuracy": accepted / total if total else None,
                 "false_rejection_rate": false_rejections / total if total else None,
             }
-        table.append({"threshold": threshold, "keywords": values})
+        table.append(
+            {
+                "threshold": threshold,
+                "overall": {
+                    "expected_rows": total_expected_rows,
+                    "any_keyword_passes": any_keyword_passes,
+                    "false_rejections": no_keyword_passes,
+                    "false_rejection_rate": (
+                        no_keyword_passes / total_expected_rows if total_expected_rows else None
+                    ),
+                    "wrong_keyword_passes": wrong_keyword_passes,
+                    "wrong_keyword_pass_rate": (
+                        wrong_keyword_passes / total_expected_rows if total_expected_rows else None
+                    ),
+                },
+                "keywords": values,
+            }
+        )
     return {
-        "metric": "accuracy_and_false_rejection_rate",
+        "metric": "per_keyword_false_rejection_and_no_keyword_pass_false_rejection_rate",
         "expected_keyword_rows": expected_counts,
+        "expected_rows": total_expected_rows,
         "threshold_table": table,
     }
 
@@ -363,9 +394,25 @@ def _negative_table(
                 "false_accepts_per_hour": false_accepts / duration_hours,
                 "false_accept_rate": false_accepts / input_rows,
             }
-        table.append({"threshold": threshold, "keywords": values})
+        total_false_accepts = sum(value["false_accepts"] for value in values.values())
+        for value in values.values():
+            value["false_accept_share"] = (
+                value["false_accepts"] / total_false_accepts if total_false_accepts else None
+            )
+        table.append(
+            {
+                "threshold": threshold,
+                "overall": {
+                    "input_rows": input_rows,
+                    "false_accepts": total_false_accepts,
+                    "false_accepts_per_hour": total_false_accepts / duration_hours,
+                    "false_accept_rate": total_false_accepts / input_rows,
+                },
+                "keywords": values,
+            }
+        )
     return {
-        "metric": "stage1_selected_candidate_false_accepts_per_hour",
+        "metric": "stage1_selected_candidate_false_accepts_with_keyword_distribution",
         "input_rows": input_rows,
         "input_duration_seconds": duration_seconds,
         "threshold_table": table,
@@ -475,13 +522,15 @@ def _markdown(payload: dict[str, Any]) -> str:
             "Each score below only decides whether that already-selected candidate passes its threshold."
         ),
         (
-            "For positives, `Acc / FR` means the expected keyword was the selected candidate and passed the "
-            "threshold / was not selected or did not pass it; no CTC alignment counts as FR."
+            "For positives, each keyword FR uses only that keyword's expected examples. A wrong winner or a "
+            "below-threshold winner is an FR for that expected keyword. `No-pass FR` is separate: it counts a "
+            "case only when its selected stage-1 candidate did not pass; a wrong keyword that passed is shown "
+            "separately."
         ),
         (
-            "For negatives, `FA/h` is the selected stage-1 candidate count per source-audio hour and `FA rate` "
-            "is the share of all input clips whose selected candidate passed the threshold; neither is a final "
-            "system metric."
+            "For negatives, `Total FA/h` and `Total FA rate` use all input clips in the block. Each negative "
+            "clip contributes at most one false accept—the selected winner—and the keyword columns show how "
+            "those false accepts are distributed. Neither is a final system metric."
         ),
     ]
     for block in payload["blocks"]:
@@ -492,25 +541,34 @@ def _markdown(payload: dict[str, Any]) -> str:
             lines.extend(["", f"### {score_table['score_label']}", "", score_table["score_description"], ""])
             if block["label"] == 1:
                 counts = score_table["expected_keyword_rows"]
+                total = score_table["expected_rows"]
                 lines.extend(
                     [
-                        "Positive set. Each column header gives its expected-example count.",
+                        "Positive set. Each per-keyword denominator is shown in its column header.",
                         "",
-                        "| Threshold | "
+                        "| Threshold | No-pass FR (n="
+                        + str(total)
+                        + ") | Wrong-keyword pass (n="
+                        + str(total)
+                        + ") | "
                         + " | ".join(
-                            f"{keyword_id} (Acc / FR; n={counts[keyword_id]})" for keyword_id in keyword_ids
+                            f"{keyword_id} (FR; n={counts[keyword_id]})" for keyword_id in keyword_ids
                         )
                         + " |",
-                        "| ---: | " + " | ".join("---:" for _ in keyword_ids) + " |",
+                        "| ---: | " + " | ".join("---:" for _ in range(len(keyword_ids) + 2)) + " |",
                     ]
                 )
                 for threshold_row in score_table["threshold_table"]:
-                    cells = []
+                    overall = threshold_row["overall"]
+                    cells = [
+                        f"{overall['false_rejections']} / "
+                        f"{_format_percent(overall['false_rejection_rate'])}",
+                        f"{overall['wrong_keyword_passes']} / "
+                        f"{_format_percent(overall['wrong_keyword_pass_rate'])}",
+                    ]
                     for keyword_id in keyword_ids:
                         value = threshold_row["keywords"][keyword_id]
-                        cells.append(
-                            f"{_format_percent(value['accuracy'])} / {_format_percent(value['false_rejection_rate'])}"
-                        )
+                        cells.append(f"{value['false_rejections']} / {_format_percent(value['false_rejection_rate'])}")
                     lines.append(f"| {threshold_row['threshold']:.6g} | " + " | ".join(cells) + " |")
             else:
                 duration = score_table["input_duration_seconds"] / 3600.0
@@ -518,20 +576,22 @@ def _markdown(payload: dict[str, Any]) -> str:
                     [
                         f"Negative set. Source duration: {duration:.6f} h.",
                         "",
-                        "| Threshold | "
-                        + " | ".join(f"{keyword_id} (FA/h / FA rate)" for keyword_id in keyword_ids)
+                        "| Threshold | Total FAs | Total FA/h | Total FA rate | "
+                        + " | ".join(f"{keyword_id} (share of FAs)" for keyword_id in keyword_ids)
                         + " |",
-                        "| ---: | " + " | ".join("---:" for _ in keyword_ids) + " |",
+                        "| ---: | ---: | ---: | ---: | " + " | ".join("---:" for _ in keyword_ids) + " |",
                     ]
                 )
                 for threshold_row in score_table["threshold_table"]:
-                    cells = []
+                    overall = threshold_row["overall"]
+                    cells = [
+                        str(overall["false_accepts"]),
+                        f"{overall['false_accepts_per_hour']:.4f}",
+                        _format_percent(overall["false_accept_rate"]),
+                    ]
                     for keyword_id in keyword_ids:
                         value = threshold_row["keywords"][keyword_id]
-                        cells.append(
-                            f"{value['false_accepts_per_hour']:.4f} / "
-                            f"{_format_percent(value['false_accept_rate'])}"
-                        )
+                        cells.append(f"{value['false_accepts']} / {_format_percent(value['false_accept_share'])}")
                     lines.append(f"| {threshold_row['threshold']:.6g} | " + " | ".join(cells) + " |")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -540,7 +600,7 @@ def run(ctx: Any) -> dict[str, Any]:
     score_thresholds = _score_thresholds(ctx)
     blocks = [_block_payload(block, score_thresholds) for block in _blocks(ctx)]
     payload = {
-        "report_schema": 4,
+        "report_schema": 5,
         # Keep the original field temporarily for readers that only consume
         # the existing normalized CTC score.
         "threshold_sweep": _threshold_sweep(score_thresholds["normalized_ctc_score"]),
