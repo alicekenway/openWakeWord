@@ -61,6 +61,12 @@ def _keyword_tokens(ctx: Any) -> Path:
     return ctx.config.resolve_path(value) if value else _keywords(ctx)
 
 
+def _debug_alignment(ctx: Any) -> bool:
+    """Whether to write the optional per-input CTC token-alignment log."""
+
+    return boolean(ctx.section, "debug_alignment", ctx.step, False)
+
+
 def _ctc_max_search_frames(ctx: Any, contract: Stage1Contract) -> int | None:
     """Convert an explicitly configured CTC window count into encoder frames.
 
@@ -127,6 +133,7 @@ def validate(ctx: Any) -> None:
             raise ConfigurationError(f"[{ctx.step}] candidate_pre_margin_frames must be >= 0")
         if integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0) < 0:
             raise ConfigurationError(f"[{ctx.step}] candidate_post_margin_frames must be >= 0")
+        _debug_alignment(ctx)
         _ctc_max_search_frames(ctx, contract)
         device = ctx.section.get("device", "cpu").lower()
         if device not in {"auto", "cpu", "gpu"}:
@@ -136,6 +143,8 @@ def validate(ctx: Any) -> None:
         raise ConfigurationError(
             f"[{ctx.step}] extractor must be openwakeword or wenet_ctc_wac, got {extractor!r}"
         )
+    if _debug_alignment(ctx):
+        raise ConfigurationError(f"[{ctx.step}] debug_alignment is only supported by extractor = wenet_ctc_wac")
     model_dir = _model_dir(ctx)
     if model_dir.exists() and not model_dir.is_dir():
         raise ConfigurationError(f"[{ctx.step}] model_dir is not a directory: {model_dir}")
@@ -159,7 +168,8 @@ def input_paths(ctx: Any) -> list[Path]:
 def output_paths(ctx: Any) -> list[Path]:
     output = _output_file(ctx)
     if _extractor(ctx) == "wenet_ctc_wac":
-        return feature_bundle_paths(output).all()
+        paths = feature_bundle_paths(output)
+        return [*paths.all(), *([paths.debug_alignments] if _debug_alignment(ctx) else [])]
     return [output, output.with_suffix(".summary.json")]
 
 
@@ -169,6 +179,7 @@ def validate_outputs(ctx: Any) -> bool:
         return feature_bundle_valid(
             _output_file(ctx),
             expected_stage1_contract_fingerprint=contract.fingerprint(),
+            require_debug_alignments=_debug_alignment(ctx),
         )
     output, summary_path = output_paths(ctx)
     if not output.is_file() or not summary_path.is_file():
@@ -202,6 +213,7 @@ def run(ctx: Any) -> dict[str, Any]:
             max_search_frames=_ctc_max_search_frames(ctx, Stage1Contract.from_json(_stage1_contract(ctx))),
             device=ctx.section.get("device", "cpu").lower(),
             overwrite=ctx.force or boolean(ctx.section, "overwrite", ctx.step, False),
+            debug_alignments=_debug_alignment(ctx),
         )
         if not validate_outputs(ctx):
             raise RuntimeError(f"CTC-WAC feature output validation failed for {ctx.step}")
@@ -210,6 +222,8 @@ def run(ctx: Any) -> dict[str, Any]:
             "feature_count": summary.get("feature_count"),
             "feature_shape": summary.get("feature_storage_shape"),
             "keyword_count": summary.get("keyword_count"),
+            "debug_alignment_enabled": summary.get("debug_alignment_enabled"),
+            "debug_alignment_jsonl": summary.get("debug_alignment_jsonl"),
             "stage1_gate_applied": False,
             "label": integer(ctx.section, "label", ctx.step),
             "split": ctx.section["split"],
@@ -302,6 +316,7 @@ def run_slurm_shard(ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
             device=ctx.section.get("device", "cpu").lower(),
             overwrite=True,
             index_offset=index_offset,
+            debug_alignments=_debug_alignment(ctx),
         )
         return {"output_file": str(output), "feature_count": summary.get("feature_count")}
 
@@ -338,6 +353,7 @@ def validate_slurm_shard(ctx: Any, task: dict[str, Any]) -> bool:
         return feature_bundle_valid(
             output,
             expected_stage1_contract_fingerprint=contract.fingerprint(),
+            require_debug_alignments=_debug_alignment(ctx),
         )
     summary_path = output.with_suffix(".summary.json")
     if not output.is_file() or not summary_path.is_file():
@@ -421,6 +437,7 @@ def _merge_openwakeword_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[
 def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
     output = _output_file(ctx)
     destination = feature_bundle_paths(output)
+    debug_alignment = _debug_alignment(ctx)
     source_paths = [feature_bundle_paths(Path(str(task["output_file"])).resolve()) for task in tasks]
     feature_frames, feature_shape, _dtype = _atomic_merge_arrays(
         destination.features, [paths.features for paths in source_paths]
@@ -465,6 +482,8 @@ def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, 
             raise RuntimeError("CTC-WAC feature shards use different keyword token files")
         if shard_summary.get("stage1_contract_fingerprint") != summary.get("stage1_contract_fingerprint"):
             raise RuntimeError("CTC-WAC feature shards use different stage-1 contracts")
+    if debug_alignment and any(item.get("debug_alignment_enabled") is not True for item in shard_summaries):
+        raise RuntimeError("CTC-WAC debug alignment logging was not enabled for every feature shard")
 
     def summed_keyword_counts(name: str) -> dict[str, int]:
         totals = {keyword_id: 0 for keyword_id in keyword_ids}
@@ -487,6 +506,16 @@ def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, 
         for shard_summary in shard_summaries
         for item in shard_summary.get("invalid_alignments", [])
     ][:50]
+    debug_alignment_rows: list[dict[str, Any]] = []
+    if debug_alignment:
+        for paths in source_paths:
+            debug_alignment_rows.extend(read_jsonl(paths.debug_alignments, allow_empty=True))
+        expected_debug_rows = sum(int(item.get("debug_alignment_rows", -1)) for item in shard_summaries)
+        if expected_debug_rows < 0 or len(debug_alignment_rows) != expected_debug_rows:
+            raise RuntimeError("CTC-WAC shard debug alignment row count does not match shard summaries")
+        write_jsonl(destination.debug_alignments, debug_alignment_rows)
+    else:
+        destination.debug_alignments.unlink(missing_ok=True)
     summary.update(
         {
             "output_file": str(output),
@@ -499,6 +528,9 @@ def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, 
             },
             "input_count": sum(int(item.get("input_count", 0)) for item in shard_summaries),
             "input_duration_seconds": sum(float(item.get("input_duration_seconds", 0.0)) for item in shard_summaries),
+            "debug_alignment_enabled": debug_alignment,
+            "debug_alignment_jsonl": str(destination.debug_alignments) if debug_alignment else None,
+            "debug_alignment_rows": len(debug_alignment_rows) if debug_alignment else 0,
             "invalid_alignment_rows": sum(int(item.get("invalid_alignment_rows", 0)) for item in shard_summaries),
             "invalid_alignments": invalid_alignments,
             "expected_keyword_counts": summed_keyword_counts("expected_keyword_counts"),
@@ -533,6 +565,7 @@ def cleanup_slurm_shards(tasks: list[dict[str, Any]]) -> None:
     for task in tasks:
         output = Path(str(task["output_file"])).resolve()
         if output.exists():
-            for path in feature_bundle_paths(output).all():
+            paths = feature_bundle_paths(output)
+            for path in [*paths.all(), paths.debug_alignments]:
                 path.unlink(missing_ok=True)
         output.with_suffix(".progress.json").unlink(missing_ok=True)

@@ -28,6 +28,7 @@ from wuw_training.ctc_wac import (  # noqa: E402
     Stage1Contract,
     StreamingCtcStage1,
     best_ctc_candidate,
+    ctc_candidate_token_alignments,
     ctc_keyword_alignment_trace,
     ctc_keyword_alignment_traces,
     ctc_keyword_score_trace,
@@ -61,7 +62,14 @@ def _keyword_file(root: Path) -> Path:
     return path
 
 
-def _write_bundle(path: Path, *, label: int, keywords_path: Path, seed: int) -> None:
+def _write_bundle(
+    path: Path,
+    *,
+    label: int,
+    keywords_path: Path,
+    seed: int,
+    debug_alignment: bool = False,
+) -> None:
     keywords = load_keywords(keywords_path)
     rng = np.random.default_rng(seed)
     lengths = np.asarray([3, 6, 4, 5], dtype=np.int32)
@@ -97,6 +105,19 @@ def _write_bundle(path: Path, *, label: int, keywords_path: Path, seed: int) -> 
             for index in range(lengths.shape[0])
         ],
     )
+    if debug_alignment:
+        write_jsonl(
+            paths.debug_alignments,
+            [
+                {
+                    "schema_version": 1,
+                    "source_index": index,
+                    "status": "ok",
+                    "candidate": {"tokens": []},
+                }
+                for index in range(lengths.shape[0])
+            ],
+        )
     write_json(
         paths.summary,
         {
@@ -115,6 +136,9 @@ def _write_bundle(path: Path, *, label: int, keywords_path: Path, seed: int) -> 
                 "wake_b": 2 if label == 1 else 0,
             },
             "expected_keyword_invalid_alignment_counts": {"wake_a": 0, "wake_b": 0},
+            "debug_alignment_enabled": debug_alignment,
+            "debug_alignment_jsonl": str(paths.debug_alignments) if debug_alignment else None,
+            "debug_alignment_rows": int(lengths.shape[0]) if debug_alignment else 0,
             "error_count": 0,
         },
     )
@@ -228,6 +252,58 @@ def test_ctc_alignment_trace_reports_token_boundaries_not_trailing_blanks() -> N
     assert trace.starts[2] == 0
     assert trace.ends[2] == 2
     assert trace.ends[3] == 2
+
+
+def test_ctc_candidate_token_alignments_report_frame_spans_and_normalized_scores() -> None:
+    probabilities = np.asarray(
+        [
+            [0.02, 0.90, 0.08],  # token 1
+            [0.05, 0.80, 0.15],  # token 1
+            [0.90, 0.05, 0.05],  # inter-token blank
+            [0.10, 0.20, 0.70],  # token 2
+            [0.05, 0.15, 0.80],  # token 2
+            [0.98, 0.01, 0.01],  # trailing blank outside the non-blank candidate range
+        ],
+        dtype=np.float32,
+    )
+    log_probs = np.log(probabilities)
+    alignments = ctc_candidate_token_alignments(
+        log_probs,
+        [1, 2],
+        candidate_start_frame=0,
+        candidate_end_frame=4,
+        blank_id=0,
+    )
+
+    assert [(item.token_id, item.start_frame, item.end_frame, item.frame_count) for item in alignments] == [
+        (1, 0, 1, 2),
+        (2, 3, 4, 2),
+    ]
+    assert alignments[0].normalized_score == pytest.approx((log_probs[0, 1] + log_probs[1, 1]) / 2)
+    assert alignments[1].normalized_score == pytest.approx((log_probs[3, 2] + log_probs[4, 2]) / 2)
+
+
+def test_ctc_candidate_token_alignments_keep_repeated_tokens_separate() -> None:
+    probabilities = np.asarray(
+        [
+            [0.02, 0.96],  # first token 1
+            [0.98, 0.02],  # required blank between repeated token IDs
+            [0.02, 0.96],  # second token 1
+        ],
+        dtype=np.float32,
+    )
+    alignments = ctc_candidate_token_alignments(
+        np.log(probabilities),
+        [1, 1],
+        candidate_start_frame=0,
+        candidate_end_frame=2,
+        blank_id=0,
+    )
+
+    assert [(item.token_index, item.start_frame, item.end_frame) for item in alignments] == [
+        (0, 0, 0),
+        (1, 2, 2),
+    ]
 
 
 def test_bounded_ctc_trace_matches_an_exact_rolling_reference() -> None:
@@ -482,17 +558,18 @@ def test_feature_bundle_crops_variable_length_ctc_candidates(monkeypatch: pytest
         lambda audio, _contract: np.asarray([[audio.size]], dtype=np.float32),
     )
     output = tmp_path / "bundle.npy"
-    summary = ctc_wac_module.generate_ctc_wac_feature_bundle(
-        records=[
+    arguments = {
+        "records": [
             {"id": "one", "path": str(tmp_path / "one.wav"), "label": 1, "text": "wake a"},
             {"id": "two", "path": str(tmp_path / "two.wav"), "label": 1, "text": "wake b"},
         ],
-        output_file=output,
-        model_path=tmp_path / "stage1.onnx",
-        contract_path=contract_path,
-        keywords_path=keywords_path,
-        candidate_pre_margin_frames=1,
-    )
+        "output_file": output,
+        "model_path": tmp_path / "stage1.onnx",
+        "contract_path": contract_path,
+        "keywords_path": keywords_path,
+        "candidate_pre_margin_frames": 1,
+    }
+    summary = ctc_wac_module.generate_ctc_wac_feature_bundle(**arguments)
     paths = feature_bundle_paths(output)
     lengths = np.load(paths.lengths)
     offsets = np.load(paths.offsets)
@@ -504,6 +581,29 @@ def test_feature_bundle_crops_variable_length_ctc_candidates(monkeypatch: pytest
     assert np.load(paths.features).shape == (12, 3)
     rows = [json.loads(line) for line in paths.rows.read_text(encoding="utf-8").splitlines()]
     assert [row["expected_keyword_id"] for row in rows] == ["wake_a", "wake_b"]
+    assert summary["debug_alignment_enabled"] is False
+    assert not paths.debug_alignments.exists()
+    assert not feature_bundle_valid(output, require_debug_alignments=True)
+
+    debug_summary = ctc_wac_module.generate_ctc_wac_feature_bundle(
+        **arguments,
+        overwrite=True,
+        debug_alignments=True,
+    )
+    debug_rows = [json.loads(line) for line in paths.debug_alignments.read_text(encoding="utf-8").splitlines()]
+    assert debug_summary["debug_alignment_enabled"] is True
+    assert debug_summary["debug_alignment_rows"] == 2
+    assert feature_bundle_valid(output, require_debug_alignments=True)
+    assert [item["status"] for item in debug_rows] == ["ok", "ok"]
+    token_rows = debug_rows[0]["candidate"]["tokens"]
+    assert [item["token_id"] for item in token_rows] == [1, 2]
+    assert all(item["start_frame"] <= item["end_frame"] for item in token_rows)
+    assert all(item["normalized_score"] <= 0.0 for item in token_rows)
+
+    normal_summary = ctc_wac_module.generate_ctc_wac_feature_bundle(**arguments)
+    assert normal_summary["debug_alignment_enabled"] is False
+    assert not paths.debug_alignments.exists()
+    assert not feature_bundle_valid(output, require_debug_alignments=True)
 
 
 def test_masked_wac_pooling_ignores_tail_padding() -> None:
@@ -528,11 +628,11 @@ def test_slurm_merge_rebuilds_ragged_offsets(tmp_path: Path) -> None:
     first = tmp_path / "shard_a.npy"
     second = tmp_path / "shard_b.npy"
     output = tmp_path / "merged.npy"
-    _write_bundle(first, label=1, keywords_path=keywords_path, seed=3)
-    _write_bundle(second, label=1, keywords_path=keywords_path, seed=4)
+    _write_bundle(first, label=1, keywords_path=keywords_path, seed=3, debug_alignment=True)
+    _write_bundle(second, label=1, keywords_path=keywords_path, seed=4, debug_alignment=True)
     ctx = SimpleNamespace(
         step="feature.positive_train",
-        section={"output_file": str(output), "label": "1", "split": "train"},
+        section={"output_file": str(output), "label": "1", "split": "train", "debug_alignment": "yes"},
         config=SimpleNamespace(resolve_path=lambda value: Path(value).resolve()),
     )
     result = _merge_ctc_wac_features(
@@ -543,11 +643,13 @@ def test_slurm_merge_rebuilds_ragged_offsets(tmp_path: Path) -> None:
     lengths = np.load(paths.lengths)
     offsets = np.load(paths.offsets)
     rows = [json.loads(line) for line in paths.rows.read_text(encoding="utf-8").splitlines()]
-    assert feature_bundle_valid(output)
+    assert feature_bundle_valid(output, require_debug_alignments=True)
     assert result["feature_count"] == 8
     assert lengths.tolist() == [3, 6, 4, 5, 3, 6, 4, 5]
     assert offsets.tolist() == [0, 3, 9, 13, 18, 21, 27, 31, 36]
     assert [row["row"] for row in rows] == list(range(8))
+    debug_rows = [json.loads(line) for line in paths.debug_alignments.read_text(encoding="utf-8").splitlines()]
+    assert len(debug_rows) == 8
     summary = json.loads(paths.summary.read_text(encoding="utf-8"))
     assert summary["expected_keyword_counts"] == {"wake_a": 4, "wake_b": 4}
     assert summary["expected_keyword_invalid_alignment_counts"] == {"wake_a": 0, "wake_b": 0}

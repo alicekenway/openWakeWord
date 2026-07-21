@@ -186,6 +186,28 @@ newly rising stage-1 candidates to stage 2. Recalibrate stage-1 and final
 thresholds after changing the horizon, because a longer search range changes
 the maximum-score distribution on negative audio.
 
+### Optional CTC token-alignment debug log
+
+Normal CTC feature generation does not backtrack through each candidate path,
+so it keeps the existing throughput and artifact size. To inspect every input
+while debugging, enable the following option in a `wenet_ctc_wac` feature
+block:
+
+```ini
+[feature.negative_dev]
+debug_alignment = yes
+```
+
+This writes `<output_file stem>.debug.jsonl` next to the feature bundle. It
+contains one row per input with its best stage-1 candidate and, for each token,
+the token ID, inclusive encoder-frame range, assigned-frame count, raw log
+score, and `normalized_score`. A token's `normalized_score` is the mean CTC
+log-probability across the frames assigned to that token, so tokens that span
+different numbers of frames remain comparable. Rows without a complete CTC
+candidate are retained with an explanatory status. Set `debug_alignment = no`
+or omit it for normal runs; it is disabled by default and its backtracking work
+is not performed. Slurm feature runs merge the same debug rows into one log.
+
 The intended first-run workflow is:
 
 ```bash

@@ -416,6 +416,12 @@ class FeatureBundlePaths:
     rows: Path
     summary: Path
 
+    @property
+    def debug_alignments(self) -> Path:
+        """Optional per-input CTC alignment log, written only in debug mode."""
+
+        return self.rows.with_name(f"{self.features.stem}.debug.jsonl")
+
     def all(self) -> list[Path]:
         return [
             self.features,
@@ -458,6 +464,7 @@ def feature_bundle_valid(
     *,
     require_complete: bool = True,
     expected_stage1_contract_fingerprint: str | None = None,
+    require_debug_alignments: bool = False,
 ) -> bool:
     """Check the shapes and summary needed by CTC-WAC training.
 
@@ -467,6 +474,8 @@ def feature_bundle_valid(
 
     paths = feature_bundle_paths(features)
     if not all(path.is_file() for path in paths.all()):
+        return False
+    if require_debug_alignments and not paths.debug_alignments.is_file():
         return False
     try:
         summary = read_json(paths.summary)
@@ -483,6 +492,11 @@ def feature_bundle_valid(
         valid = (
             int(summary.get("bundle_schema", -1)) == BUNDLE_SCHEMA_VERSION
             and (not require_complete or int(summary.get("error_count", -1)) == 0)
+            and (not require_debug_alignments or summary.get("debug_alignment_enabled") is True)
+            and (
+                not require_debug_alignments
+                or int(summary.get("debug_alignment_rows", -1)) == int(summary.get("input_count", -2))
+            )
             and (
                 expected_stage1_contract_fingerprint is None
                 or summary.get("stage1_contract_fingerprint")
@@ -908,6 +922,119 @@ class CtcCandidate:
     end_frame: int
 
 
+@dataclass(frozen=True)
+class CtcTokenAlignment:
+    """One token's Viterbi span inside a selected CTC candidate."""
+
+    token_index: int
+    token_id: int
+    start_frame: int
+    end_frame: int
+    frame_count: int
+    log_score: float
+    normalized_score: float
+
+
+def ctc_candidate_token_alignments(
+    log_probs: np.ndarray,
+    token_ids: Sequence[int],
+    *,
+    candidate_start_frame: int,
+    candidate_end_frame: int,
+    blank_id: int = 0,
+) -> list[CtcTokenAlignment]:
+    """Return Viterbi token spans for one already selected CTC candidate.
+
+    ``candidate_start_frame`` and ``candidate_end_frame`` are the non-blank
+    boundaries produced by :func:`best_ctc_candidate`.  The alignment is
+    constrained to begin with the first keyword token at the former and end
+    with the last keyword token at the latter.  A token's normalized score is
+    its mean CTC log-probability across the frames assigned to that token.
+
+    This function is intentionally separate from normal candidate scoring so
+    feature extraction pays the backtracking cost only when debug alignment
+    logging is enabled.
+    """
+
+    values = np.asarray(log_probs, dtype=np.float32)
+    if values.ndim != 2:
+        raise ValueError(f"CTC scores must have shape [frames, vocabulary], got {values.shape}")
+    tokens = tuple(int(item) for item in token_ids)
+    if not tokens:
+        raise ValueError("A CTC keyword needs at least one token")
+    if blank_id < 0 or blank_id >= values.shape[1] or any(item < 0 or item >= values.shape[1] for item in tokens):
+        raise ValueError("CTC keyword token ID is outside the output vocabulary")
+    if blank_id in tokens:
+        raise ValueError("CTC keyword token IDs must not include the blank ID")
+    if not 0 <= candidate_start_frame <= candidate_end_frame < values.shape[0]:
+        raise ValueError(
+            "CTC candidate boundaries must satisfy "
+            "0 <= candidate_start_frame <= candidate_end_frame < frame_count"
+        )
+
+    candidate = values[candidate_start_frame:candidate_end_frame + 1]
+    extended: list[int] = [blank_id]
+    for token in tokens:
+        extended.extend([token, blank_id])
+    state_count = len(extended)
+    negative_infinity = np.float32(-1.0e30)
+    previous_score = np.full(state_count, negative_infinity, dtype=np.float32)
+    predecessors = np.full((candidate.shape[0], state_count), -1, dtype=np.int32)
+
+    # The recorded start boundary is the first non-blank keyword token, so
+    # leading CTC blanks are deliberately excluded from this forced alignment.
+    previous_score[1] = np.float32(candidate[0, tokens[0]])
+    for frame_index in range(1, candidate.shape[0]):
+        current_score = np.full(state_count, negative_infinity, dtype=np.float32)
+        for state in range(1, state_count):
+            symbol = extended[state]
+            candidate_states = [state, state - 1]
+            if state % 2 == 1 and extended[state] != extended[state - 2]:
+                candidate_states.append(state - 2)
+            best_state = candidate_states[0]
+            best_score = previous_score[best_state]
+            for previous_state in candidate_states[1:]:
+                if previous_score[previous_state] > best_score:
+                    best_score = previous_score[previous_state]
+                    best_state = previous_state
+            if best_score > negative_infinity / 2:
+                current_score[state] = best_score + np.float32(candidate[frame_index, symbol])
+                predecessors[frame_index, state] = best_state
+        previous_score = current_score
+
+    final_state = state_count - 2
+    if previous_score[final_state] <= negative_infinity / 2:
+        raise RuntimeError("Selected CTC candidate has no token-level alignment")
+    states = np.empty(candidate.shape[0], dtype=np.int32)
+    state = final_state
+    for frame_index in range(candidate.shape[0] - 1, -1, -1):
+        states[frame_index] = state
+        state = int(predecessors[frame_index, state])
+    if int(states[0]) != 1:
+        raise RuntimeError("Selected CTC candidate alignment does not start with its first token")
+
+    alignments: list[CtcTokenAlignment] = []
+    for token_index, token_id in enumerate(tokens):
+        state_index = 2 * token_index + 1
+        local_frames = np.flatnonzero(states == state_index)
+        if local_frames.size == 0:
+            raise RuntimeError(f"Selected CTC candidate did not emit token index {token_index}")
+        token_log_scores = candidate[local_frames, token_id]
+        frame_count = int(local_frames.size)
+        alignments.append(
+            CtcTokenAlignment(
+                token_index=token_index,
+                token_id=token_id,
+                start_frame=int(candidate_start_frame + local_frames[0]),
+                end_frame=int(candidate_start_frame + local_frames[-1]),
+                frame_count=frame_count,
+                log_score=float(token_log_scores.sum()),
+                normalized_score=float(token_log_scores.mean()),
+            )
+        )
+    return alignments
+
+
 def best_ctc_candidate(
     log_probs: np.ndarray,
     keywords: Sequence[Keyword],
@@ -1315,6 +1442,7 @@ def generate_ctc_wac_feature_bundle(
     device: str = "cpu",
     overwrite: bool = False,
     index_offset: int = 0,
+    debug_alignments: bool = False,
 ) -> dict[str, Any]:
     """Generate ragged candidate features and all stage-1 values.
 
@@ -1331,8 +1459,11 @@ def generate_ctc_wac_feature_bundle(
     if not overwrite and feature_bundle_valid(
         output_file,
         expected_stage1_contract_fingerprint=contract.fingerprint(),
+        require_debug_alignments=debug_alignments,
     ):
-        return read_json(paths.summary)
+        existing_summary = read_json(paths.summary)
+        if bool(existing_summary.get("debug_alignment_enabled")) == debug_alignments:
+            return existing_summary
     keywords = load_keywords(keywords_path, require_threshold=False)
     keyword_ids = {item.id for item in keywords}
     keyword_by_text = {item.display_text.strip().casefold(): item.id for item in keywords}
@@ -1344,6 +1475,7 @@ def generate_ctc_wac_feature_bundle(
     output_file.parent.mkdir(parents=True, exist_ok=True)
     temporary_paths = {name: _temporary_path(path) for name, path in asdict(paths).items()}
     temporary = {name: Path(value) for name, value in temporary_paths.items()}
+    temporary_debug_alignments = _temporary_path(paths.debug_alignments) if debug_alignments else None
     raw_features = _temporary_path(output_file.with_name(f".{output_file.name}.candidate_features.raw"))
     rows: list[dict[str, Any]] = []
     score_rows: list[np.ndarray] = []
@@ -1354,11 +1486,61 @@ def generate_ctc_wac_feature_bundle(
     offsets = [0]
     errors: list[dict[str, Any]] = []
     invalid_alignments: list[dict[str, Any]] = []
+    debug_alignment_rows: list[dict[str, Any]] = []
     expected_keyword_counts = {item.id: 0 for item in keywords}
     expected_keyword_invalid_alignment_counts = {item.id: 0 for item in keywords}
     feature_dim: int | None = None
     input_duration_seconds = 0.0
     row = 0
+
+    def debug_alignment_row(
+        *,
+        record: dict[str, Any],
+        source_index: int,
+        expected_keyword_id: str | None,
+        status: str,
+        candidate: CtcCandidate | None = None,
+        token_alignments: list[CtcTokenAlignment] | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "schema_version": 1,
+            "source_index": source_index,
+            "id": record.get("id"),
+            "path": str(record.get("path")) if record.get("path") else None,
+            "label": record.get("label"),
+            "expected_keyword_id": expected_keyword_id,
+            "status": status,
+            "candidate": None,
+        }
+        if candidate is None:
+            return result
+        keyword = keywords[candidate.keyword_index]
+        result["candidate"] = {
+            "keyword_id": keyword.id,
+            "keyword_text": keyword.display_text,
+            "token_ids": list(keyword.token_ids),
+            "candidate_frame": candidate.frame,
+            "candidate_start_frame": candidate.start_frame,
+            "candidate_end_frame": candidate.end_frame,
+            "top_score": candidate.top_score,
+            "margin": candidate.margin,
+            "score_domain": "normalized_ctc_log_probability_per_keyword",
+            "tokens": [
+                {
+                    "token_index": item.token_index,
+                    "token_id": item.token_id,
+                    "start_frame": item.start_frame,
+                    "end_frame": item.end_frame,
+                    "frame_count": item.frame_count,
+                    "log_score": item.log_score,
+                    "normalized_score": item.normalized_score,
+                    "normalized_score_domain": "mean_log_probability_per_assigned_encoder_frame",
+                }
+                for item in token_alignments or []
+            ],
+        }
+        return result
+
     try:
         with raw_features.open("ab") as raw_handle:
             for local_index, record in enumerate(records):
@@ -1412,6 +1594,17 @@ def generate_ctc_wac_feature_bundle(
                         blank_id=contract.blank_id,
                         max_search_frames=max_search_frames,
                     )
+                    token_alignments = (
+                        ctc_candidate_token_alignments(
+                            ctc,
+                            keywords[candidate.keyword_index].token_ids,
+                            candidate_start_frame=candidate.start_frame,
+                            candidate_end_frame=candidate.end_frame,
+                            blank_id=contract.blank_id,
+                        )
+                        if debug_alignments
+                        else None
+                    )
                     crop_start = max(0, candidate.start_frame - int(candidate_pre_margin_frames))
                     crop_end = min(
                         int(encoder.shape[0]),
@@ -1431,6 +1624,17 @@ def generate_ctc_wac_feature_bundle(
                                 "candidate_end_frame": candidate.end_frame,
                             }
                         )
+                        if debug_alignments:
+                            debug_alignment_rows.append(
+                                debug_alignment_row(
+                                    record=record,
+                                    source_index=index,
+                                    expected_keyword_id=expected_keyword_id,
+                                    status="empty_candidate_crop",
+                                    candidate=candidate,
+                                    token_alignments=token_alignments,
+                                )
+                            )
                         continue
                     crop = np.asarray(encoder[crop_start:crop_end], dtype=np.float32)
                     crop.tofile(raw_handle)
@@ -1464,6 +1668,17 @@ def generate_ctc_wac_feature_bundle(
                             "margin": candidate.margin,
                         }
                     )
+                    if debug_alignments:
+                        debug_alignment_rows.append(
+                            debug_alignment_row(
+                                record=record,
+                                source_index=index,
+                                expected_keyword_id=expected_keyword_id,
+                                status="ok",
+                                candidate=candidate,
+                                token_alignments=token_alignments,
+                            )
+                        )
                     row += 1
                 except RuntimeError as exc:
                     # A CTC matrix with no complete keyword path is expected to
@@ -1480,6 +1695,15 @@ def generate_ctc_wac_feature_bundle(
                                 "expected_keyword_id": expected_keyword_id,
                             }
                         )
+                        if debug_alignments:
+                            debug_alignment_rows.append(
+                                debug_alignment_row(
+                                    record=record,
+                                    source_index=index,
+                                    expected_keyword_id=expected_keyword_id,
+                                    status="no_valid_ctc_alignment",
+                                )
+                            )
                         continue
                     errors.append(
                         {
@@ -1505,6 +1729,8 @@ def generate_ctc_wac_feature_bundle(
             )
         if feature_dim is None:
             raise RuntimeError("CTC-WAC feature generation did not receive a usable stage-1 encoder output")
+        if debug_alignments and len(debug_alignment_rows) != len(records):
+            raise RuntimeError("CTC-WAC debug alignment log does not cover every input record")
         total_frames = int(offsets[-1])
         if total_frames:
             raw = np.memmap(raw_features, mode="r", dtype=np.float32, shape=(total_frames, feature_dim))
@@ -1554,6 +1780,9 @@ def generate_ctc_wac_feature_bundle(
             "encoder_frame_shift_ms": contract.encoder_frame_shift_ms,
             "input_count": len(records),
             "input_duration_seconds": input_duration_seconds,
+            "debug_alignment_enabled": debug_alignments,
+            "debug_alignment_jsonl": str(paths.debug_alignments) if debug_alignments else None,
+            "debug_alignment_rows": len(debug_alignment_rows) if debug_alignments else 0,
             "invalid_alignment_rows": len(invalid_alignments),
             "invalid_alignments": invalid_alignments[:50],
             "candidate_pre_margin_frames": int(candidate_pre_margin_frames),
@@ -1570,14 +1799,22 @@ def generate_ctc_wac_feature_bundle(
             "stage1_gate_applied": False,
         }
         _atomic_write_rows(temporary["rows"], rows)
+        if temporary_debug_alignments is not None:
+            write_jsonl(temporary_debug_alignments, debug_alignment_rows)
         _atomic_write_json(temporary["summary"], summary)
         for name, destination in asdict(paths).items():
             os.replace(temporary[name], Path(destination))
+        if temporary_debug_alignments is not None:
+            os.replace(temporary_debug_alignments, paths.debug_alignments)
+        else:
+            paths.debug_alignments.unlink(missing_ok=True)
         return summary
     finally:
         # A failed extraction never overwrites a last known-good bundle.
         for path in temporary.values():
             path.unlink(missing_ok=True)
+        if temporary_debug_alignments is not None:
+            temporary_debug_alignments.unlink(missing_ok=True)
         raw_features.unlink(missing_ok=True)
 
 
