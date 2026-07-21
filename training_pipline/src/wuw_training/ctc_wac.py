@@ -28,11 +28,11 @@ from .artifacts import hash_payload, read_json, write_json, write_jsonl
 from .config import ConfigurationError
 
 
-# Schema 3 stores variable-length candidate features as one flat matrix plus
-# row offsets and records the expected wake word for positive examples. It
-# deliberately cannot be confused with the old fixed-window ``[N, T, D]``
-# artifact format.
-BUNDLE_SCHEMA_VERSION = 3
+# Schema 4 stores variable-length candidate features as one flat matrix plus
+# row offsets, records the expected wake word for positive examples, and keeps
+# the selected keyword-versus-filler CTC comparison values. It deliberately
+# cannot be confused with the old fixed-window ``[N, T, D]`` artifact format.
+BUNDLE_SCHEMA_VERSION = 4
 
 # torchaudio.load returns floating-point PCM in roughly [-1, 1], while
 # WeNet's dataset frontend converts it back to the signed-16-bit amplitude
@@ -411,6 +411,13 @@ class FeatureBundlePaths:
     lengths: Path
     all_scores: Path
     top_score: Path
+    keyword_score: Path
+    filler_score: Path
+    raw_score: Path
+    normalized_raw_score: Path
+    confidence: Path
+    normalized_confidence: Path
+    segment_length: Path
     margin: Path
     winner_onehot: Path
     rows: Path
@@ -429,6 +436,13 @@ class FeatureBundlePaths:
             self.lengths,
             self.all_scores,
             self.top_score,
+            self.keyword_score,
+            self.filler_score,
+            self.raw_score,
+            self.normalized_raw_score,
+            self.confidence,
+            self.normalized_confidence,
+            self.segment_length,
             self.margin,
             self.winner_onehot,
             self.rows,
@@ -452,6 +466,13 @@ def feature_bundle_paths(features: Path) -> FeatureBundlePaths:
         lengths=parent / f"{stem}.lengths.npy",
         all_scores=parent / f"{stem}.all_scores.npy",
         top_score=parent / f"{stem}.top_score.npy",
+        keyword_score=parent / f"{stem}.keyword_score.npy",
+        filler_score=parent / f"{stem}.filler_score.npy",
+        raw_score=parent / f"{stem}.raw_score.npy",
+        normalized_raw_score=parent / f"{stem}.normalized_raw_score.npy",
+        confidence=parent / f"{stem}.confidence.npy",
+        normalized_confidence=parent / f"{stem}.normalized_confidence.npy",
+        segment_length=parent / f"{stem}.segment_length.npy",
         margin=parent / f"{stem}.margin.npy",
         winner_onehot=parent / f"{stem}.winner_onehot.npy",
         rows=parent / f"{stem}.rows.jsonl",
@@ -484,6 +505,13 @@ def feature_bundle_valid(
         lengths = np.load(paths.lengths, mmap_mode="r")
         scores = np.load(paths.all_scores, mmap_mode="r")
         top = np.load(paths.top_score, mmap_mode="r")
+        keyword_score = np.load(paths.keyword_score, mmap_mode="r")
+        filler_score = np.load(paths.filler_score, mmap_mode="r")
+        raw_score = np.load(paths.raw_score, mmap_mode="r")
+        normalized_raw_score = np.load(paths.normalized_raw_score, mmap_mode="r")
+        confidence = np.load(paths.confidence, mmap_mode="r")
+        normalized_confidence = np.load(paths.normalized_confidence, mmap_mode="r")
+        segment_length = np.load(paths.segment_length, mmap_mode="r")
         margin = np.load(paths.margin, mmap_mode="r")
         winner = np.load(paths.winner_onehot, mmap_mode="r")
         n = int(lengths.shape[0])
@@ -514,10 +542,26 @@ def feature_bundle_valid(
             and np.all(length_values > 0)
             and scores.ndim == 2
             and top.shape == (n, 1)
+            and keyword_score.shape == (n, 1)
+            and filler_score.shape == (n, 1)
+            and raw_score.shape == (n, 1)
+            and normalized_raw_score.shape == (n, 1)
+            and confidence.shape == (n, 1)
+            and normalized_confidence.shape == (n, 1)
+            and segment_length.shape == (n, 1)
             and margin.shape == (n, 1)
             and winner.shape == scores.shape
             and scores.shape[0] == n
             and scores.shape[1] >= 1
+            and np.all(np.isfinite(keyword_score))
+            and np.all(np.isfinite(filler_score))
+            and np.all(np.isfinite(raw_score))
+            and np.all(np.isfinite(normalized_raw_score))
+            and np.all(np.isfinite(confidence))
+            and np.all(np.isfinite(normalized_confidence))
+            and np.all((confidence >= 0.0) & (confidence <= 1.0))
+            and np.all((normalized_confidence >= 0.0) & (normalized_confidence <= 1.0))
+            and np.all(np.asarray(segment_length, dtype=np.int64) > 0)
         )
         return bool(valid)
     except Exception:
@@ -528,6 +572,281 @@ def _log_softmax(values: np.ndarray) -> np.ndarray:
     values = np.asarray(values, dtype=np.float32)
     maximum = np.max(values, axis=-1, keepdims=True)
     return values - maximum - np.log(np.sum(np.exp(values - maximum), axis=-1, keepdims=True))
+
+
+def _ctc_values(log_probs: np.ndarray, *, blank_id: int) -> np.ndarray:
+    """Validate one time-major CTC log-probability matrix."""
+
+    values = np.asarray(log_probs, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] < 1:
+        raise ValueError(
+            "CTC scores must have shape [frames, vocabulary] with at least one frame, "
+            f"got {values.shape}"
+        )
+    if blank_id < 0 or blank_id >= values.shape[1]:
+        raise ValueError("CTC blank token ID is outside the output vocabulary")
+    return values
+
+
+def _ctc_target_tokens(
+    token_ids: Sequence[int],
+    *,
+    vocabulary_size: int,
+    blank_id: int,
+    allow_empty: bool,
+) -> tuple[int, ...]:
+    tokens = tuple(int(item) for item in token_ids)
+    if not tokens and not allow_empty:
+        raise ValueError("A CTC keyword needs at least one token")
+    if any(item < 0 or item >= vocabulary_size for item in tokens):
+        raise ValueError("CTC keyword token ID is outside the output vocabulary")
+    if blank_id in tokens:
+        raise ValueError("CTC keyword token IDs must not include the blank ID")
+    return tokens
+
+
+def ctc_forward_score(
+    log_probs: np.ndarray,
+    token_ids: Sequence[int],
+    *,
+    blank_id: int = 0,
+) -> float:
+    """Return the standard CTC forward log probability of one token sequence.
+
+    The target is expanded to ``blank, token_1, blank, ... , token_n,
+    blank``.  Unlike the stage-1 candidate finder, this sums every legal CTC
+    path in log space rather than retaining only the Viterbi predecessor.
+    ``token_ids`` may be empty, which represents the all-blank sequence and
+    is useful when it is the best non-keyword filler hypothesis.
+    """
+
+    values = _ctc_values(log_probs, blank_id=blank_id)
+    tokens = _ctc_target_tokens(
+        token_ids,
+        vocabulary_size=values.shape[1],
+        blank_id=blank_id,
+        allow_empty=True,
+    )
+    extended: list[int] = [blank_id]
+    for token in tokens:
+        extended.extend([token, blank_id])
+    state_count = len(extended)
+    previous = np.full(state_count, -np.inf, dtype=np.float64)
+    previous[0] = values[0, blank_id]
+    if state_count > 1:
+        previous[1] = values[0, tokens[0]]
+
+    for frame in values[1:]:
+        current = np.full(state_count, -np.inf, dtype=np.float64)
+        for state, symbol in enumerate(extended):
+            predecessors = [previous[state]]  # stay in the same CTC state
+            if state > 0:
+                predecessors.append(previous[state - 1])  # advance one state
+            if state > 1 and state % 2 == 1 and symbol != extended[state - 2]:
+                predecessors.append(previous[state - 2])  # skip a blank when CTC permits it
+            current[state] = np.logaddexp.reduce(np.asarray(predecessors, dtype=np.float64)) + frame[symbol]
+        previous = current
+
+    if state_count == 1:
+        return float(previous[0])
+    return float(np.logaddexp(previous[-2], previous[-1]))
+
+
+def _logaddexp_pair(left: float, right: float) -> float:
+    """Fast scalar log-add-exp for the small prefix-beam state maps."""
+
+    if left == -math.inf:
+        return right
+    if right == -math.inf:
+        return left
+    if left < right:
+        left, right = right, left
+    return left + math.log1p(math.exp(right - left))
+
+
+@dataclass(frozen=True)
+class CtcPrefixBeamHypothesis:
+    """One collapsed token sequence retained by CTC prefix beam search."""
+
+    token_ids: tuple[int, ...]
+    log_score: float
+
+
+def _prefix_beam_tokens(
+    frame: np.ndarray,
+    *,
+    blank_id: int,
+    token_prune: int | None,
+) -> tuple[int, ...]:
+    """Return the highest-scoring non-blank token IDs for one beam step."""
+
+    vocabulary_size = int(frame.shape[0])
+    nonblank = np.concatenate(
+        [np.arange(blank_id, dtype=np.int64), np.arange(blank_id + 1, vocabulary_size, dtype=np.int64)]
+    )
+    if token_prune is not None:
+        if int(token_prune) < 1:
+            raise ValueError("CTC prefix beam token_prune must be >= 1 when configured")
+        if int(token_prune) < nonblank.size:
+            local = np.argpartition(frame[nonblank], -int(token_prune))[-int(token_prune):]
+            nonblank = nonblank[local]
+    return tuple(sorted((int(item) for item in nonblank), key=lambda item: (-float(frame[item]), item)))
+
+
+def ctc_prefix_beam_search(
+    log_probs: np.ndarray,
+    *,
+    blank_id: int = 0,
+    beam_size: int = 16,
+    token_prune: int | None = None,
+) -> list[CtcPrefixBeamHypothesis]:
+    """Decode top collapsed CTC token sequences with prefix beam search.
+
+    Scores inside this search are used only to select the strongest decoded
+    non-keyword sequence.  Call :func:`ctc_forward_score` afterwards to get
+    the full, non-Viterbi CTC probability of the selected sequence.
+    """
+
+    values = _ctc_values(log_probs, blank_id=blank_id)
+    if int(beam_size) < 1:
+        raise ValueError("CTC prefix beam_size must be >= 1")
+    beam_width = int(beam_size)
+    negative_infinity = -math.inf
+    # Prefix -> (ends in blank log probability, ends in non-blank log probability).
+    beam: dict[tuple[int, ...], tuple[float, float]] = {(): (0.0, negative_infinity)}
+    for frame in values:
+        next_blank: dict[tuple[int, ...], float] = {}
+        next_nonblank: dict[tuple[int, ...], float] = {}
+        token_ids = _prefix_beam_tokens(frame, blank_id=blank_id, token_prune=token_prune)
+        blank_log_prob = float(frame[blank_id])
+        for prefix, (prob_blank, prob_nonblank) in beam.items():
+            prefix_total = _logaddexp_pair(prob_blank, prob_nonblank)
+            blank_value = prefix_total + blank_log_prob
+            next_blank[prefix] = _logaddexp_pair(next_blank.get(prefix, negative_infinity), blank_value)
+            for token_id in token_ids:
+                token_value = float(frame[token_id])
+                if prefix and token_id == prefix[-1]:
+                    # Repeating a label without a separating blank keeps the
+                    # same collapsed sequence.  Repeating after a blank adds a
+                    # second copy of that label to the collapsed sequence.
+                    if prob_nonblank != negative_infinity:
+                        next_nonblank[prefix] = _logaddexp_pair(
+                            next_nonblank.get(prefix, negative_infinity),
+                            prob_nonblank + token_value,
+                        )
+                    if prob_blank != negative_infinity:
+                        extended = prefix + (token_id,)
+                        next_nonblank[extended] = _logaddexp_pair(
+                            next_nonblank.get(extended, negative_infinity),
+                            prob_blank + token_value,
+                        )
+                elif prefix_total != negative_infinity:
+                    extended = prefix + (token_id,)
+                    next_nonblank[extended] = _logaddexp_pair(
+                        next_nonblank.get(extended, negative_infinity),
+                        prefix_total + token_value,
+                    )
+        ranked = [
+            (
+                prefix,
+                _logaddexp_pair(
+                    next_blank.get(prefix, negative_infinity),
+                    next_nonblank.get(prefix, negative_infinity),
+                ),
+            )
+            for prefix in set(next_blank) | set(next_nonblank)
+        ]
+        ranked.sort(key=lambda item: (-item[1], item[0]))
+        beam = {
+            prefix: (next_blank.get(prefix, negative_infinity), next_nonblank.get(prefix, negative_infinity))
+            for prefix, _score in ranked[:beam_width]
+        }
+    return [
+        CtcPrefixBeamHypothesis(token_ids=prefix, log_score=float(score))
+        for prefix, score in sorted(
+            (
+                (prefix, _logaddexp_pair(prob_blank, prob_nonblank))
+                for prefix, (prob_blank, prob_nonblank) in beam.items()
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+
+
+def _sigmoid(value: float) -> float:
+    """Return a finite sigmoid without overflowing for extreme score gaps."""
+
+    if value >= 0.0:
+        return 1.0 / (1.0 + math.exp(-value))
+    exponent = math.exp(value)
+    return exponent / (1.0 + exponent)
+
+
+@dataclass(frozen=True)
+class CtcKeywordVsFillerScore:
+    """Forward-score comparison for one selected keyword candidate segment."""
+
+    keyword_score: float
+    filler_score: float
+    raw_score: float
+    normalized_raw_score: float
+    confidence: float
+    normalized_confidence: float
+    segment_length: int
+    filler_token_ids: tuple[int, ...]
+
+
+def ctc_keyword_vs_filler_score(
+    log_probs: np.ndarray,
+    token_ids: Sequence[int],
+    *,
+    blank_id: int = 0,
+    beam_size: int = 16,
+    token_prune: int | None = 8,
+) -> CtcKeywordVsFillerScore:
+    """Compare a keyword with the strongest beam-decoded non-keyword sequence.
+
+    Both forward scores use exactly the supplied CTC segment.  The beam search
+    chooses a collapsed competitor sequence different from ``token_ids``;
+    its final score is then recomputed with the same forward algorithm as the
+    keyword, rather than comparing a forward score with a Viterbi score.
+    """
+
+    values = _ctc_values(log_probs, blank_id=blank_id)
+    tokens = _ctc_target_tokens(
+        token_ids,
+        vocabulary_size=values.shape[1],
+        blank_id=blank_id,
+        allow_empty=False,
+    )
+    if int(beam_size) < 2:
+        raise ValueError("CTC keyword-versus-filler beam_size must be >= 2")
+    hypotheses = ctc_prefix_beam_search(
+        values,
+        blank_id=blank_id,
+        beam_size=int(beam_size),
+        token_prune=token_prune,
+    )
+    filler_tokens = next((item.token_ids for item in hypotheses if item.token_ids != tokens), None)
+    if filler_tokens is None:
+        raise RuntimeError("CTC prefix beam search did not retain a non-keyword filler hypothesis")
+    keyword_score = ctc_forward_score(values, tokens, blank_id=blank_id)
+    filler_score = ctc_forward_score(values, filler_tokens, blank_id=blank_id)
+    if not math.isfinite(keyword_score) or not math.isfinite(filler_score):
+        raise RuntimeError("CTC keyword-versus-filler forward score is not finite")
+    segment_length = int(values.shape[0])
+    raw_score = keyword_score - filler_score
+    normalized_raw_score = raw_score / segment_length
+    return CtcKeywordVsFillerScore(
+        keyword_score=keyword_score,
+        filler_score=filler_score,
+        raw_score=raw_score,
+        normalized_raw_score=normalized_raw_score,
+        confidence=_sigmoid(raw_score),
+        normalized_confidence=_sigmoid(normalized_raw_score),
+        segment_length=segment_length,
+        filler_token_ids=filler_tokens,
+    )
 
 
 @dataclass(frozen=True)
@@ -1443,6 +1762,8 @@ def generate_ctc_wac_feature_bundle(
     overwrite: bool = False,
     index_offset: int = 0,
     debug_alignments: bool = False,
+    competitor_beam_size: int = 16,
+    competitor_token_prune: int | None = 8,
 ) -> dict[str, Any]:
     """Generate ragged candidate features and all stage-1 values.
 
@@ -1471,6 +1792,10 @@ def generate_ctc_wac_feature_bundle(
         raise ValueError("candidate crop margins must be >= 0")
     if max_search_frames is not None and int(max_search_frames) < 1:
         raise ValueError("max_search_frames must be >= 1 when configured")
+    if int(competitor_beam_size) < 2:
+        raise ValueError("competitor_beam_size must be >= 2")
+    if competitor_token_prune is not None and int(competitor_token_prune) < 1:
+        raise ValueError("competitor_token_prune must be >= 1 when configured")
     stage1 = StreamingCtcStage1(model_path, contract, device=device)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     temporary_paths = {name: _temporary_path(path) for name, path in asdict(paths).items()}
@@ -1480,6 +1805,13 @@ def generate_ctc_wac_feature_bundle(
     rows: list[dict[str, Any]] = []
     score_rows: list[np.ndarray] = []
     top_rows: list[float] = []
+    keyword_score_rows: list[float] = []
+    filler_score_rows: list[float] = []
+    raw_score_rows: list[float] = []
+    normalized_raw_score_rows: list[float] = []
+    confidence_rows: list[float] = []
+    normalized_confidence_rows: list[float] = []
+    segment_length_rows: list[int] = []
     margin_rows: list[float] = []
     winner_rows: list[np.ndarray] = []
     lengths: list[int] = []
@@ -1501,6 +1833,7 @@ def generate_ctc_wac_feature_bundle(
         status: str,
         candidate: CtcCandidate | None = None,
         token_alignments: list[CtcTokenAlignment] | None = None,
+        keyword_vs_filler: CtcKeywordVsFillerScore | None = None,
     ) -> dict[str, Any]:
         result: dict[str, Any] = {
             "schema_version": 1,
@@ -1525,6 +1858,25 @@ def generate_ctc_wac_feature_bundle(
             "top_score": candidate.top_score,
             "margin": candidate.margin,
             "score_domain": "normalized_ctc_log_probability_per_keyword",
+            "keyword_vs_filler": (
+                {
+                    "keyword_score": keyword_vs_filler.keyword_score,
+                    "filler_score": keyword_vs_filler.filler_score,
+                    "raw_score": keyword_vs_filler.raw_score,
+                    "normalized_raw_score": keyword_vs_filler.normalized_raw_score,
+                    "confidence": keyword_vs_filler.confidence,
+                    "normalized_confidence": keyword_vs_filler.normalized_confidence,
+                    "segment_length": keyword_vs_filler.segment_length,
+                    "filler_token_ids": list(keyword_vs_filler.filler_token_ids),
+                    "filler_method": "ctc_prefix_beam_best_nonkeyword",
+                    "competitor_beam_size": int(competitor_beam_size),
+                    "competitor_token_prune": (
+                        int(competitor_token_prune) if competitor_token_prune is not None else None
+                    ),
+                }
+                if keyword_vs_filler is not None
+                else None
+            ),
             "tokens": [
                 {
                     "token_index": item.token_index,
@@ -1636,11 +1988,25 @@ def generate_ctc_wac_feature_bundle(
                                 )
                             )
                         continue
+                    keyword_vs_filler = ctc_keyword_vs_filler_score(
+                        ctc[candidate.start_frame:candidate.end_frame + 1],
+                        keywords[candidate.keyword_index].token_ids,
+                        blank_id=contract.blank_id,
+                        beam_size=int(competitor_beam_size),
+                        token_prune=competitor_token_prune,
+                    )
                     crop = np.asarray(encoder[crop_start:crop_end], dtype=np.float32)
                     crop.tofile(raw_handle)
                     candidate_length = int(crop.shape[0])
                     score_rows.append(candidate.scores)
                     top_rows.append(candidate.top_score)
+                    keyword_score_rows.append(keyword_vs_filler.keyword_score)
+                    filler_score_rows.append(keyword_vs_filler.filler_score)
+                    raw_score_rows.append(keyword_vs_filler.raw_score)
+                    normalized_raw_score_rows.append(keyword_vs_filler.normalized_raw_score)
+                    confidence_rows.append(keyword_vs_filler.confidence)
+                    normalized_confidence_rows.append(keyword_vs_filler.normalized_confidence)
+                    segment_length_rows.append(keyword_vs_filler.segment_length)
                     margin_rows.append(candidate.margin)
                     onehot = np.zeros((len(keywords),), dtype=np.float32)
                     onehot[candidate.keyword_index] = 1.0
@@ -1664,7 +2030,20 @@ def generate_ctc_wac_feature_bundle(
                             "candidate_length_frames": candidate_length,
                             "candidate_duration_ms": candidate_length * contract.encoder_frame_shift_ms,
                             "top_score": candidate.top_score,
-                            "confidence": candidate.top_score,
+                            "normalized_ctc_score": candidate.top_score,
+                            "keyword_score": keyword_vs_filler.keyword_score,
+                            "filler_score": keyword_vs_filler.filler_score,
+                            "raw_score": keyword_vs_filler.raw_score,
+                            "normalized_raw_score": keyword_vs_filler.normalized_raw_score,
+                            "confidence": keyword_vs_filler.confidence,
+                            "normalized_confidence": keyword_vs_filler.normalized_confidence,
+                            "segment_length": keyword_vs_filler.segment_length,
+                            "filler_token_ids": list(keyword_vs_filler.filler_token_ids),
+                            "filler_method": "ctc_prefix_beam_best_nonkeyword",
+                            "competitor_beam_size": int(competitor_beam_size),
+                            "competitor_token_prune": (
+                                int(competitor_token_prune) if competitor_token_prune is not None else None
+                            ),
                             "margin": candidate.margin,
                         }
                     )
@@ -1677,6 +2056,7 @@ def generate_ctc_wac_feature_bundle(
                                 status="ok",
                                 candidate=candidate,
                                 token_alignments=token_alignments,
+                                keyword_vs_filler=keyword_vs_filler,
                             )
                         )
                     row += 1
@@ -1752,6 +2132,22 @@ def generate_ctc_wac_feature_bundle(
         _atomic_write_npy(temporary["lengths"], np.asarray(lengths, dtype=np.int32))
         _atomic_write_npy(temporary["all_scores"], np.asarray(score_rows, dtype=np.float32).reshape(row, len(keywords)))
         _atomic_write_npy(temporary["top_score"], np.asarray(top_rows, dtype=np.float32).reshape(row, 1))
+        _atomic_write_npy(temporary["keyword_score"], np.asarray(keyword_score_rows, dtype=np.float32).reshape(row, 1))
+        _atomic_write_npy(temporary["filler_score"], np.asarray(filler_score_rows, dtype=np.float32).reshape(row, 1))
+        _atomic_write_npy(temporary["raw_score"], np.asarray(raw_score_rows, dtype=np.float32).reshape(row, 1))
+        _atomic_write_npy(
+            temporary["normalized_raw_score"],
+            np.asarray(normalized_raw_score_rows, dtype=np.float32).reshape(row, 1),
+        )
+        _atomic_write_npy(temporary["confidence"], np.asarray(confidence_rows, dtype=np.float32).reshape(row, 1))
+        _atomic_write_npy(
+            temporary["normalized_confidence"],
+            np.asarray(normalized_confidence_rows, dtype=np.float32).reshape(row, 1),
+        )
+        _atomic_write_npy(
+            temporary["segment_length"],
+            np.asarray(segment_length_rows, dtype=np.int32).reshape(row, 1),
+        )
         _atomic_write_npy(temporary["margin"], np.asarray(margin_rows, dtype=np.float32).reshape(row, 1))
         _atomic_write_npy(temporary["winner_onehot"], np.asarray(winner_rows, dtype=np.float32).reshape(row, len(keywords)))
         length_values = np.asarray(lengths, dtype=np.int64)
@@ -1777,6 +2173,19 @@ def generate_ctc_wac_feature_bundle(
             "stage1_providers": stage1.providers,
             "sample_rate": contract.sample_rate,
             "score_domain": "normalized_log_probability",
+            "keyword_vs_filler": {
+                "filler_method": "ctc_prefix_beam_best_nonkeyword",
+                "keyword_score_domain": "ctc_forward_log_probability",
+                "filler_score_domain": "ctc_forward_log_probability",
+                "raw_score_domain": "keyword_score_minus_filler_score",
+                "normalized_raw_score_domain": "raw_score_per_selected_candidate_encoder_frame",
+                "confidence_domain": "sigmoid(keyword_score_minus_filler_score)",
+                "normalized_confidence_domain": "sigmoid(raw_score_per_selected_candidate_encoder_frame)",
+                "competitor_beam_size": int(competitor_beam_size),
+                "competitor_token_prune": (
+                    int(competitor_token_prune) if competitor_token_prune is not None else None
+                ),
+            },
             "encoder_frame_shift_ms": contract.encoder_frame_shift_ms,
             "input_count": len(records),
             "input_duration_seconds": input_duration_seconds,

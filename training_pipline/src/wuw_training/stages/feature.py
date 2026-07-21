@@ -67,6 +67,18 @@ def _debug_alignment(ctx: Any) -> bool:
     return boolean(ctx.section, "debug_alignment", ctx.step, False)
 
 
+def _competitor_beam_size(ctx: Any) -> int:
+    """Return the CTC prefix-beam width used for the filler competitor."""
+
+    return integer(ctx.section, "competitor_beam_size", ctx.step, 16)
+
+
+def _competitor_token_prune(ctx: Any) -> int:
+    """Return the per-frame non-blank token cap for the competitor beam."""
+
+    return integer(ctx.section, "competitor_token_prune", ctx.step, 8)
+
+
 def _ctc_max_search_frames(ctx: Any, contract: Stage1Contract) -> int | None:
     """Convert an explicitly configured CTC window count into encoder frames.
 
@@ -133,6 +145,10 @@ def validate(ctx: Any) -> None:
             raise ConfigurationError(f"[{ctx.step}] candidate_pre_margin_frames must be >= 0")
         if integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0) < 0:
             raise ConfigurationError(f"[{ctx.step}] candidate_post_margin_frames must be >= 0")
+        if _competitor_beam_size(ctx) < 2:
+            raise ConfigurationError(f"[{ctx.step}] competitor_beam_size must be >= 2")
+        if _competitor_token_prune(ctx) < 1:
+            raise ConfigurationError(f"[{ctx.step}] competitor_token_prune must be >= 1")
         _debug_alignment(ctx)
         _ctc_max_search_frames(ctx, contract)
         device = ctx.section.get("device", "cpu").lower()
@@ -214,6 +230,8 @@ def run(ctx: Any) -> dict[str, Any]:
             device=ctx.section.get("device", "cpu").lower(),
             overwrite=ctx.force or boolean(ctx.section, "overwrite", ctx.step, False),
             debug_alignments=_debug_alignment(ctx),
+            competitor_beam_size=_competitor_beam_size(ctx),
+            competitor_token_prune=_competitor_token_prune(ctx),
         )
         if not validate_outputs(ctx):
             raise RuntimeError(f"CTC-WAC feature output validation failed for {ctx.step}")
@@ -317,6 +335,8 @@ def run_slurm_shard(ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
             overwrite=True,
             index_offset=index_offset,
             debug_alignments=_debug_alignment(ctx),
+            competitor_beam_size=_competitor_beam_size(ctx),
+            competitor_token_prune=_competitor_token_prune(ctx),
         )
         return {"output_file": str(output), "feature_count": summary.get("feature_count")}
 
@@ -445,7 +465,19 @@ def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, 
     row_count, _length_shape, _dtype = _atomic_merge_arrays(
         destination.lengths, [paths.lengths for paths in source_paths]
     )
-    for name in ("all_scores", "top_score", "margin", "winner_onehot"):
+    for name in (
+        "all_scores",
+        "top_score",
+        "keyword_score",
+        "filler_score",
+        "raw_score",
+        "normalized_raw_score",
+        "confidence",
+        "normalized_confidence",
+        "segment_length",
+        "margin",
+        "winner_onehot",
+    ):
         count_for_array, _trailing, _dtype = _atomic_merge_arrays(
             getattr(destination, name), [getattr(paths, name) for paths in source_paths]
         )
@@ -482,6 +514,8 @@ def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, 
             raise RuntimeError("CTC-WAC feature shards use different keyword token files")
         if shard_summary.get("stage1_contract_fingerprint") != summary.get("stage1_contract_fingerprint"):
             raise RuntimeError("CTC-WAC feature shards use different stage-1 contracts")
+        if shard_summary.get("keyword_vs_filler") != summary.get("keyword_vs_filler"):
+            raise RuntimeError("CTC-WAC feature shards use different keyword-versus-filler settings")
     if debug_alignment and any(item.get("debug_alignment_enabled") is not True for item in shard_summaries):
         raise RuntimeError("CTC-WAC debug alignment logging was not enabled for every feature shard")
 

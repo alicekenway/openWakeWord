@@ -153,11 +153,13 @@ There is an opt-in pipeline for the design we discussed:
 Stage 1 and stage 2 are trained separately. This repository does **not** train
 the CTC model; fine-tune and export it with WeNet. The feature stage retains
 every valid best candidate in a ragged bundle, plus its score, margin, keyword
-winner, crop boundaries, and (for positives) the expected keyword ID.
-`[stage1_report]` writes a threshold-by-keyword table before any filtering.
+winner, crop boundaries, and (for positives) the expected keyword ID. It also
+compares the selected keyword against the strongest non-keyword CTC sequence
+found by prefix beam search on exactly the same candidate frames.
+`[stage1_report]` writes threshold-by-keyword tables before any filtering.
 Each row has one selected stage-1 keyword: the highest-scoring keyword for
 that candidate. A positive cell is `Acc / FR` only when that selected keyword
-is the expected keyword and its score passes the threshold. A negative cell is
+is the expected keyword and the score for that table passes the threshold. A negative cell is
 the selected-candidate `FA/h / FA rate`; a negative clip contributes to at
 most one keyword column. Here FA rate is the share of all input negative clips
 whose selected candidate passed the threshold. Positive `FR` includes examples
@@ -166,6 +168,47 @@ where no complete CTC alignment was found. The
 threshold later, immediately before training the WAC model. That means you can
 choose a threshold and retrain stage 2 without rerunning the expensive CTC
 model.
+
+### Keyword-versus-filler CTC confidence
+
+For each selected candidate segment, the feature stage runs CTC prefix beam
+search and chooses the highest-scoring collapsed token sequence that is not
+exactly the selected keyword. It recomputes both the keyword and this
+competitor with the standard CTC **forward** algorithm, which sums all legal
+CTC paths. The bundle row and adjacent NPY files store `keyword_score`,
+`filler_score`, `raw_score`, `normalized_raw_score`, `confidence`,
+`normalized_confidence`, and `segment_length`. `confidence` is
+`sigmoid(keyword_score - filler_score)`; `normalized_confidence` applies the
+same sigmoid after dividing the score difference by the selected segment's
+encoder-frame length. The old `top_score` / `normalized_ctc_score` remains
+unchanged for comparison and is still the score used by the existing stage-2
+model.
+
+The feature options below control the approximate competitor search. Their
+defaults are shown; `competitor_token_prune` keeps only the best non-blank
+tokens at each encoder frame, which keeps large negative-corpus runs practical.
+
+```ini
+[feature.negative_dev]
+competitor_beam_size = 16
+competitor_token_prune = 8
+```
+
+The report has three separate threshold ranges, because the old log score and
+the two confidence values have different scales:
+
+```ini
+[stage1_report]
+threshold_start = -5.0
+threshold_stop = 0.0
+threshold_step = 0.05
+confidence_threshold_start = 0.0
+confidence_threshold_stop = 1.0
+confidence_threshold_step = 0.05
+normalized_confidence_threshold_start = 0.0
+normalized_confidence_threshold_stop = 1.0
+normalized_confidence_threshold_step = 0.05
+```
 
 For CTC training, use `ctc_context = yes` and a base `window_seconds` of about
 `2.56`. Set `window_count = 2` when a wake word plus natural surrounding speech

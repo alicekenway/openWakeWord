@@ -23,6 +23,63 @@ class ReportBlock:
     split: str
 
 
+@dataclass(frozen=True)
+class ScoreSpec:
+    """One stored selected-candidate score to sweep in the report."""
+
+    id: str
+    label: str
+    path_attribute: str
+    threshold_prefix: str
+    default_start: float
+    default_stop: float
+    default_step: float
+    description: str
+
+
+SCORE_SPECS: tuple[ScoreSpec, ...] = (
+    ScoreSpec(
+        id="normalized_ctc_score",
+        label="Existing normalized CTC score",
+        path_attribute="top_score",
+        threshold_prefix="",
+        default_start=-5.0,
+        default_stop=0.0,
+        default_step=0.05,
+        description=(
+            "The existing selected keyword length-normalized Viterbi CTC score. "
+            "It is retained for direct comparison."
+        ),
+    ),
+    ScoreSpec(
+        id="confidence",
+        label="Keyword-versus-filler confidence",
+        path_attribute="confidence",
+        threshold_prefix="confidence_",
+        default_start=0.0,
+        default_stop=1.0,
+        default_step=0.05,
+        description=(
+            "sigmoid(keyword forward score - best beam-decoded non-keyword forward score) "
+            "on the selected candidate segment."
+        ),
+    ),
+    ScoreSpec(
+        id="normalized_confidence",
+        label="Length-normalized keyword-versus-filler confidence",
+        path_attribute="normalized_confidence",
+        threshold_prefix="normalized_confidence_",
+        default_start=0.0,
+        default_stop=1.0,
+        default_step=0.05,
+        description=(
+            "sigmoid((keyword forward score - best beam-decoded non-keyword forward score) "
+            "/ selected candidate segment length)."
+        ),
+    ),
+)
+
+
 def _references(ctx: Any) -> list[str]:
     return csv_option(ctx.section, "features", ctx.step)
 
@@ -55,24 +112,49 @@ def _output_report(ctx: Any) -> Path:
     return ctx.config.resolve_path(require(ctx.section, "output_report", ctx.step))
 
 
-def _thresholds(ctx: Any) -> list[float]:
-    start = number(ctx.section, "threshold_start", ctx.step, -5.0)
-    stop = number(ctx.section, "threshold_stop", ctx.step, 0.0)
-    step = number(ctx.section, "threshold_step", ctx.step, 0.05)
+def _thresholds(
+    ctx: Any,
+    *,
+    prefix: str = "",
+    default_start: float = -5.0,
+    default_stop: float = 0.0,
+    default_step: float = 0.05,
+) -> list[float]:
+    start_name = f"{prefix}threshold_start"
+    stop_name = f"{prefix}threshold_stop"
+    step_name = f"{prefix}threshold_step"
+    start = number(ctx.section, start_name, ctx.step, default_start)
+    stop = number(ctx.section, stop_name, ctx.step, default_stop)
+    step = number(ctx.section, step_name, ctx.step, default_step)
     if not all(math.isfinite(value) for value in (start, stop, step)) or start > stop or step <= 0:
-        raise ConfigurationError(f"[{ctx.step}] threshold_start/stop/step must be finite with start <= stop and step > 0")
+        raise ConfigurationError(
+            f"[{ctx.step}] {start_name}/{stop_name}/{step_name} must be finite with start <= stop and step > 0"
+        )
     count = int(round((stop - start) / step))
     values = [start + index * step for index in range(count + 1)]
     if not values or abs(values[-1] - stop) > max(1.0e-8, abs(step) * 1.0e-6):
-        raise ConfigurationError(f"[{ctx.step}] threshold_step must reach threshold_stop exactly")
+        raise ConfigurationError(f"[{ctx.step}] {step_name} must reach {stop_name} exactly")
     values[-1] = stop
     return values
+
+
+def _score_thresholds(ctx: Any) -> dict[str, list[float]]:
+    return {
+        spec.id: _thresholds(
+            ctx,
+            prefix=spec.threshold_prefix,
+            default_start=spec.default_start,
+            default_stop=spec.default_stop,
+            default_step=spec.default_step,
+        )
+        for spec in SCORE_SPECS
+    }
 
 
 def validate(ctx: Any) -> None:
     if not _blocks(ctx):
         raise ConfigurationError(f"[{ctx.step}] requires at least one feature.* block")
-    _thresholds(ctx)
+    _score_thresholds(ctx)
     _output_json(ctx)
     _output_report(ctx)
 
@@ -94,7 +176,7 @@ def validate_outputs(ctx: Any) -> bool:
         return False
     try:
         payload = read_json(output_json)
-        return payload.get("report_schema") == 3 and "Stage-1 Threshold Tables" in output_report.read_text(
+        return payload.get("report_schema") == 4 and "Stage-1 Threshold Tables" in output_report.read_text(
             encoding="utf-8"
         )
     except Exception:
@@ -106,6 +188,26 @@ def _keyword_ids(summary: dict[str, Any], scores: np.ndarray, block: ReportBlock
     if len(keyword_ids) != scores.shape[1]:
         raise RuntimeError(f"{block.name} has inconsistent keyword IDs and score columns")
     return keyword_ids
+
+
+def _selected_score_values(
+    *,
+    paths: Any,
+    scores: np.ndarray,
+    spec: ScoreSpec,
+    block: ReportBlock,
+) -> np.ndarray:
+    path = getattr(paths, spec.path_attribute)
+    values = np.asarray(np.load(path, mmap_mode="r"), dtype=np.float32)
+    expected_shape = (scores.shape[0], 1)
+    if values.shape != expected_shape:
+        raise RuntimeError(
+            f"{block.name} has {spec.id} shaped {values.shape}; expected {expected_shape}. "
+            "Regenerate the CTC-WAC feature bundle."
+        )
+    if not np.all(np.isfinite(values)):
+        raise RuntimeError(f"{block.name} has non-finite {spec.id} values")
+    return values.reshape(-1)
 
 
 def _integer_counts(raw: Any, keyword_ids: list[str], *, name: str, block: ReportBlock) -> dict[str, int]:
@@ -185,6 +287,8 @@ def _positive_table(
     keyword_ids: list[str],
     summary: dict[str, Any],
     thresholds: list[float],
+    winners: np.ndarray,
+    selected_scores: np.ndarray,
 ) -> dict[str, Any]:
     rows_by_keyword, expected_counts = _positive_rows(
         block=block,
@@ -193,7 +297,6 @@ def _positive_table(
         keyword_ids=keyword_ids,
         summary=summary,
     )
-    winners = np.argmax(scores, axis=1)
     table: list[dict[str, Any]] = []
     for threshold in thresholds:
         values: dict[str, Any] = {}
@@ -201,7 +304,7 @@ def _positive_table(
             total = expected_counts[keyword_id]
             rows = rows_by_keyword[keyword_id]
             accepted = (
-                int(np.count_nonzero((winners[rows] == column) & (scores[rows, column] >= threshold)))
+                int(np.count_nonzero((winners[rows] == column) & (selected_scores[rows] >= threshold)))
                 if rows.size
                 else 0
             )
@@ -228,6 +331,8 @@ def _negative_table(
     keyword_ids: list[str],
     summary: dict[str, Any],
     thresholds: list[float],
+    winners: np.ndarray,
+    selected_scores: np.ndarray,
 ) -> dict[str, Any]:
     try:
         duration_seconds = float(summary.get("input_duration_seconds", 0.0))
@@ -246,13 +351,12 @@ def _negative_table(
             f"{block.name} has {scores.shape[0]} candidate rows but only {input_rows} input rows"
         )
     duration_hours = duration_seconds / 3600.0
-    winners = np.argmax(scores, axis=1)
     table: list[dict[str, Any]] = []
     for threshold in thresholds:
         values: dict[str, Any] = {}
         for column, keyword_id in enumerate(keyword_ids):
             false_accepts = int(
-                np.count_nonzero((winners == column) & (scores[:, column] >= threshold))
+                np.count_nonzero((winners == column) & (selected_scores >= threshold))
             )
             values[keyword_id] = {
                 "false_accepts": false_accepts,
@@ -268,21 +372,31 @@ def _negative_table(
     }
 
 
-def _block_payload(block: ReportBlock, thresholds: list[float]) -> dict[str, Any]:
-    if not feature_bundle_valid(block.path):
-        raise RuntimeError(f"{block.name} is not a complete schema-3 CTC-WAC feature bundle: {block.path}")
-    paths = feature_bundle_paths(block.path)
-    summary = read_json(paths.summary)
-    scores = np.asarray(np.load(paths.all_scores, mmap_mode="r"), dtype=np.float32)
-    keyword_ids = _keyword_ids(summary, scores, block)
+def _threshold_sweep(thresholds: list[float]) -> dict[str, float]:
+    return {
+        "start": thresholds[0],
+        "stop": thresholds[-1],
+        "step": thresholds[1] - thresholds[0] if len(thresholds) > 1 else 0.0,
+    }
+
+
+def _score_table(
+    *,
+    block: ReportBlock,
+    paths: Any,
+    scores: np.ndarray,
+    keyword_ids: list[str],
+    summary: dict[str, Any],
+    winners: np.ndarray,
+    spec: ScoreSpec,
+    thresholds: list[float],
+) -> dict[str, Any]:
+    selected_scores = _selected_score_values(paths=paths, scores=scores, spec=spec, block=block)
     common = {
-        "name": block.name,
-        "label": block.label,
-        "split": block.split,
-        "input_rows": int(summary.get("input_count", scores.shape[0])),
-        "candidate_rows": int(scores.shape[0]),
-        "invalid_alignment_rows": int(summary.get("invalid_alignment_rows", 0)),
-        "keyword_ids": keyword_ids,
+        "score_id": spec.id,
+        "score_label": spec.label,
+        "score_description": spec.description,
+        "threshold_sweep": _threshold_sweep(thresholds),
     }
     if block.label == 1:
         return {
@@ -294,6 +408,8 @@ def _block_payload(block: ReportBlock, thresholds: list[float]) -> dict[str, Any
                 keyword_ids=keyword_ids,
                 summary=summary,
                 thresholds=thresholds,
+                winners=winners,
+                selected_scores=selected_scores,
             ),
         }
     return {
@@ -304,7 +420,44 @@ def _block_payload(block: ReportBlock, thresholds: list[float]) -> dict[str, Any
             keyword_ids=keyword_ids,
             summary=summary,
             thresholds=thresholds,
+            winners=winners,
+            selected_scores=selected_scores,
         ),
+    }
+
+
+def _block_payload(block: ReportBlock, score_thresholds: dict[str, list[float]]) -> dict[str, Any]:
+    if not feature_bundle_valid(block.path):
+        raise RuntimeError(f"{block.name} is not a complete schema-4 CTC-WAC feature bundle: {block.path}")
+    paths = feature_bundle_paths(block.path)
+    summary = read_json(paths.summary)
+    scores = np.asarray(np.load(paths.all_scores, mmap_mode="r"), dtype=np.float32)
+    keyword_ids = _keyword_ids(summary, scores, block)
+    winners = np.argmax(scores, axis=1)
+    common = {
+        "name": block.name,
+        "label": block.label,
+        "split": block.split,
+        "input_rows": int(summary.get("input_count", scores.shape[0])),
+        "candidate_rows": int(scores.shape[0]),
+        "invalid_alignment_rows": int(summary.get("invalid_alignment_rows", 0)),
+        "keyword_ids": keyword_ids,
+    }
+    return {
+        **common,
+        "score_tables": {
+            spec.id: _score_table(
+                block=block,
+                paths=paths,
+                scores=scores,
+                keyword_ids=keyword_ids,
+                summary=summary,
+                winners=winners,
+                spec=spec,
+                thresholds=score_thresholds[spec.id],
+            )
+            for spec in SCORE_SPECS
+        },
     }
 
 
@@ -316,7 +469,11 @@ def _markdown(payload: dict[str, Any]) -> str:
     lines = [
         "# Stage-1 Threshold Tables",
         "",
-        "Each row is one configured normalized CTC log-score threshold.",
+        "Each score section has its own configured threshold range.",
+        (
+            "The stage-1 winner is chosen once with the existing normalized CTC scorer. "
+            "Each score below only decides whether that already-selected candidate passes its threshold."
+        ),
         (
             "For positives, `Acc / FR` means the expected keyword was the selected candidate and passed the "
             "threshold / was not selected or did not pass it; no CTC alignment counts as FR."
@@ -329,63 +486,70 @@ def _markdown(payload: dict[str, Any]) -> str:
     ]
     for block in payload["blocks"]:
         keyword_ids = block["keyword_ids"]
-        lines.extend(["", f"## {block['name']}", ""])
-        if block["label"] == 1:
-            counts = block["expected_keyword_rows"]
-            lines.extend(
-                [
-                    "Positive set. Each column header gives its expected-example count.",
-                    "",
-                    "| Threshold | "
-                    + " | ".join(
-                        f"{keyword_id} (Acc / FR; n={counts[keyword_id]})" for keyword_id in keyword_ids
-                    )
-                    + " |",
-                    "| ---: | " + " | ".join("---:" for _ in keyword_ids) + " |",
-                ]
-            )
-            for threshold_row in block["threshold_table"]:
-                cells = []
-                for keyword_id in keyword_ids:
-                    value = threshold_row["keywords"][keyword_id]
-                    cells.append(
-                        f"{_format_percent(value['accuracy'])} / {_format_percent(value['false_rejection_rate'])}"
-                    )
-                lines.append(f"| {threshold_row['threshold']:.6g} | " + " | ".join(cells) + " |")
-        else:
-            duration = block["input_duration_seconds"] / 3600.0
-            lines.extend(
-                [
-                    f"Negative set. Source duration: {duration:.6f} h.",
-                    "",
-                    "| Threshold | "
-                    + " | ".join(f"{keyword_id} (FA/h / FA rate)" for keyword_id in keyword_ids)
-                    + " |",
-                    "| ---: | " + " | ".join("---:" for _ in keyword_ids) + " |",
-                ]
-            )
-            for threshold_row in block["threshold_table"]:
-                cells = []
-                for keyword_id in keyword_ids:
-                    value = threshold_row["keywords"][keyword_id]
-                    cells.append(
-                        f"{value['false_accepts_per_hour']:.4f} / "
-                        f"{_format_percent(value['false_accept_rate'])}"
-                    )
-                lines.append(f"| {threshold_row['threshold']:.6g} | " + " | ".join(cells) + " |")
+        lines.extend(["", f"## {block['name']}"])
+        for score_definition in payload["score_definitions"]:
+            score_table = block["score_tables"][score_definition["id"]]
+            lines.extend(["", f"### {score_table['score_label']}", "", score_table["score_description"], ""])
+            if block["label"] == 1:
+                counts = score_table["expected_keyword_rows"]
+                lines.extend(
+                    [
+                        "Positive set. Each column header gives its expected-example count.",
+                        "",
+                        "| Threshold | "
+                        + " | ".join(
+                            f"{keyword_id} (Acc / FR; n={counts[keyword_id]})" for keyword_id in keyword_ids
+                        )
+                        + " |",
+                        "| ---: | " + " | ".join("---:" for _ in keyword_ids) + " |",
+                    ]
+                )
+                for threshold_row in score_table["threshold_table"]:
+                    cells = []
+                    for keyword_id in keyword_ids:
+                        value = threshold_row["keywords"][keyword_id]
+                        cells.append(
+                            f"{_format_percent(value['accuracy'])} / {_format_percent(value['false_rejection_rate'])}"
+                        )
+                    lines.append(f"| {threshold_row['threshold']:.6g} | " + " | ".join(cells) + " |")
+            else:
+                duration = score_table["input_duration_seconds"] / 3600.0
+                lines.extend(
+                    [
+                        f"Negative set. Source duration: {duration:.6f} h.",
+                        "",
+                        "| Threshold | "
+                        + " | ".join(f"{keyword_id} (FA/h / FA rate)" for keyword_id in keyword_ids)
+                        + " |",
+                        "| ---: | " + " | ".join("---:" for _ in keyword_ids) + " |",
+                    ]
+                )
+                for threshold_row in score_table["threshold_table"]:
+                    cells = []
+                    for keyword_id in keyword_ids:
+                        value = threshold_row["keywords"][keyword_id]
+                        cells.append(
+                            f"{value['false_accepts_per_hour']:.4f} / "
+                            f"{_format_percent(value['false_accept_rate'])}"
+                        )
+                    lines.append(f"| {threshold_row['threshold']:.6g} | " + " | ".join(cells) + " |")
     return "\n".join(lines).rstrip() + "\n"
 
 
 def run(ctx: Any) -> dict[str, Any]:
-    thresholds = _thresholds(ctx)
-    blocks = [_block_payload(block, thresholds) for block in _blocks(ctx)]
+    score_thresholds = _score_thresholds(ctx)
+    blocks = [_block_payload(block, score_thresholds) for block in _blocks(ctx)]
     payload = {
-        "report_schema": 3,
-        "threshold_sweep": {
-            "start": thresholds[0],
-            "stop": thresholds[-1],
-            "step": thresholds[1] - thresholds[0] if len(thresholds) > 1 else 0.0,
+        "report_schema": 4,
+        # Keep the original field temporarily for readers that only consume
+        # the existing normalized CTC score.
+        "threshold_sweep": _threshold_sweep(score_thresholds["normalized_ctc_score"]),
+        "score_threshold_sweeps": {
+            score_id: _threshold_sweep(thresholds) for score_id, thresholds in score_thresholds.items()
         },
+        "score_definitions": [
+            {"id": spec.id, "label": spec.label, "description": spec.description} for spec in SCORE_SPECS
+        ],
         "blocks": blocks,
     }
     output_json = _output_json(ctx)

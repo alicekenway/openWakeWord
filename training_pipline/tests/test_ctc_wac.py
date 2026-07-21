@@ -7,6 +7,7 @@ import json
 import math
 import random
 import sys
+from itertools import product
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -29,9 +30,12 @@ from wuw_training.ctc_wac import (  # noqa: E402
     StreamingCtcStage1,
     best_ctc_candidate,
     ctc_candidate_token_alignments,
+    ctc_forward_score,
+    ctc_keyword_vs_filler_score,
     ctc_keyword_alignment_trace,
     ctc_keyword_alignment_traces,
     ctc_keyword_score_trace,
+    ctc_prefix_beam_search,
     feature_bundle_paths,
     feature_bundle_valid,
     keyword_token_fingerprint,
@@ -81,6 +85,13 @@ def _write_bundle(
         [[-1.0, -4.0], [-4.0, -1.1], [-1.2, -3.0], [-4.0, -3.0]], dtype=np.float32
     )
     top, margin, winner = rank_keyword_scores(scores)
+    segment_lengths = np.asarray([3, 4, 5, 6], dtype=np.int32)
+    keyword_scores = np.asarray([-2.0, -2.5, -3.0, -3.5], dtype=np.float32)
+    raw_scores = np.asarray([1.0, -1.0, 0.5, -0.5], dtype=np.float32)
+    filler_scores = keyword_scores - raw_scores
+    normalized_raw_scores = raw_scores / segment_lengths
+    confidence = 1.0 / (1.0 + np.exp(-raw_scores))
+    normalized_confidence = 1.0 / (1.0 + np.exp(-normalized_raw_scores))
     onehot = np.zeros_like(scores)
     onehot[np.arange(scores.shape[0]), winner] = 1.0
     paths = feature_bundle_paths(path)
@@ -89,6 +100,13 @@ def _write_bundle(
     np.save(paths.lengths, lengths)
     np.save(paths.all_scores, scores)
     np.save(paths.top_score, top.reshape(-1, 1))
+    np.save(paths.keyword_score, keyword_scores.reshape(-1, 1))
+    np.save(paths.filler_score, filler_scores.reshape(-1, 1))
+    np.save(paths.raw_score, raw_scores.reshape(-1, 1))
+    np.save(paths.normalized_raw_score, normalized_raw_scores.reshape(-1, 1))
+    np.save(paths.confidence, confidence.reshape(-1, 1))
+    np.save(paths.normalized_confidence, normalized_confidence.reshape(-1, 1))
+    np.save(paths.segment_length, segment_lengths.reshape(-1, 1))
     np.save(paths.margin, margin.reshape(-1, 1))
     np.save(paths.winner_onehot, onehot)
     expected_keyword_ids = (
@@ -139,6 +157,11 @@ def _write_bundle(
             "debug_alignment_enabled": debug_alignment,
             "debug_alignment_jsonl": str(paths.debug_alignments) if debug_alignment else None,
             "debug_alignment_rows": int(lengths.shape[0]) if debug_alignment else 0,
+            "keyword_vs_filler": {
+                "filler_method": "ctc_prefix_beam_best_nonkeyword",
+                "competitor_beam_size": 16,
+                "competitor_token_prune": 8,
+            },
             "error_count": 0,
         },
     )
@@ -236,6 +259,79 @@ def test_ctc_viterbi_trace_prefers_the_right_token_order() -> None:
     assert np.isfinite(right).all()
     assert right[-1] > wrong[-1]
     assert np.isfinite(repeated[-1])
+
+
+def test_ctc_forward_score_sums_all_legal_paths() -> None:
+    probabilities = np.asarray(
+        [
+            [0.10, 0.80, 0.10],
+            [0.60, 0.25, 0.15],
+            [0.10, 0.15, 0.75],
+        ],
+        dtype=np.float64,
+    )
+    log_probs = np.log(probabilities)
+
+    def collapse(path: tuple[int, ...]) -> tuple[int, ...]:
+        result: list[int] = []
+        previous: int | None = None
+        for token_id in path:
+            if token_id != 0 and token_id != previous:
+                result.append(token_id)
+            previous = token_id
+        return tuple(result)
+
+    for target in ((), (1,), (1, 2), (1, 1)):
+        probability = sum(
+            math.exp(sum(float(log_probs[frame, token_id]) for frame, token_id in enumerate(path)))
+            for path in product(range(probabilities.shape[1]), repeat=probabilities.shape[0])
+            if collapse(path) == target
+        )
+        assert math.exp(ctc_forward_score(log_probs, target, blank_id=0)) == pytest.approx(probability)
+
+    all_targets = {collapse(path) for path in product(range(probabilities.shape[1]), repeat=probabilities.shape[0])}
+    expected = sorted(
+        ((target, ctc_forward_score(log_probs, target, blank_id=0)) for target in all_targets),
+        key=lambda item: (-item[1], item[0]),
+    )
+    hypotheses = ctc_prefix_beam_search(log_probs, blank_id=0, beam_size=64, token_prune=None)
+    assert [item.token_ids for item in hypotheses] == [target for target, _score in expected]
+    assert [item.log_score for item in hypotheses] == pytest.approx([score for _target, score in expected])
+
+
+def test_keyword_vs_filler_uses_forward_scores_on_the_same_segment() -> None:
+    probabilities = np.asarray(
+        [
+            [0.03, 0.94, 0.03],
+            [0.80, 0.15, 0.05],
+            [0.03, 0.04, 0.93],
+            [0.85, 0.10, 0.05],
+        ],
+        dtype=np.float64,
+    )
+    log_probs = np.log(probabilities)
+    keyword = (1, 2)
+    hypotheses = ctc_prefix_beam_search(log_probs, blank_id=0, beam_size=16, token_prune=None)
+    assert hypotheses[0].token_ids == keyword
+    expected_filler = next(item.token_ids for item in hypotheses if item.token_ids != keyword)
+
+    result = ctc_keyword_vs_filler_score(
+        log_probs,
+        keyword,
+        blank_id=0,
+        beam_size=16,
+        token_prune=None,
+    )
+
+    assert result.filler_token_ids == expected_filler
+    assert result.keyword_score == pytest.approx(ctc_forward_score(log_probs, keyword, blank_id=0))
+    assert result.filler_score == pytest.approx(ctc_forward_score(log_probs, expected_filler, blank_id=0))
+    assert result.raw_score == pytest.approx(result.keyword_score - result.filler_score)
+    assert result.normalized_raw_score == pytest.approx(result.raw_score / log_probs.shape[0])
+    assert result.confidence == pytest.approx(1.0 / (1.0 + math.exp(-result.raw_score)))
+    assert result.normalized_confidence == pytest.approx(
+        1.0 / (1.0 + math.exp(-result.normalized_raw_score))
+    )
 
 
 def test_ctc_alignment_trace_reports_token_boundaries_not_trailing_blanks() -> None:
@@ -581,6 +677,23 @@ def test_feature_bundle_crops_variable_length_ctc_candidates(monkeypatch: pytest
     assert np.load(paths.features).shape == (12, 3)
     rows = [json.loads(line) for line in paths.rows.read_text(encoding="utf-8").splitlines()]
     assert [row["expected_keyword_id"] for row in rows] == ["wake_a", "wake_b"]
+    for name in (
+        "keyword_score",
+        "filler_score",
+        "raw_score",
+        "normalized_raw_score",
+        "confidence",
+        "normalized_confidence",
+        "segment_length",
+    ):
+        assert np.load(getattr(paths, name)).shape == (2, 1)
+        assert name in rows[0]
+    assert all(0.0 <= row["confidence"] <= 1.0 for row in rows)
+    assert all(0.0 <= row["normalized_confidence"] <= 1.0 for row in rows)
+    assert all(row["segment_length"] == row["candidate_end_frame"] - row["candidate_start_frame"] + 1 for row in rows)
+    selected_tokens = {"wake_a": [1, 2], "wake_b": [2, 1]}
+    assert all(row["filler_token_ids"] != selected_tokens[row["keyword_id"]] for row in rows)
+    assert summary["keyword_vs_filler"]["filler_method"] == "ctc_prefix_beam_best_nonkeyword"
     assert summary["debug_alignment_enabled"] is False
     assert not paths.debug_alignments.exists()
     assert not feature_bundle_valid(output, require_debug_alignments=True)
@@ -599,6 +712,7 @@ def test_feature_bundle_crops_variable_length_ctc_candidates(monkeypatch: pytest
     assert [item["token_id"] for item in token_rows] == [1, 2]
     assert all(item["start_frame"] <= item["end_frame"] for item in token_rows)
     assert all(item["normalized_score"] <= 0.0 for item in token_rows)
+    assert debug_rows[0]["candidate"]["keyword_vs_filler"]["confidence"] == pytest.approx(rows[0]["confidence"])
 
     normal_summary = ctc_wac_module.generate_ctc_wac_feature_bundle(**arguments)
     assert normal_summary["debug_alignment_enabled"] is False
@@ -923,14 +1037,22 @@ output_report = ${{main:experiment_dir}}/report.md
 threshold_start = -5
 threshold_stop = 0
 threshold_step = 1
+confidence_threshold_start = 0
+confidence_threshold_stop = 1
+confidence_threshold_step = 0.5
+normalized_confidence_threshold_start = 0
+normalized_confidence_threshold_stop = 1
+normalized_confidence_threshold_step = 0.5
 """,
         encoding="utf-8",
     )
     PipelineRunner(load_ini_config(config)).run()
     payload = json.loads((tmp_path / "experiment" / "report.json").read_text(encoding="utf-8"))
-    assert payload["report_schema"] == 3
-    positive_table = payload["blocks"][0]["threshold_table"]
-    negative_table = payload["blocks"][1]["threshold_table"]
+    assert payload["report_schema"] == 4
+    positive_tables = payload["blocks"][0]["score_tables"]
+    negative_tables = payload["blocks"][1]["score_tables"]
+    positive_table = positive_tables["normalized_ctc_score"]["threshold_table"]
+    negative_table = negative_tables["normalized_ctc_score"]["threshold_table"]
     positive_at_minus_two = next(item for item in positive_table if item["threshold"] == -2.0)
     negative_at_minus_two = next(item for item in negative_table if item["threshold"] == -2.0)
     assert positive_at_minus_two["keywords"]["wake_a"]["accuracy"] == 1.0
@@ -941,8 +1063,20 @@ threshold_step = 1
     assert negative_at_minus_two["keywords"]["wake_b"]["false_accepts_per_hour"] == 1.0
     assert negative_at_minus_two["keywords"]["wake_a"]["false_accept_rate"] == 0.5
     assert negative_at_minus_two["keywords"]["wake_b"]["false_accept_rate"] == 0.25
+    positive_confidence_at_half = next(
+        item for item in positive_tables["confidence"]["threshold_table"] if item["threshold"] == 0.5
+    )
+    negative_confidence_at_half = next(
+        item for item in negative_tables["confidence"]["threshold_table"] if item["threshold"] == 0.5
+    )
+    assert positive_confidence_at_half["keywords"]["wake_a"]["accuracy"] == 1.0
+    assert positive_confidence_at_half["keywords"]["wake_b"]["accuracy"] == 0.0
+    assert negative_confidence_at_half["keywords"]["wake_a"]["false_accept_rate"] == 0.5
+    assert negative_confidence_at_half["keywords"]["wake_b"]["false_accept_rate"] == 0.0
     markdown = (tmp_path / "experiment" / "report.md").read_text(encoding="utf-8")
     assert "Acc / FR" in markdown
     assert "FA/h" in markdown
     assert "FA rate" in markdown
+    assert "Keyword-versus-filler confidence" in markdown
+    assert "Length-normalized keyword-versus-filler confidence" in markdown
     assert "quantile" not in markdown.lower()
