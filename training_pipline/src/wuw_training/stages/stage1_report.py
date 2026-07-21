@@ -94,7 +94,7 @@ def validate_outputs(ctx: Any) -> bool:
         return False
     try:
         payload = read_json(output_json)
-        return payload.get("report_schema") == 2 and "Stage-1 Threshold Tables" in output_report.read_text(
+        return payload.get("report_schema") == 3 and "Stage-1 Threshold Tables" in output_report.read_text(
             encoding="utf-8"
         )
     except Exception:
@@ -193,13 +193,18 @@ def _positive_table(
         keyword_ids=keyword_ids,
         summary=summary,
     )
+    winners = np.argmax(scores, axis=1)
     table: list[dict[str, Any]] = []
     for threshold in thresholds:
         values: dict[str, Any] = {}
         for column, keyword_id in enumerate(keyword_ids):
             total = expected_counts[keyword_id]
             rows = rows_by_keyword[keyword_id]
-            accepted = int(np.count_nonzero(scores[rows, column] >= threshold)) if rows.size else 0
+            accepted = (
+                int(np.count_nonzero((winners[rows] == column) & (scores[rows, column] >= threshold)))
+                if rows.size
+                else 0
+            )
             false_rejections = total - accepted
             values[keyword_id] = {
                 "expected_rows": total,
@@ -241,11 +246,14 @@ def _negative_table(
             f"{block.name} has {scores.shape[0]} candidate rows but only {input_rows} input rows"
         )
     duration_hours = duration_seconds / 3600.0
+    winners = np.argmax(scores, axis=1)
     table: list[dict[str, Any]] = []
     for threshold in thresholds:
         values: dict[str, Any] = {}
         for column, keyword_id in enumerate(keyword_ids):
-            false_accepts = int(np.count_nonzero(scores[:, column] >= threshold))
+            false_accepts = int(
+                np.count_nonzero((winners == column) & (scores[:, column] >= threshold))
+            )
             values[keyword_id] = {
                 "false_accepts": false_accepts,
                 "false_accepts_per_hour": false_accepts / duration_hours,
@@ -253,7 +261,7 @@ def _negative_table(
             }
         table.append({"threshold": threshold, "keywords": values})
     return {
-        "metric": "stage1_false_accept_candidates_per_hour",
+        "metric": "stage1_selected_candidate_false_accepts_per_hour",
         "input_rows": input_rows,
         "input_duration_seconds": duration_seconds,
         "threshold_table": table,
@@ -309,10 +317,14 @@ def _markdown(payload: dict[str, Any]) -> str:
         "# Stage-1 Threshold Tables",
         "",
         "Each row is one configured normalized CTC log-score threshold.",
-        "For positives, `Acc / FR` means the expected keyword score passed the threshold / did not pass it; no CTC alignment counts as FR.",
         (
-            "For negatives, `FA/h` is the stage-1 candidate count per source-audio hour and `FA rate` is "
-            "the share of all input clips whose candidate passed the threshold; neither is a final system metric."
+            "For positives, `Acc / FR` means the expected keyword was the selected candidate and passed the "
+            "threshold / was not selected or did not pass it; no CTC alignment counts as FR."
+        ),
+        (
+            "For negatives, `FA/h` is the selected stage-1 candidate count per source-audio hour and `FA rate` "
+            "is the share of all input clips whose selected candidate passed the threshold; neither is a final "
+            "system metric."
         ),
     ]
     for block in payload["blocks"]:
@@ -368,7 +380,7 @@ def run(ctx: Any) -> dict[str, Any]:
     thresholds = _thresholds(ctx)
     blocks = [_block_payload(block, thresholds) for block in _blocks(ctx)]
     payload = {
-        "report_schema": 2,
+        "report_schema": 3,
         "threshold_sweep": {
             "start": thresholds[0],
             "stop": thresholds[-1],

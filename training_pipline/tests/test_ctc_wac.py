@@ -876,6 +876,28 @@ def test_stage1_report_summarizes_ragged_candidate_scores(tmp_path: Path) -> Non
     negative = tmp_path / "negative.npy"
     _write_bundle(positive, label=1, keywords_path=keywords_path, seed=1)
     _write_bundle(negative, label=0, keywords_path=keywords_path, seed=2)
+    # Make a non-winning keyword pass the threshold in both sets. The report
+    # must count only the argmax winner, rather than every passing score.
+    positive_paths = feature_bundle_paths(positive)
+    positive_scores = np.load(positive_paths.all_scores)
+    positive_scores[3] = np.asarray([-1.0, -1.5], dtype=np.float32)
+    positive_top, positive_margin, positive_winner = rank_keyword_scores(positive_scores)
+    positive_onehot = np.zeros_like(positive_scores)
+    positive_onehot[np.arange(positive_scores.shape[0]), positive_winner] = 1.0
+    np.save(positive_paths.all_scores, positive_scores)
+    np.save(positive_paths.top_score, positive_top.reshape(-1, 1))
+    np.save(positive_paths.margin, positive_margin.reshape(-1, 1))
+    np.save(positive_paths.winner_onehot, positive_onehot)
+    negative_paths = feature_bundle_paths(negative)
+    negative_scores = np.load(negative_paths.all_scores)
+    negative_scores[0] = np.asarray([-1.0, -1.5], dtype=np.float32)
+    negative_top, negative_margin, negative_winner = rank_keyword_scores(negative_scores)
+    negative_onehot = np.zeros_like(negative_scores)
+    negative_onehot[np.arange(negative_scores.shape[0]), negative_winner] = 1.0
+    np.save(negative_paths.all_scores, negative_scores)
+    np.save(negative_paths.top_score, negative_top.reshape(-1, 1))
+    np.save(negative_paths.margin, negative_margin.reshape(-1, 1))
+    np.save(negative_paths.winner_onehot, negative_onehot)
     config = tmp_path / "report.ini"
     config.write_text(
         f"""[main]
@@ -906,7 +928,7 @@ threshold_step = 1
     )
     PipelineRunner(load_ini_config(config)).run()
     payload = json.loads((tmp_path / "experiment" / "report.json").read_text(encoding="utf-8"))
-    assert payload["report_schema"] == 2
+    assert payload["report_schema"] == 3
     positive_table = payload["blocks"][0]["threshold_table"]
     negative_table = payload["blocks"][1]["threshold_table"]
     positive_at_minus_two = next(item for item in positive_table if item["threshold"] == -2.0)
