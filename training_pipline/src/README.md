@@ -212,6 +212,49 @@ normalized_confidence_threshold_stop = 1.0
 normalized_confidence_threshold_step = 0.05
 ```
 
+### Experimental contextual BPE WUW beam
+
+For a BPE CTC model, a feature block can use an opt-in contextual beam rather
+than forcing every input through every keyword spelling. Keep the existing
+`keyword_tokens` JSON for the model-facing token IDs and supply a TSV with one
+human-readable keyword and completion bonus per line:
+
+```text
+# display_text<TAB>bonus
+hey siri	5.0
+next track	6.0
+```
+
+```ini
+[feature.positive_dev]
+extractor = wenet_ctc_wac
+candidate_search = contextual_wuw_beam
+wuw_bias_tsv = /path/to/wuw_bias.tsv
+contextual_beam_size = 16
+contextual_token_prune = 8
+contextual_lookahead = yes
+```
+
+The decoder retains ordinary BPE paths during normal beam search. A completed
+keyword becomes a virtual `<WUW:keyword_id>` only inside the decoder and gains
+its TSV bonus once. Partial keyword prefixes use the best reachable bonus only
+for beam pruning; they receive no final bonus unless the full spelling is
+completed. At finalization, paths with no completed WUW are discarded. If none
+remain, the input has confidence `0`, creates no Stage-2 crop, and is counted
+as a Stage-1 rejection.
+
+The contextual Stage-1 gate uses normalized confidence:
+`sigmoid((boosted WUW score - best non-WUW score) / CTC frame count)`. Set
+per-keyword thresholds in the keyword JSON on the `[0, 1]` scale after reading
+the contextual section of `stage1_report`. The report uses
+`normalized_confidence_threshold_*` for this primary table.
+
+No BPE text table is needed for ordinary speech: all non-keyword tokens are
+treated as garbage semantically while retaining their integer AM IDs during
+search. As a result, this first experiment does not independently verify a
+right word boundary; an exact keyword token sequence inside a longer BPE word
+can still match and should be checked in Stage-2 evaluation.
+
 For CTC training, use `ctc_context = yes` and a base `window_seconds` of about
 `2.56`. Set `window_count = 2` when a wake word plus natural surrounding speech
 needs up to `5.12` seconds. With

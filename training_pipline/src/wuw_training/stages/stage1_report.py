@@ -80,6 +80,38 @@ SCORE_SPECS: tuple[ScoreSpec, ...] = (
 )
 
 
+CONTEXTUAL_SCORE_SPECS: tuple[ScoreSpec, ...] = (
+    ScoreSpec(
+        id="normalized_contextual_confidence",
+        label="Normalized contextual WUW confidence",
+        path_attribute="top_score",
+        threshold_prefix="normalized_confidence_",
+        default_start=0.0,
+        default_stop=1.0,
+        default_step=0.05,
+        description=(
+            "The Stage-1 gate score: sigmoid((boosted WUW beam score - best constrained "
+            "non-WUW beam score) / full CTC-window frame count)."
+        ),
+    ),
+    ScoreSpec(
+        id="contextual_confidence",
+        label="Contextual WUW confidence",
+        path_attribute="confidence",
+        threshold_prefix="confidence_",
+        default_start=0.0,
+        default_stop=1.0,
+        default_step=0.05,
+        description=(
+            "sigmoid(boosted WUW beam score - best constrained non-WUW beam score)."
+        ),
+    ),
+)
+
+
+ALL_SCORE_SPECS: tuple[ScoreSpec, ...] = SCORE_SPECS + CONTEXTUAL_SCORE_SPECS
+
+
 def _references(ctx: Any) -> list[str]:
     return csv_option(ctx.section, "features", ctx.step)
 
@@ -147,8 +179,18 @@ def _score_thresholds(ctx: Any) -> dict[str, list[float]]:
             default_stop=spec.default_stop,
             default_step=spec.default_step,
         )
-        for spec in SCORE_SPECS
+        for spec in ALL_SCORE_SPECS
     }
+
+
+def _score_specs(summary: dict[str, Any]) -> tuple[ScoreSpec, ...]:
+    """Choose score tables matching the feature bundle's candidate decoder."""
+
+    return (
+        CONTEXTUAL_SCORE_SPECS
+        if summary.get("candidate_search") == "contextual_wuw_beam"
+        else SCORE_SPECS
+    )
 
 
 def validate(ctx: Any) -> None:
@@ -247,6 +289,12 @@ def _positive_rows(
         name="expected_keyword_invalid_alignment_counts",
         block=block,
     )
+    no_wuw_counts = _integer_counts(
+        summary.get("expected_keyword_no_wuw_counts", {keyword_id: 0 for keyword_id in keyword_ids}),
+        keyword_ids,
+        name="expected_keyword_no_wuw_counts",
+        block=block,
+    )
     rows = read_jsonl(paths.rows, allow_empty=True)
     by_keyword: dict[str, list[int]] = {keyword_id: [] for keyword_id in keyword_ids}
     seen_rows: set[int] = set()
@@ -270,7 +318,7 @@ def _positive_rows(
         keyword_id: np.asarray(indices, dtype=np.int64) for keyword_id, indices in by_keyword.items()
     }
     for keyword_id in keyword_ids:
-        accounted = int(result[keyword_id].size) + invalid_counts[keyword_id]
+        accounted = int(result[keyword_id].size) + invalid_counts[keyword_id] + no_wuw_counts[keyword_id]
         if accounted != expected_counts[keyword_id]:
             raise RuntimeError(
                 f"{block.name} expected-keyword accounting mismatch for {keyword_id}: "
@@ -481,6 +529,7 @@ def _block_payload(block: ReportBlock, score_thresholds: dict[str, list[float]])
     scores = np.asarray(np.load(paths.all_scores, mmap_mode="r"), dtype=np.float32)
     keyword_ids = _keyword_ids(summary, scores, block)
     winners = np.argmax(scores, axis=1)
+    specs = _score_specs(summary)
     common = {
         "name": block.name,
         "label": block.label,
@@ -488,10 +537,15 @@ def _block_payload(block: ReportBlock, score_thresholds: dict[str, list[float]])
         "input_rows": int(summary.get("input_count", scores.shape[0])),
         "candidate_rows": int(scores.shape[0]),
         "invalid_alignment_rows": int(summary.get("invalid_alignment_rows", 0)),
+        "no_wuw_hypothesis_rows": int(summary.get("no_wuw_hypothesis_rows", 0)),
+        "candidate_search": summary.get("candidate_search", "forced_keyword"),
         "keyword_ids": keyword_ids,
     }
     return {
         **common,
+        "score_definitions": [
+            {"id": spec.id, "label": spec.label, "description": spec.description} for spec in specs
+        ],
         "score_tables": {
             spec.id: _score_table(
                 block=block,
@@ -503,7 +557,7 @@ def _block_payload(block: ReportBlock, score_thresholds: dict[str, list[float]])
                 spec=spec,
                 thresholds=score_thresholds[spec.id],
             )
-            for spec in SCORE_SPECS
+            for spec in specs
         },
     }
 
@@ -518,7 +572,7 @@ def _markdown(payload: dict[str, Any]) -> str:
         "",
         "Each score section has its own configured threshold range.",
         (
-            "The stage-1 winner is chosen once with the existing normalized CTC scorer. "
+            "The stage-1 winner is chosen once by the feature bundle's configured candidate decoder. "
             "Each score below only decides whether that already-selected candidate passes its threshold."
         ),
         (
@@ -536,7 +590,16 @@ def _markdown(payload: dict[str, Any]) -> str:
     for block in payload["blocks"]:
         keyword_ids = block["keyword_ids"]
         lines.extend(["", f"## {block['name']}"])
-        for score_definition in payload["score_definitions"]:
+        if block["candidate_search"] == "contextual_wuw_beam":
+            lines.extend(
+                [
+                    "",
+                    "Contextual BPE beam mode. "
+                    f"{block['no_wuw_hypothesis_rows']} input(s) had no final WUW hypothesis and "
+                    "therefore contribute confidence 0 / no Stage-2 crop.",
+                ]
+            )
+        for score_definition in block["score_definitions"]:
             score_table = block["score_tables"][score_definition["id"]]
             lines.extend(["", f"### {score_table['score_label']}", "", score_table["score_description"], ""])
             if block["label"] == 1:
@@ -608,7 +671,7 @@ def run(ctx: Any) -> dict[str, Any]:
             score_id: _threshold_sweep(thresholds) for score_id, thresholds in score_thresholds.items()
         },
         "score_definitions": [
-            {"id": spec.id, "label": spec.label, "description": spec.description} for spec in SCORE_SPECS
+            {"id": spec.id, "label": spec.label, "description": spec.description} for spec in ALL_SCORE_SPECS
         ],
         "blocks": blocks,
     }

@@ -15,10 +15,13 @@ from ..artifacts import normalise_manifest_inputs, read_json, read_jsonl, write_
 from ..config import ConfigurationError
 from ..ctc_wac import (
     Stage1Contract,
+    contextual_wuw_decoder_fingerprint,
     feature_bundle_paths,
     feature_bundle_valid,
     generate_ctc_wac_feature_bundle,
     load_keywords,
+    load_wuw_biases,
+    wuw_bias_fingerprint,
 )
 from ..legacy import get_legacy_module
 from .common import boolean, integer, number, placement, require, stage_work_path
@@ -79,6 +82,59 @@ def _competitor_token_prune(ctx: Any) -> int:
     return integer(ctx.section, "competitor_token_prune", ctx.step, 8)
 
 
+def _candidate_search(ctx: Any) -> str:
+    """Return the opt-in stage-1 candidate-search implementation."""
+
+    return ctx.section.get("candidate_search", "forced_keyword").strip().lower()
+
+
+def _wuw_bias_tsv(ctx: Any) -> Path | None:
+    """Return the contextual completion-bonus TSV when that mode is selected."""
+
+    value = ctx.section.get("wuw_bias_tsv")
+    return ctx.config.resolve_path(value) if value else None
+
+
+def _contextual_beam_size(ctx: Any) -> int:
+    return integer(ctx.section, "contextual_beam_size", ctx.step, 16)
+
+
+def _contextual_token_prune(ctx: Any) -> int:
+    return integer(ctx.section, "contextual_token_prune", ctx.step, 8)
+
+
+def _contextual_lookahead(ctx: Any) -> bool:
+    return boolean(ctx.section, "contextual_lookahead", ctx.step, True)
+
+
+def _contextual_bias_fingerprint(ctx: Any) -> str | None:
+    """Compute the expected bias fingerprint used to reject stale outputs."""
+
+    if _candidate_search(ctx) != "contextual_wuw_beam":
+        return None
+    path = _wuw_bias_tsv(ctx)
+    if path is None:
+        return None
+    return wuw_bias_fingerprint(load_wuw_biases(path, load_keywords(_keyword_tokens(ctx), require_threshold=False)))
+
+
+def _contextual_decoder_fingerprint(ctx: Any) -> str | None:
+    """Fingerprint all contextual settings that affect feature candidates."""
+
+    if _candidate_search(ctx) != "contextual_wuw_beam":
+        return None
+    path = _wuw_bias_tsv(ctx)
+    if path is None:
+        return None
+    biases = load_wuw_biases(path, load_keywords(_keyword_tokens(ctx), require_threshold=False))
+    return contextual_wuw_decoder_fingerprint(
+        biases,
+        beam_size=_contextual_beam_size(ctx),
+        token_prune=_contextual_token_prune(ctx),
+        lookahead=_contextual_lookahead(ctx),
+    )
+
+
 def _ctc_max_search_frames(ctx: Any, contract: Stage1Contract) -> int | None:
     """Convert an explicitly configured CTC window count into encoder frames.
 
@@ -135,7 +191,23 @@ def validate(ctx: Any) -> None:
             if not path.is_file():
                 raise ConfigurationError(f"[{ctx.step}] {name} does not exist: {path}")
         contract = Stage1Contract.from_json(contract_path)
-        load_keywords(keywords_path, require_threshold=False)
+        keywords = load_keywords(keywords_path, require_threshold=False)
+        candidate_search = _candidate_search(ctx)
+        if candidate_search not in {"forced_keyword", "contextual_wuw_beam"}:
+            raise ConfigurationError(
+                f"[{ctx.step}] candidate_search must be forced_keyword or contextual_wuw_beam"
+            )
+        if candidate_search == "contextual_wuw_beam":
+            bias_tsv = _wuw_bias_tsv(ctx)
+            if bias_tsv is None:
+                raise ConfigurationError(f"[{ctx.step}] contextual_wuw_beam requires wuw_bias_tsv")
+            if not bias_tsv.is_file():
+                raise ConfigurationError(f"[{ctx.step}] wuw_bias_tsv does not exist: {bias_tsv}")
+            load_wuw_biases(bias_tsv, keywords)
+            if _contextual_beam_size(ctx) < 1:
+                raise ConfigurationError(f"[{ctx.step}] contextual_beam_size must be >= 1")
+            if _contextual_token_prune(ctx) < 1:
+                raise ConfigurationError(f"[{ctx.step}] contextual_token_prune must be >= 1")
         configured_rate = integer(ctx.config.section("main"), "sample_rate", "main", contract.sample_rate)
         if configured_rate != contract.sample_rate:
             raise ConfigurationError(
@@ -175,6 +247,10 @@ def input_paths(ctx: Any) -> list[Path]:
     paths = [item.path for item in _inputs(ctx)]
     if _extractor(ctx) == "wenet_ctc_wac":
         paths.extend([_stage1_model(ctx), _stage1_contract(ctx), _keyword_tokens(ctx)])
+        if _candidate_search(ctx) == "contextual_wuw_beam":
+            bias_tsv = _wuw_bias_tsv(ctx)
+            if bias_tsv is not None:
+                paths.append(bias_tsv)
         return paths
     model_dir = _model_dir(ctx)
     paths.extend([model_dir / "melspectrogram.onnx", model_dir / "embedding_model.onnx"])
@@ -195,6 +271,9 @@ def validate_outputs(ctx: Any) -> bool:
         return feature_bundle_valid(
             _output_file(ctx),
             expected_stage1_contract_fingerprint=contract.fingerprint(),
+            expected_contextual_wuw_bias_fingerprint=_contextual_bias_fingerprint(ctx),
+            expected_contextual_wuw_decoder_fingerprint=_contextual_decoder_fingerprint(ctx),
+            expected_candidate_search=_candidate_search(ctx),
             require_debug_alignments=_debug_alignment(ctx),
         )
     output, summary_path = output_paths(ctx)
@@ -232,6 +311,11 @@ def run(ctx: Any) -> dict[str, Any]:
             debug_alignments=_debug_alignment(ctx),
             competitor_beam_size=_competitor_beam_size(ctx),
             competitor_token_prune=_competitor_token_prune(ctx),
+            candidate_search=_candidate_search(ctx),
+            wuw_bias_tsv=_wuw_bias_tsv(ctx),
+            contextual_beam_size=_contextual_beam_size(ctx),
+            contextual_token_prune=_contextual_token_prune(ctx),
+            contextual_lookahead=_contextual_lookahead(ctx),
         )
         if not validate_outputs(ctx):
             raise RuntimeError(f"CTC-WAC feature output validation failed for {ctx.step}")
@@ -337,6 +421,11 @@ def run_slurm_shard(ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
             debug_alignments=_debug_alignment(ctx),
             competitor_beam_size=_competitor_beam_size(ctx),
             competitor_token_prune=_competitor_token_prune(ctx),
+            candidate_search=_candidate_search(ctx),
+            wuw_bias_tsv=_wuw_bias_tsv(ctx),
+            contextual_beam_size=_contextual_beam_size(ctx),
+            contextual_token_prune=_contextual_token_prune(ctx),
+            contextual_lookahead=_contextual_lookahead(ctx),
         )
         return {"output_file": str(output), "feature_count": summary.get("feature_count")}
 
@@ -373,6 +462,9 @@ def validate_slurm_shard(ctx: Any, task: dict[str, Any]) -> bool:
         return feature_bundle_valid(
             output,
             expected_stage1_contract_fingerprint=contract.fingerprint(),
+            expected_contextual_wuw_bias_fingerprint=_contextual_bias_fingerprint(ctx),
+            expected_contextual_wuw_decoder_fingerprint=_contextual_decoder_fingerprint(ctx),
+            expected_candidate_search=_candidate_search(ctx),
             require_debug_alignments=_debug_alignment(ctx),
         )
     summary_path = output.with_suffix(".summary.json")
@@ -514,17 +606,28 @@ def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, 
             raise RuntimeError("CTC-WAC feature shards use different keyword token files")
         if shard_summary.get("stage1_contract_fingerprint") != summary.get("stage1_contract_fingerprint"):
             raise RuntimeError("CTC-WAC feature shards use different stage-1 contracts")
+        if shard_summary.get("candidate_search", "forced_keyword") != summary.get("candidate_search", "forced_keyword"):
+            raise RuntimeError("CTC-WAC feature shards use different candidate-search modes")
+        if shard_summary.get("contextual_wuw_bias_fingerprint") != summary.get("contextual_wuw_bias_fingerprint"):
+            raise RuntimeError("CTC-WAC feature shards use different contextual WUW bias TSVs")
+        if shard_summary.get("contextual_wuw_decoder_fingerprint") != summary.get(
+            "contextual_wuw_decoder_fingerprint"
+        ):
+            raise RuntimeError("CTC-WAC feature shards use different contextual decoder settings")
         if shard_summary.get("keyword_vs_filler") != summary.get("keyword_vs_filler"):
             raise RuntimeError("CTC-WAC feature shards use different keyword-versus-filler settings")
     if debug_alignment and any(item.get("debug_alignment_enabled") is not True for item in shard_summaries):
         raise RuntimeError("CTC-WAC debug alignment logging was not enabled for every feature shard")
 
-    def summed_keyword_counts(name: str) -> dict[str, int]:
+    def summed_keyword_counts(name: str, *, default_zero: bool = False) -> dict[str, int]:
         totals = {keyword_id: 0 for keyword_id in keyword_ids}
         for shard_summary in shard_summaries:
             raw = shard_summary.get(name)
             if not isinstance(raw, dict):
-                raise RuntimeError(f"CTC-WAC shard summary has no {name}")
+                if default_zero and raw is None:
+                    raw = {}
+                else:
+                    raise RuntimeError(f"CTC-WAC shard summary has no {name}")
             for keyword_id in keyword_ids:
                 try:
                     value = int(raw.get(keyword_id, 0))
@@ -539,6 +642,11 @@ def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, 
         item
         for shard_summary in shard_summaries
         for item in shard_summary.get("invalid_alignments", [])
+    ][:50]
+    no_wuw_hypotheses = [
+        item
+        for shard_summary in shard_summaries
+        for item in shard_summary.get("no_wuw_hypotheses", [])
     ][:50]
     debug_alignment_rows: list[dict[str, Any]] = []
     if debug_alignment:
@@ -571,6 +679,13 @@ def _merge_ctc_wac_features(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, 
             "expected_keyword_invalid_alignment_counts": summed_keyword_counts(
                 "expected_keyword_invalid_alignment_counts"
             ),
+            "expected_keyword_no_wuw_counts": summed_keyword_counts(
+                "expected_keyword_no_wuw_counts", default_zero=True
+            ),
+            "no_wuw_hypothesis_rows": sum(
+                int(item.get("no_wuw_hypothesis_rows", 0)) for item in shard_summaries
+            ),
+            "no_wuw_hypotheses": no_wuw_hypotheses,
             "error_count": 0,
             "errors": [],
         }

@@ -28,7 +28,9 @@ from wuw_training.ctc_wac import (  # noqa: E402
     Keyword,
     Stage1Contract,
     StreamingCtcStage1,
+    WuwBias,
     best_ctc_candidate,
+    best_contextual_ctc_candidate,
     ctc_candidate_token_alignments,
     ctc_forward_score,
     ctc_keyword_vs_filler_score,
@@ -36,15 +38,18 @@ from wuw_training.ctc_wac import (  # noqa: E402
     ctc_keyword_alignment_traces,
     ctc_keyword_score_trace,
     ctc_prefix_beam_search,
+    contextual_ctc_prefix_beam_search,
+    contextual_wuw_decoder_fingerprint,
     feature_bundle_paths,
     feature_bundle_valid,
     keyword_token_fingerprint,
     load_keywords,
+    load_wuw_biases,
     make_ctc_wac_model,
     rank_keyword_scores,
 )
 from wuw_training.runner import PipelineRunner  # noqa: E402
-from wuw_training.config import load_ini_config  # noqa: E402
+from wuw_training.config import ConfigurationError, load_ini_config  # noqa: E402
 from wuw_training.legacy import get_legacy_module  # noqa: E402
 from wuw_training.stages.train import FeatureBlock  # noqa: E402
 from wuw_training.stages.feature import _merge_ctc_wac_features  # noqa: E402
@@ -234,6 +239,30 @@ def test_feature_bundle_rejects_a_stale_stage1_contract(
     )
 
 
+def test_feature_bundle_rejects_stale_contextual_decoder_settings(tmp_path: Path) -> None:
+    keywords_path = _keyword_file(tmp_path)
+    features = tmp_path / "features.npy"
+    _write_bundle(features, label=1, keywords_path=keywords_path, seed=3)
+    biases = [
+        WuwBias(0, "wake_a", "wake a", (1, 2), 2.0),
+        WuwBias(1, "wake_b", "wake b", (2, 1), 3.0),
+    ]
+    first = contextual_wuw_decoder_fingerprint(biases, beam_size=16, token_prune=8, lookahead=True)
+    second = contextual_wuw_decoder_fingerprint(biases, beam_size=32, token_prune=8, lookahead=True)
+    paths = feature_bundle_paths(features)
+    summary = json.loads(paths.summary.read_text(encoding="utf-8"))
+    summary.update(
+        {
+            "candidate_search": "contextual_wuw_beam",
+            "contextual_wuw_decoder_fingerprint": first,
+        }
+    )
+    write_json(paths.summary, summary)
+
+    assert feature_bundle_valid(features, expected_contextual_wuw_decoder_fingerprint=first)
+    assert not feature_bundle_valid(features, expected_contextual_wuw_decoder_fingerprint=second)
+
+
 def test_onnx_threads_follow_slurm_allocation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OMP_NUM_THREADS", "8")
     monkeypatch.setenv("SLURM_CPUS_PER_TASK", "2")
@@ -297,6 +326,109 @@ def test_ctc_forward_score_sums_all_legal_paths() -> None:
     hypotheses = ctc_prefix_beam_search(log_probs, blank_id=0, beam_size=64, token_prune=None)
     assert [item.token_ids for item in hypotheses] == [target for target, _score in expected]
     assert [item.log_score for item in hypotheses] == pytest.approx([score for _target, score in expected])
+
+
+def test_contextual_wuw_bias_tsv_requires_a_complete_keyword_mapping(tmp_path: Path) -> None:
+    keywords = [
+        Keyword("wake_a", "Wake A", (1, 2), 0.0),
+        Keyword("wake_b", "wake b", (2, 3), 0.0),
+    ]
+    path = tmp_path / "bias.tsv"
+    path.write_text("# display_text<TAB>bonus\n wake   a\t2.5\nwake b\t0\n", encoding="utf-8")
+
+    biases = load_wuw_biases(path, keywords)
+    assert [(item.keyword_id, item.token_ids, item.bonus) for item in biases] == [
+        ("wake_a", (1, 2), 2.5),
+        ("wake_b", (2, 3), 0.0),
+    ]
+
+    path.write_text("wake a\t1\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="missing configured wake word"):
+        load_wuw_biases(path, keywords)
+
+
+def test_contextual_beam_can_select_a_bonus_boosted_wuw_and_crop_its_tokens() -> None:
+    # The acoustic best path is token 3; the lower-scoring [1, 2] spelling
+    # must win only after its completion bonus is applied.
+    probabilities = np.asarray(
+        [
+            [0.10, 0.35, 0.05, 0.50],
+            [0.10, 0.05, 0.35, 0.50],
+            [0.80, 0.05, 0.05, 0.10],
+        ],
+        dtype=np.float32,
+    )
+    candidate = best_contextual_ctc_candidate(
+        np.log(probabilities),
+        [WuwBias(0, "wake", "wake", (1, 2), 2.0)],
+        blank_id=0,
+        beam_size=8,
+        token_prune=3,
+        use_lookahead=True,
+    )
+
+    assert candidate is not None
+    assert candidate.keyword_index == 0
+    assert candidate.decoded_token_ids == (1, 2)
+    assert (candidate.start_frame, candidate.end_frame) == (0, 1)
+    assert candidate.keyword_score == pytest.approx(candidate.acoustic_score + 2.0)
+    assert candidate.filler_token_ids != (1, 2)
+    assert candidate.top_score == pytest.approx(candidate.normalized_confidence)
+
+
+def test_contextual_beam_prunes_wuw_like_any_other_path_and_returns_none_when_absent() -> None:
+    probabilities = np.asarray(
+        [
+            [0.05, 0.01, 0.01, 0.93],
+            [0.05, 0.01, 0.01, 0.93],
+            [0.90, 0.04, 0.02, 0.04],
+        ],
+        dtype=np.float32,
+    )
+    biases = [WuwBias(0, "wake", "wake", (1, 2), 0.0)]
+    hypotheses = contextual_ctc_prefix_beam_search(
+        np.log(probabilities),
+        biases,
+        blank_id=0,
+        beam_size=1,
+        token_prune=1,
+        use_lookahead=True,
+    )
+    assert hypotheses and not hypotheses[0].matches
+    assert best_contextual_ctc_candidate(
+        np.log(probabilities),
+        biases,
+        blank_id=0,
+        beam_size=1,
+        token_prune=1,
+        use_lookahead=True,
+    ) is None
+
+
+def test_contextual_beam_does_not_stack_repeated_wuw_bonuses() -> None:
+    probabilities = np.asarray(
+        [
+            [0.02, 0.94, 0.02, 0.02],
+            [0.02, 0.02, 0.94, 0.02],
+            [0.94, 0.02, 0.02, 0.02],
+            [0.02, 0.94, 0.02, 0.02],
+            [0.02, 0.02, 0.94, 0.02],
+        ],
+        dtype=np.float32,
+    )
+    bonus = 1.75
+    candidate = best_contextual_ctc_candidate(
+        np.log(probabilities),
+        [WuwBias(0, "wake", "wake", (1, 2), bonus)],
+        blank_id=0,
+        beam_size=16,
+        token_prune=3,
+        use_lookahead=True,
+    )
+
+    assert candidate is not None
+    assert candidate.decoded_token_ids == (1, 2, 1, 2)
+    assert candidate.keyword_score - candidate.acoustic_score == pytest.approx(bonus)
 
 
 def test_keyword_vs_filler_uses_forward_scores_on_the_same_segment() -> None:
@@ -720,6 +852,81 @@ def test_feature_bundle_crops_variable_length_ctc_candidates(monkeypatch: pytest
     assert not feature_bundle_valid(output, require_debug_alignments=True)
 
 
+def test_contextual_feature_bundle_records_no_wuw_without_a_fake_crop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    keywords_path = _keyword_file(tmp_path)
+    bias_path = tmp_path / "bias.tsv"
+    bias_path.write_text("wake a\t0\nwake b\t0\n", encoding="utf-8")
+    contract_path = tmp_path / "contract.json"
+    write_json(
+        contract_path,
+        {
+            "schema_version": 2,
+            "sample_rate": 16000,
+            "fbank": {"num_mel_bins": 80, "frame_length_ms": 25.0, "frame_shift_ms": 10.0, "dither": 0.0},
+            "chunk_frames": 7,
+            "chunk_stride_frames": 7,
+            "minimum_input_frames": 1,
+            "pad_final_chunk": False,
+            "inputs": {"features": "chunk"},
+            "outputs": {"encoder": "encoder_out", "ctc_log_probs": "ctc_log_probs"},
+            "ctc_output_is_log_probs": True,
+            "encoder_frame_shift_ms": 40.0,
+            "encoder_output_size": 3,
+            "vocab_size": 3,
+        },
+    )
+
+    class FakeStage1:
+        providers = ["fake"]
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def infer_fbank(self, _values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            encoder = np.zeros((3, 3), dtype=np.float32)
+            probabilities = np.asarray(
+                [[0.99, 0.005, 0.005], [0.99, 0.005, 0.005], [0.99, 0.005, 0.005]],
+                dtype=np.float32,
+            )
+            return encoder, np.log(probabilities)
+
+    monkeypatch.setattr(ctc_wac_module, "StreamingCtcStage1", FakeStage1)
+    monkeypatch.setattr(
+        ctc_wac_module,
+        "load_audio",
+        lambda _path, _sample_rate: np.zeros(5, dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        ctc_wac_module,
+        "audio_to_fbank",
+        lambda _audio, _contract: np.ones((1, 80), dtype=np.float32),
+    )
+    output = tmp_path / "bundle.npy"
+    summary = ctc_wac_module.generate_ctc_wac_feature_bundle(
+        records=[{"id": "one", "path": str(tmp_path / "one.wav"), "label": 1, "text": "wake a"}],
+        output_file=output,
+        model_path=tmp_path / "stage1.onnx",
+        contract_path=contract_path,
+        keywords_path=keywords_path,
+        candidate_search="contextual_wuw_beam",
+        wuw_bias_tsv=bias_path,
+        contextual_beam_size=1,
+        contextual_token_prune=1,
+        contextual_lookahead=True,
+    )
+
+    paths = feature_bundle_paths(output)
+    assert feature_bundle_valid(output)
+    assert summary["feature_count"] == 0
+    assert summary["no_wuw_hypothesis_rows"] == 1
+    assert summary["expected_keyword_no_wuw_counts"] == {"wake_a": 1, "wake_b": 0}
+    assert np.load(paths.features).shape == (0, 3)
+    assert np.load(paths.all_scores).shape == (0, 2)
+    assert paths.rows.read_text(encoding="utf-8") == ""
+
+
 def test_masked_wac_pooling_ignores_tail_padding() -> None:
     model = make_ctc_wac_model(
         feature_dim=3,
@@ -1098,3 +1305,71 @@ normalized_confidence_threshold_step = 0.5
     assert "Keyword-versus-filler confidence" in markdown
     assert "Length-normalized keyword-versus-filler confidence" in markdown
     assert "quantile" not in markdown.lower()
+
+
+def test_stage1_report_uses_contextual_scores_and_counts_no_wuw_positive(tmp_path: Path) -> None:
+    keywords_path = _keyword_file(tmp_path)
+    positive = tmp_path / "positive.npy"
+    _write_bundle(positive, label=1, keywords_path=keywords_path, seed=1)
+    paths = feature_bundle_paths(positive)
+    scores = np.asarray(
+        [[0.8, 0.1], [0.1, 0.8], [0.6, 0.2], [0.2, 0.6]], dtype=np.float32
+    )
+    top, margin, winner = rank_keyword_scores(scores)
+    onehot = np.zeros_like(scores)
+    onehot[np.arange(scores.shape[0]), winner] = 1.0
+    np.save(paths.all_scores, scores)
+    np.save(paths.top_score, top.reshape(-1, 1))
+    np.save(paths.margin, margin.reshape(-1, 1))
+    np.save(paths.winner_onehot, onehot)
+    summary = json.loads(paths.summary.read_text(encoding="utf-8"))
+    summary.update(
+        {
+            "candidate_search": "contextual_wuw_beam",
+            "score_domain": "normalized_contextual_wuw_confidence",
+            "expected_keyword_counts": {"wake_a": 3, "wake_b": 2},
+            "expected_keyword_no_wuw_counts": {"wake_a": 1, "wake_b": 0},
+            "no_wuw_hypothesis_rows": 1,
+        }
+    )
+    paths.summary.write_text(json.dumps(summary), encoding="utf-8")
+    config = tmp_path / "report.ini"
+    config.write_text(
+        f"""[main]
+experiment_dir = {tmp_path / 'experiment'}
+
+[steps]
+steps = stage1_report
+
+[feature.positive]
+output_file = {positive}
+label = 1
+split = train
+
+[stage1_report]
+features = feature.positive
+output_json = ${{main:experiment_dir}}/report.json
+output_report = ${{main:experiment_dir}}/report.md
+threshold_start = -5
+threshold_stop = 0
+threshold_step = 1
+confidence_threshold_start = 0
+confidence_threshold_stop = 1
+confidence_threshold_step = 0.5
+normalized_confidence_threshold_start = 0
+normalized_confidence_threshold_stop = 1
+normalized_confidence_threshold_step = 0.5
+""",
+        encoding="utf-8",
+    )
+    PipelineRunner(load_ini_config(config)).run()
+    payload = json.loads((tmp_path / "experiment" / "report.json").read_text(encoding="utf-8"))
+    block = payload["blocks"][0]
+    assert set(block["score_tables"]) == {"normalized_contextual_confidence", "contextual_confidence"}
+    table = block["score_tables"]["normalized_contextual_confidence"]["threshold_table"]
+    at_zero = next(item for item in table if item["threshold"] == 0.0)
+    assert at_zero["overall"]["expected_rows"] == 5
+    assert at_zero["overall"]["false_rejections"] == 1
+    markdown = (tmp_path / "experiment" / "report.md").read_text(encoding="utf-8")
+    assert "Normalized contextual WUW confidence" in markdown
+    assert "no final WUW hypothesis" in markdown

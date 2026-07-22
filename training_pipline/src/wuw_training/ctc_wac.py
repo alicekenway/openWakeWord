@@ -16,6 +16,8 @@ import json
 import math
 import os
 import tempfile
+import unicodedata
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -50,6 +52,17 @@ class Keyword:
     display_text: str
     token_ids: tuple[int, ...]
     threshold: float
+
+
+@dataclass(frozen=True)
+class WuwBias:
+    """One contextual-decoder wake-word spelling and its completion bonus."""
+
+    keyword_index: int
+    keyword_id: str
+    display_text: str
+    token_ids: tuple[int, ...]
+    bonus: float
 
 
 @dataclass(frozen=True)
@@ -367,6 +380,128 @@ def load_keywords(path: Path, *, require_threshold: bool = True) -> list[Keyword
     return parsed
 
 
+def _normalised_wuw_text(value: str) -> str:
+    """Normalise a user-facing wake-word spelling for TSV matching."""
+
+    return " ".join(unicodedata.normalize("NFKC", value).strip().split()).casefold()
+
+
+def load_wuw_biases(path: Path, keywords: Sequence[Keyword]) -> list[WuwBias]:
+    """Load ``<display_text><TAB><bonus>`` contextual WUW rules.
+
+    The frozen CTC model needs token IDs, which stay in the existing keyword
+    JSON.  The TSV deliberately carries only a human-editable spelling and an
+    additive completion bonus.  Requiring a one-to-one mapping avoids silently
+    running a mixed or stale keyword set.
+    """
+
+    if not path.is_file():
+        raise ConfigurationError(f"WUW bias TSV does not exist: {path}")
+    by_text: dict[str, tuple[int, Keyword]] = {}
+    for index, keyword in enumerate(keywords):
+        key = _normalised_wuw_text(keyword.display_text)
+        if not key:
+            raise ConfigurationError(f"Keyword {keyword.id!r} has an empty display_text")
+        if key in by_text:
+            other = by_text[key][1]
+            raise ConfigurationError(
+                "Contextual WUW TSV matching is ambiguous: "
+                f"keywords {other.id!r} and {keyword.id!r} share display_text {keyword.display_text!r}"
+            )
+        by_text[key] = (index, keyword)
+
+    parsed: dict[str, float] = {}
+    try:
+        handle = path.open("r", encoding="utf-8")
+    except OSError as exc:
+        raise ConfigurationError(f"Could not read WUW bias TSV {path}: {exc}") from exc
+    with handle:
+        for line_number, line in enumerate(handle, start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) != 2:
+                raise ConfigurationError(
+                    f"WUW bias TSV {path} line {line_number}: expected <display_text><TAB><bonus>"
+                )
+            display_text = _normalised_wuw_text(fields[0])
+            if not display_text:
+                raise ConfigurationError(f"WUW bias TSV {path} line {line_number}: empty display_text")
+            if display_text not in by_text:
+                raise ConfigurationError(
+                    f"WUW bias TSV {path} line {line_number}: unknown wake word {fields[0]!r}"
+                )
+            if display_text in parsed:
+                raise ConfigurationError(
+                    f"WUW bias TSV {path} line {line_number}: duplicate wake word {fields[0]!r}"
+                )
+            try:
+                bonus = float(fields[1].strip())
+            except ValueError as exc:
+                raise ConfigurationError(
+                    f"WUW bias TSV {path} line {line_number}: bonus is not numeric"
+                ) from exc
+            if not math.isfinite(bonus) or bonus < 0.0:
+                raise ConfigurationError(
+                    f"WUW bias TSV {path} line {line_number}: bonus must be finite and >= 0"
+                )
+            parsed[display_text] = bonus
+
+    missing = [keyword.display_text for key, (_index, keyword) in by_text.items() if key not in parsed]
+    if missing:
+        raise ConfigurationError(
+            f"WUW bias TSV {path} is missing configured wake word(s): " + ", ".join(repr(item) for item in missing)
+        )
+    return [
+        WuwBias(
+            keyword_index=index,
+            keyword_id=keyword.id,
+            display_text=keyword.display_text,
+            token_ids=keyword.token_ids,
+            bonus=parsed[_normalised_wuw_text(keyword.display_text)],
+        )
+        for index, keyword in enumerate(keywords)
+    ]
+
+
+def wuw_bias_fingerprint(biases: Sequence[WuwBias]) -> str:
+    """Stable fingerprint for feature-bundle compatibility checks."""
+
+    return hash_payload(
+        [
+            {
+                "keyword_id": item.keyword_id,
+                "display_text": item.display_text,
+                "token_ids": item.token_ids,
+                "bonus": item.bonus,
+            }
+            for item in biases
+        ]
+    )
+
+
+def contextual_wuw_decoder_fingerprint(
+    biases: Sequence[WuwBias],
+    *,
+    beam_size: int,
+    token_prune: int | None,
+    lookahead: bool,
+) -> str:
+    """Fingerprint every contextual-decoder choice that changes candidates."""
+
+    return hash_payload(
+        {
+            "bias_fingerprint": wuw_bias_fingerprint(biases),
+            "beam_size": int(beam_size),
+            "token_prune": int(token_prune) if token_prune is not None else None,
+            "lookahead": bool(lookahead),
+            "completion_bonus_only": True,
+            "repeat_bonus_policy": "best_single_occurrence",
+        }
+    )
+
+
 def _expected_keyword_id(
     record: dict[str, Any],
     *,
@@ -485,6 +620,9 @@ def feature_bundle_valid(
     *,
     require_complete: bool = True,
     expected_stage1_contract_fingerprint: str | None = None,
+    expected_contextual_wuw_bias_fingerprint: str | None = None,
+    expected_contextual_wuw_decoder_fingerprint: str | None = None,
+    expected_candidate_search: str | None = None,
     require_debug_alignments: bool = False,
 ) -> bool:
     """Check the shapes and summary needed by CTC-WAC training.
@@ -529,6 +667,20 @@ def feature_bundle_valid(
                 expected_stage1_contract_fingerprint is None
                 or summary.get("stage1_contract_fingerprint")
                 == expected_stage1_contract_fingerprint
+            )
+            and (
+                expected_contextual_wuw_bias_fingerprint is None
+                or summary.get("contextual_wuw_bias_fingerprint")
+                == expected_contextual_wuw_bias_fingerprint
+            )
+            and (
+                expected_contextual_wuw_decoder_fingerprint is None
+                or summary.get("contextual_wuw_decoder_fingerprint")
+                == expected_contextual_wuw_decoder_fingerprint
+            )
+            and (
+                expected_candidate_search is None
+                or summary.get("candidate_search", "forced_keyword") == expected_candidate_search
             )
             and int(summary.get("feature_count", -1)) == n
             and x.ndim == 2
@@ -771,6 +923,253 @@ def ctc_prefix_beam_search(
             key=lambda item: (-item[1], item[0]),
         )
     ]
+
+
+@dataclass(frozen=True)
+class ContextualWuwMatch:
+    """One exact keyword-token occurrence inside a collapsed CTC prefix."""
+
+    keyword_index: int
+    token_start: int
+    token_end: int
+
+
+@dataclass(frozen=True)
+class ContextualCtcHypothesis:
+    """A CTC prefix plus all complete WUW occurrences it contains."""
+
+    token_ids: tuple[int, ...]
+    acoustic_score: float
+    matches: tuple[ContextualWuwMatch, ...]
+
+
+@dataclass(frozen=True)
+class ContextualCtcCandidate:
+    """The selected virtual-WUW candidate from a contextual CTC beam."""
+
+    keyword_index: int
+    scores: np.ndarray
+    top_score: float
+    margin: float
+    start_frame: int
+    end_frame: int
+    candidate_frame: int
+    bonus: float
+    acoustic_score: float
+    keyword_score: float
+    filler_score: float
+    raw_score: float
+    normalized_raw_score: float
+    confidence: float
+    normalized_confidence: float
+    segment_length: int
+    decoded_token_ids: tuple[int, ...]
+    filler_token_ids: tuple[int, ...]
+    occurrence_token_start: int
+    occurrence_token_end: int
+    token_alignments: tuple["CtcTokenAlignment", ...]
+
+
+class _WuwTrie:
+    """Small Aho--Corasick trie over keyword token IDs.
+
+    The trie is intentionally token-ID-only.  Non-keyword BPE IDs remain
+    opaque to this experimental decoder: they contribute normal AM scores but
+    are semantically represented as garbage outside a completed WUW.
+    """
+
+    def __init__(self, biases: Sequence[WuwBias]) -> None:
+        if not biases:
+            raise ValueError("Contextual CTC decoding needs at least one WUW bias")
+        self.biases = tuple(biases)
+        if [item.keyword_index for item in self.biases] != list(range(len(self.biases))):
+            raise ValueError(
+                "Contextual WUW biases must be ordered by contiguous keyword_index values starting at zero"
+            )
+        self.children: list[dict[int, int]] = [{}]
+        self.fail: list[int] = [0]
+        self.outputs: list[list[int]] = [[]]
+        for bias in self.biases:
+            if not bias.token_ids:
+                raise ValueError(f"WUW {bias.keyword_id!r} has no token IDs")
+            state = 0
+            for token_id in bias.token_ids:
+                child = self.children[state].get(int(token_id))
+                if child is None:
+                    child = len(self.children)
+                    self.children[state][int(token_id)] = child
+                    self.children.append({})
+                    self.fail.append(0)
+                    self.outputs.append([])
+                state = child
+            self.outputs[state].append(int(bias.keyword_index))
+
+        queue: deque[int] = deque()
+        for child in self.children[0].values():
+            queue.append(child)
+        while queue:
+            state = queue.popleft()
+            for token_id, child in self.children[state].items():
+                fallback = self.fail[state]
+                while fallback and token_id not in self.children[fallback]:
+                    fallback = self.fail[fallback]
+                self.fail[child] = self.children[fallback].get(token_id, 0)
+                self.outputs[child].extend(self.outputs[self.fail[child]])
+                queue.append(child)
+
+        self._descendant_max_bonus = [0.0] * len(self.children)
+
+        def visit(state: int) -> float:
+            value = max((self.biases[index].bonus for index in self.outputs[state]), default=0.0)
+            for child in self.children[state].values():
+                value = max(value, visit(child))
+            self._descendant_max_bonus[state] = value
+            return value
+
+        visit(0)
+
+    def advance(self, state: int, token_id: int) -> tuple[int, tuple[int, ...]]:
+        """Consume one collapsed CTC token and return new state/completions."""
+
+        while state and token_id not in self.children[state]:
+            state = self.fail[state]
+        state = self.children[state].get(token_id, 0)
+        return state, tuple(self.outputs[state])
+
+    def useful_tokens(self, state: int) -> set[int]:
+        """Tokens worth retaining beyond the normal AM top-k expansion."""
+
+        return set(self.children[0]).union(self.children[state])
+
+    def future_bonus(self, state: int) -> float:
+        """Potential completion bonus for the active, non-root prefix only."""
+
+        return self._descendant_max_bonus[state] if state else 0.0
+
+
+def _contextual_completed_bonus(
+    matches: Sequence[ContextualWuwMatch], biases: Sequence[WuwBias]
+) -> float:
+    return max((biases[item.keyword_index].bonus for item in matches), default=0.0)
+
+
+def contextual_ctc_prefix_beam_search(
+    log_probs: np.ndarray,
+    biases: Sequence[WuwBias],
+    *,
+    blank_id: int = 0,
+    beam_size: int = 16,
+    token_prune: int | None = 8,
+    use_lookahead: bool = True,
+    forbid_wuw: bool = False,
+) -> list[ContextualCtcHypothesis]:
+    """Decode BPE CTC paths while marking exact virtual-WUW completions.
+
+    All hypotheses use the same bounded CTC beam.  ``use_lookahead`` affects
+    only pruning rank: a partial WUW receives the largest bonus that can be
+    reached by continuing that trie prefix.  The returned acoustic scores do
+    not contain that provisional value.  With ``forbid_wuw=True`` the result
+    is a competing background beam that cannot contain a completed WUW.
+    """
+
+    values = _ctc_values(log_probs, blank_id=blank_id)
+    if int(beam_size) < 1:
+        raise ValueError("contextual CTC beam_size must be >= 1")
+    if token_prune is not None and int(token_prune) < 1:
+        raise ValueError("contextual CTC token_prune must be >= 1 when configured")
+    trie = _WuwTrie(biases)
+    negative_infinity = -math.inf
+    # Prefix -> (blank score, non-blank score, trie state, completed matches).
+    beam: dict[tuple[int, ...], tuple[float, float, int, tuple[ContextualWuwMatch, ...]]] = {
+        (): (0.0, negative_infinity, 0, ())
+    }
+    for frame in values:
+        next_blank: dict[tuple[int, ...], float] = {}
+        next_nonblank: dict[tuple[int, ...], float] = {}
+        metadata: dict[tuple[int, ...], tuple[int, tuple[ContextualWuwMatch, ...]]] = {}
+        candidate_tokens = set(_prefix_beam_tokens(frame, blank_id=blank_id, token_prune=token_prune))
+        for _prefix, (_pb, _pnb, state, _matches) in beam.items():
+            candidate_tokens.update(trie.useful_tokens(state))
+        token_ids = tuple(sorted(candidate_tokens, key=lambda item: (-float(frame[item]), item)))
+        blank_log_prob = float(frame[blank_id])
+
+        def put_blank(prefix: tuple[int, ...], value: float, state: int, matches: tuple[ContextualWuwMatch, ...]) -> None:
+            next_blank[prefix] = _logaddexp_pair(next_blank.get(prefix, negative_infinity), value)
+            metadata.setdefault(prefix, (state, matches))
+
+        def put_nonblank(
+            prefix: tuple[int, ...], value: float, state: int, matches: tuple[ContextualWuwMatch, ...]
+        ) -> None:
+            next_nonblank[prefix] = _logaddexp_pair(next_nonblank.get(prefix, negative_infinity), value)
+            metadata.setdefault(prefix, (state, matches))
+
+        for prefix, (prob_blank, prob_nonblank, state, matches) in beam.items():
+            prefix_total = _logaddexp_pair(prob_blank, prob_nonblank)
+            put_blank(prefix, prefix_total + blank_log_prob, state, matches)
+            for token_id in token_ids:
+                token_value = float(frame[token_id])
+                if prefix and token_id == prefix[-1]:
+                    if prob_nonblank != negative_infinity:
+                        put_nonblank(prefix, prob_nonblank + token_value, state, matches)
+                    if prob_blank == negative_infinity:
+                        continue
+                elif prefix_total == negative_infinity:
+                    continue
+
+                extended = prefix + (token_id,)
+                extended_state, outputs = trie.advance(state, token_id)
+                if forbid_wuw and outputs:
+                    continue
+                extended_matches = matches + tuple(
+                    ContextualWuwMatch(
+                        keyword_index=keyword_index,
+                        token_start=len(prefix) - len(biases[keyword_index].token_ids) + 1,
+                        token_end=len(prefix),
+                    )
+                    for keyword_index in outputs
+                )
+                source = prob_blank if prefix and token_id == prefix[-1] else prefix_total
+                put_nonblank(extended, source + token_value, extended_state, extended_matches)
+
+        ranked: list[tuple[tuple[int, ...], float]] = []
+        for prefix in set(next_blank).union(next_nonblank):
+            state, matches = metadata[prefix]
+            acoustic_score = _logaddexp_pair(
+                next_blank.get(prefix, negative_infinity), next_nonblank.get(prefix, negative_infinity)
+            )
+            completed_bonus = _contextual_completed_bonus(matches, biases)
+            lookahead_bonus = trie.future_bonus(state) if use_lookahead and not forbid_wuw else 0.0
+            ranked.append((prefix, acoustic_score + max(completed_bonus, lookahead_bonus)))
+        ranked.sort(key=lambda item: (-item[1], item[0]))
+        beam = {
+            prefix: (
+                next_blank.get(prefix, negative_infinity),
+                next_nonblank.get(prefix, negative_infinity),
+                metadata[prefix][0],
+                metadata[prefix][1],
+            )
+            for prefix, _rank in ranked[: int(beam_size)]
+        }
+
+    hypotheses = [
+        ContextualCtcHypothesis(
+            token_ids=prefix,
+            acoustic_score=float(_logaddexp_pair(prob_blank, prob_nonblank)),
+            matches=matches,
+        )
+        for prefix, (prob_blank, prob_nonblank, _state, matches) in beam.items()
+    ]
+    return sorted(
+        hypotheses,
+        key=lambda item: (
+            -(
+                item.acoustic_score + _contextual_completed_bonus(item.matches, biases)
+                if not forbid_wuw
+                else item.acoustic_score
+            ),
+            item.token_ids,
+        ),
+    )
 
 
 def _sigmoid(value: float) -> float:
@@ -1354,6 +1753,225 @@ def ctc_candidate_token_alignments(
     return alignments
 
 
+def ctc_sequence_token_alignments(
+    log_probs: np.ndarray,
+    token_ids: Sequence[int],
+    *,
+    blank_id: int = 0,
+) -> list[CtcTokenAlignment]:
+    """Viterbi-align a complete collapsed CTC sequence to all encoder frames.
+
+    Contextual decoding selects a whole BPE path so that ordinary speech can
+    appear before and after a WUW.  This helper recovers token frame ranges for
+    that full path, allowing the selected virtual WUW occurrence to be cropped
+    precisely without treating its surrounding tokens as part of Stage 2.
+    """
+
+    values = np.asarray(log_probs, dtype=np.float32)
+    if values.ndim != 2 or values.shape[0] < 1:
+        raise ValueError(f"CTC scores must have shape [frames, vocabulary], got {values.shape}")
+    tokens = tuple(int(item) for item in token_ids)
+    if not tokens:
+        raise ValueError("Cannot align an empty collapsed CTC sequence")
+    if blank_id < 0 or blank_id >= values.shape[1] or any(item < 0 or item >= values.shape[1] for item in tokens):
+        raise ValueError("CTC token ID is outside the output vocabulary")
+    if blank_id in tokens:
+        raise ValueError("CTC token IDs must not include the blank ID")
+
+    extended: list[int] = [blank_id]
+    for token in tokens:
+        extended.extend([token, blank_id])
+    state_count = len(extended)
+    negative_infinity = np.float32(-1.0e30)
+    previous = np.full(state_count, negative_infinity, dtype=np.float32)
+    previous[0] = values[0, blank_id]
+    previous[1] = values[0, tokens[0]]
+    predecessors = np.full((values.shape[0], state_count), -1, dtype=np.int32)
+
+    for frame_index in range(1, values.shape[0]):
+        current = np.full(state_count, negative_infinity, dtype=np.float32)
+        for state, symbol in enumerate(extended):
+            choices = [state]
+            if state > 0:
+                choices.append(state - 1)
+            if state > 1 and state % 2 == 1 and symbol != extended[state - 2]:
+                choices.append(state - 2)
+            best_state = choices[0]
+            best_score = previous[best_state]
+            for prior_state in choices[1:]:
+                if previous[prior_state] > best_score:
+                    best_state = prior_state
+                    best_score = previous[prior_state]
+            if best_score > negative_infinity / 2:
+                current[state] = best_score + values[frame_index, symbol]
+                predecessors[frame_index, state] = best_state
+        previous = current
+
+    final_state = state_count - 2
+    if previous[-1] > previous[final_state]:
+        final_state = state_count - 1
+    if previous[final_state] <= negative_infinity / 2:
+        raise RuntimeError("Selected contextual CTC path has no token-level alignment")
+    states = np.empty(values.shape[0], dtype=np.int32)
+    state = final_state
+    for frame_index in range(values.shape[0] - 1, 0, -1):
+        states[frame_index] = state
+        state = int(predecessors[frame_index, state])
+        if state < 0:
+            raise RuntimeError("Selected contextual CTC path has an incomplete Viterbi backtrace")
+    states[0] = state
+
+    alignments: list[CtcTokenAlignment] = []
+    for token_index, token_id in enumerate(tokens):
+        state_index = 2 * token_index + 1
+        frames = np.flatnonzero(states == state_index)
+        if frames.size == 0:
+            raise RuntimeError(f"Selected contextual CTC path did not emit token index {token_index}")
+        token_log_scores = values[frames, token_id]
+        alignments.append(
+            CtcTokenAlignment(
+                token_index=token_index,
+                token_id=token_id,
+                start_frame=int(frames[0]),
+                end_frame=int(frames[-1]),
+                frame_count=int(frames.size),
+                log_score=float(token_log_scores.sum()),
+                normalized_score=float(token_log_scores.mean()),
+            )
+        )
+    return alignments
+
+
+def best_contextual_ctc_candidate(
+    log_probs: np.ndarray,
+    biases: Sequence[WuwBias],
+    *,
+    blank_id: int = 0,
+    beam_size: int = 16,
+    token_prune: int | None = 8,
+    use_lookahead: bool = True,
+) -> ContextualCtcCandidate | None:
+    """Return the best final virtual-WUW candidate, or ``None`` if absent.
+
+    The ordinary main beam is pruned normally.  Only after that search ends do
+    we discard hypotheses with no completed WUW.  A separate constrained beam
+    supplies the best non-WUW competitor used by the confidence calculation.
+    """
+
+    values = _ctc_values(log_probs, blank_id=blank_id)
+    if not biases:
+        raise ValueError("Contextual CTC decoding needs at least one WUW bias")
+    vocabulary_size = int(values.shape[1])
+    for bias in biases:
+        if (
+            bias.keyword_index < 0
+            or not bias.token_ids
+            or blank_id in bias.token_ids
+            or any(token < 0 or token >= vocabulary_size for token in bias.token_ids)
+        ):
+            raise ValueError(f"Contextual WUW {bias.keyword_id!r} has invalid CTC token IDs")
+
+    hypotheses = contextual_ctc_prefix_beam_search(
+        values,
+        biases,
+        blank_id=blank_id,
+        beam_size=beam_size,
+        token_prune=token_prune,
+        use_lookahead=use_lookahead,
+    )
+    # This is the explicit final prune requested by the experiment design.
+    wuw_hypotheses = [item for item in hypotheses if item.matches]
+    if not wuw_hypotheses:
+        return None
+    filler_hypotheses = contextual_ctc_prefix_beam_search(
+        values,
+        biases,
+        blank_id=blank_id,
+        beam_size=beam_size,
+        token_prune=token_prune,
+        use_lookahead=False,
+        forbid_wuw=True,
+    )
+    if not filler_hypotheses:
+        raise RuntimeError("Contextual CTC background beam retained no non-WUW hypothesis")
+    filler = filler_hypotheses[0]
+
+    # One path may contain several WUWs.  They are evaluated independently;
+    # bonuses are never accumulated across repeats.
+    best_by_keyword: dict[int, tuple[float, ContextualCtcHypothesis, ContextualWuwMatch]] = {}
+    for hypothesis in wuw_hypotheses:
+        for match in hypothesis.matches:
+            score = hypothesis.acoustic_score + biases[match.keyword_index].bonus
+            current = best_by_keyword.get(match.keyword_index)
+            tie_key = (hypothesis.token_ids, match.token_start, match.token_end)
+            current_key = (
+                current[1].token_ids,
+                current[2].token_start,
+                current[2].token_end,
+            ) if current is not None else None
+            if current is None or score > current[0] or (score == current[0] and tie_key < current_key):
+                best_by_keyword[match.keyword_index] = (score, hypothesis, match)
+    if not best_by_keyword:
+        return None
+
+    frame_count = int(values.shape[0])
+    scores = np.zeros((len(biases),), dtype=np.float32)
+    for keyword_index, (keyword_score, _hypothesis, _match) in best_by_keyword.items():
+        raw = keyword_score - filler.acoustic_score
+        scores[keyword_index] = np.float32(_sigmoid(raw / frame_count))
+    winner = max(
+        best_by_keyword,
+        key=lambda index: (
+            best_by_keyword[index][0],
+            -index,
+        ),
+    )
+    keyword_score, hypothesis, match = best_by_keyword[winner]
+    raw_score = keyword_score - filler.acoustic_score
+    normalized_raw_score = raw_score / frame_count
+    confidence = _sigmoid(raw_score)
+    normalized_confidence = _sigmoid(normalized_raw_score)
+    # ``scores`` and the selected normalized confidence are calculated through
+    # the same formula; assign explicitly to avoid float32 tie surprises.
+    scores[winner] = np.float32(normalized_confidence)
+    top_score = float(scores[winner])
+    if scores.size == 1:
+        margin = 0.0
+    else:
+        margin = float(top_score - np.partition(scores, -2)[-2])
+
+    alignments = ctc_sequence_token_alignments(values, hypothesis.token_ids, blank_id=blank_id)
+    if not 0 <= match.token_start <= match.token_end < len(alignments):
+        raise RuntimeError("Contextual WUW match is outside its selected CTC token sequence")
+    start_frame = int(alignments[match.token_start].start_frame)
+    end_frame = int(alignments[match.token_end].end_frame)
+    if start_frame < 0 or end_frame < start_frame:
+        raise RuntimeError("Contextual WUW candidate has invalid token alignment boundaries")
+    return ContextualCtcCandidate(
+        keyword_index=winner,
+        scores=scores,
+        top_score=top_score,
+        margin=margin,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        candidate_frame=end_frame,
+        bonus=float(biases[winner].bonus),
+        acoustic_score=float(hypothesis.acoustic_score),
+        keyword_score=float(keyword_score),
+        filler_score=float(filler.acoustic_score),
+        raw_score=float(raw_score),
+        normalized_raw_score=float(normalized_raw_score),
+        confidence=float(confidence),
+        normalized_confidence=float(normalized_confidence),
+        segment_length=frame_count,
+        decoded_token_ids=hypothesis.token_ids,
+        filler_token_ids=filler.token_ids,
+        occurrence_token_start=match.token_start,
+        occurrence_token_end=match.token_end,
+        token_alignments=tuple(alignments),
+    )
+
+
 def best_ctc_candidate(
     log_probs: np.ndarray,
     keywords: Sequence[Keyword],
@@ -1764,6 +2382,11 @@ def generate_ctc_wac_feature_bundle(
     debug_alignments: bool = False,
     competitor_beam_size: int = 16,
     competitor_token_prune: int | None = 8,
+    candidate_search: str = "forced_keyword",
+    wuw_bias_tsv: Path | None = None,
+    contextual_beam_size: int = 16,
+    contextual_token_prune: int | None = 8,
+    contextual_lookahead: bool = True,
 ) -> dict[str, Any]:
     """Generate ragged candidate features and all stage-1 values.
 
@@ -1777,15 +2400,45 @@ def generate_ctc_wac_feature_bundle(
     output_file = output_file.resolve()
     paths = feature_bundle_paths(output_file)
     contract = Stage1Contract.from_json(contract_path)
+    mode = candidate_search.strip().lower()
+    if mode not in {"forced_keyword", "contextual_wuw_beam"}:
+        raise ValueError(
+            "candidate_search must be forced_keyword or contextual_wuw_beam, "
+            f"got {candidate_search!r}"
+        )
+    keywords = load_keywords(keywords_path, require_threshold=False)
+    biases: list[WuwBias] | None = None
+    contextual_bias_fingerprint: str | None = None
+    contextual_decoder_fingerprint: str | None = None
+    if mode == "contextual_wuw_beam":
+        if wuw_bias_tsv is None:
+            raise ValueError("contextual_wuw_beam requires wuw_bias_tsv")
+        biases = load_wuw_biases(Path(wuw_bias_tsv), keywords)
+        contextual_bias_fingerprint = wuw_bias_fingerprint(biases)
+        if int(contextual_beam_size) < 1:
+            raise ValueError("contextual_beam_size must be >= 1")
+        if contextual_token_prune is not None and int(contextual_token_prune) < 1:
+            raise ValueError("contextual_token_prune must be >= 1 when configured")
+        contextual_decoder_fingerprint = contextual_wuw_decoder_fingerprint(
+            biases,
+            beam_size=int(contextual_beam_size),
+            token_prune=contextual_token_prune,
+            lookahead=bool(contextual_lookahead),
+        )
     if not overwrite and feature_bundle_valid(
         output_file,
         expected_stage1_contract_fingerprint=contract.fingerprint(),
+        expected_contextual_wuw_bias_fingerprint=contextual_bias_fingerprint,
+        expected_contextual_wuw_decoder_fingerprint=contextual_decoder_fingerprint,
+        expected_candidate_search=mode,
         require_debug_alignments=debug_alignments,
     ):
         existing_summary = read_json(paths.summary)
-        if bool(existing_summary.get("debug_alignment_enabled")) == debug_alignments:
+        if (
+            bool(existing_summary.get("debug_alignment_enabled")) == debug_alignments
+            and existing_summary.get("candidate_search", "forced_keyword") == mode
+        ):
             return existing_summary
-    keywords = load_keywords(keywords_path, require_threshold=False)
     keyword_ids = {item.id for item in keywords}
     keyword_by_text = {item.display_text.strip().casefold(): item.id for item in keywords}
     if candidate_pre_margin_frames < 0 or candidate_post_margin_frames < 0:
@@ -1818,9 +2471,12 @@ def generate_ctc_wac_feature_bundle(
     offsets = [0]
     errors: list[dict[str, Any]] = []
     invalid_alignments: list[dict[str, Any]] = []
+    no_wuw_hypotheses: list[dict[str, Any]] = []
     debug_alignment_rows: list[dict[str, Any]] = []
     expected_keyword_counts = {item.id: 0 for item in keywords}
     expected_keyword_invalid_alignment_counts = {item.id: 0 for item in keywords}
+    expected_keyword_no_wuw_counts = {item.id: 0 for item in keywords}
+    no_wuw_hypothesis_rows = 0
     feature_dim: int | None = None
     input_duration_seconds = 0.0
     row = 0
@@ -1832,6 +2488,7 @@ def generate_ctc_wac_feature_bundle(
         expected_keyword_id: str | None,
         status: str,
         candidate: CtcCandidate | None = None,
+        contextual_candidate: ContextualCtcCandidate | None = None,
         token_alignments: list[CtcTokenAlignment] | None = None,
         keyword_vs_filler: CtcKeywordVsFillerScore | None = None,
     ) -> dict[str, Any]:
@@ -1845,6 +2502,45 @@ def generate_ctc_wac_feature_bundle(
             "status": status,
             "candidate": None,
         }
+        if contextual_candidate is not None:
+            keyword = keywords[contextual_candidate.keyword_index]
+            result["candidate"] = {
+                "decoder_mode": "contextual_wuw_beam",
+                "keyword_id": keyword.id,
+                "keyword_text": keyword.display_text,
+                "token_ids": list(keyword.token_ids),
+                "candidate_frame": contextual_candidate.candidate_frame,
+                "candidate_start_frame": contextual_candidate.start_frame,
+                "candidate_end_frame": contextual_candidate.end_frame,
+                "top_score": contextual_candidate.top_score,
+                "margin": contextual_candidate.margin,
+                "bonus": contextual_candidate.bonus,
+                "acoustic_score": contextual_candidate.acoustic_score,
+                "keyword_score": contextual_candidate.keyword_score,
+                "filler_score": contextual_candidate.filler_score,
+                "raw_score": contextual_candidate.raw_score,
+                "normalized_raw_score": contextual_candidate.normalized_raw_score,
+                "confidence": contextual_candidate.confidence,
+                "normalized_confidence": contextual_candidate.normalized_confidence,
+                "segment_length": contextual_candidate.segment_length,
+                "decoded_token_ids": list(contextual_candidate.decoded_token_ids),
+                "filler_token_ids": list(contextual_candidate.filler_token_ids),
+                "occurrence_token_start": contextual_candidate.occurrence_token_start,
+                "occurrence_token_end": contextual_candidate.occurrence_token_end,
+                "tokens": [
+                    {
+                        "token_index": item.token_index,
+                        "token_id": item.token_id,
+                        "start_frame": item.start_frame,
+                        "end_frame": item.end_frame,
+                        "frame_count": item.frame_count,
+                        "log_score": item.log_score,
+                        "normalized_score": item.normalized_score,
+                    }
+                    for item in contextual_candidate.token_alignments
+                ],
+            }
+            return result
         if candidate is None:
             return result
         keyword = keywords[candidate.keyword_index]
@@ -1940,27 +2636,104 @@ def generate_ctc_wac_feature_bundle(
                         raise RuntimeError(
                             f"stage-1 encoder dimension changed from {feature_dim} to {encoder.shape[1]}"
                         )
-                    candidate = best_ctc_candidate(
-                        ctc,
-                        keywords,
-                        blank_id=contract.blank_id,
-                        max_search_frames=max_search_frames,
-                    )
-                    token_alignments = (
-                        ctc_candidate_token_alignments(
+                    contextual_candidate: ContextualCtcCandidate | None = None
+                    forced_candidate: CtcCandidate | None = None
+                    token_alignments: list[CtcTokenAlignment] | None = None
+                    if mode == "contextual_wuw_beam":
+                        assert biases is not None
+                        contextual_candidate = best_contextual_ctc_candidate(
                             ctc,
-                            keywords[candidate.keyword_index].token_ids,
-                            candidate_start_frame=candidate.start_frame,
-                            candidate_end_frame=candidate.end_frame,
+                            biases,
                             blank_id=contract.blank_id,
+                            beam_size=int(contextual_beam_size),
+                            token_prune=contextual_token_prune,
+                            use_lookahead=bool(contextual_lookahead),
                         )
-                        if debug_alignments
-                        else None
-                    )
-                    crop_start = max(0, candidate.start_frame - int(candidate_pre_margin_frames))
+                        if contextual_candidate is None:
+                            no_wuw_hypothesis_rows += 1
+                            if expected_keyword_id is not None:
+                                expected_keyword_no_wuw_counts[expected_keyword_id] += 1
+                            no_wuw_hypotheses.append(
+                                {
+                                    "source_index": index,
+                                    "id": record.get("id"),
+                                    "path": str(path_value),
+                                    "expected_keyword_id": expected_keyword_id,
+                                    "confidence": 0.0,
+                                }
+                            )
+                            if debug_alignments:
+                                debug_row = debug_alignment_row(
+                                    record=record,
+                                    source_index=index,
+                                    expected_keyword_id=expected_keyword_id,
+                                    status="no_wuw_hypothesis",
+                                )
+                                debug_row["confidence"] = 0.0
+                                debug_row["normalized_confidence"] = 0.0
+                                debug_alignment_rows.append(debug_row)
+                            continue
+                        candidate_keyword_index = contextual_candidate.keyword_index
+                        candidate_frame = contextual_candidate.candidate_frame
+                        candidate_start_frame = contextual_candidate.start_frame
+                        candidate_end_frame = contextual_candidate.end_frame
+                        candidate_scores = contextual_candidate.scores
+                        candidate_top_score = contextual_candidate.top_score
+                        candidate_margin = contextual_candidate.margin
+                        selected_keyword_score = contextual_candidate.keyword_score
+                        selected_filler_score = contextual_candidate.filler_score
+                        selected_raw_score = contextual_candidate.raw_score
+                        selected_normalized_raw_score = contextual_candidate.normalized_raw_score
+                        selected_confidence = contextual_candidate.confidence
+                        selected_normalized_confidence = contextual_candidate.normalized_confidence
+                        selected_segment_length = contextual_candidate.segment_length
+                        selected_filler_token_ids = contextual_candidate.filler_token_ids
+                        token_alignments = list(contextual_candidate.token_alignments)
+                    else:
+                        forced_candidate = best_ctc_candidate(
+                            ctc,
+                            keywords,
+                            blank_id=contract.blank_id,
+                            max_search_frames=max_search_frames,
+                        )
+                        candidate_keyword_index = forced_candidate.keyword_index
+                        candidate_frame = forced_candidate.frame
+                        candidate_start_frame = forced_candidate.start_frame
+                        candidate_end_frame = forced_candidate.end_frame
+                        candidate_scores = forced_candidate.scores
+                        candidate_top_score = forced_candidate.top_score
+                        candidate_margin = forced_candidate.margin
+                        token_alignments = (
+                            ctc_candidate_token_alignments(
+                                ctc,
+                                keywords[candidate_keyword_index].token_ids,
+                                candidate_start_frame=candidate_start_frame,
+                                candidate_end_frame=candidate_end_frame,
+                                blank_id=contract.blank_id,
+                            )
+                            if debug_alignments
+                            else None
+                        )
+                        keyword_vs_filler = ctc_keyword_vs_filler_score(
+                            ctc[candidate_start_frame:candidate_end_frame + 1],
+                            keywords[candidate_keyword_index].token_ids,
+                            blank_id=contract.blank_id,
+                            beam_size=int(competitor_beam_size),
+                            token_prune=competitor_token_prune,
+                        )
+                        selected_keyword_score = keyword_vs_filler.keyword_score
+                        selected_filler_score = keyword_vs_filler.filler_score
+                        selected_raw_score = keyword_vs_filler.raw_score
+                        selected_normalized_raw_score = keyword_vs_filler.normalized_raw_score
+                        selected_confidence = keyword_vs_filler.confidence
+                        selected_normalized_confidence = keyword_vs_filler.normalized_confidence
+                        selected_segment_length = keyword_vs_filler.segment_length
+                        selected_filler_token_ids = keyword_vs_filler.filler_token_ids
+
+                    crop_start = max(0, candidate_start_frame - int(candidate_pre_margin_frames))
                     crop_end = min(
                         int(encoder.shape[0]),
-                        candidate.end_frame + 1 + int(candidate_post_margin_frames),
+                        candidate_end_frame + 1 + int(candidate_post_margin_frames),
                     )
                     if crop_start >= crop_end:
                         if expected_keyword_id is not None:
@@ -1972,8 +2745,8 @@ def generate_ctc_wac_feature_bundle(
                                 "path": str(path_value),
                                 "reason": "empty_candidate_crop",
                                 "expected_keyword_id": expected_keyword_id,
-                                "candidate_start_frame": candidate.start_frame,
-                                "candidate_end_frame": candidate.end_frame,
+                                "candidate_start_frame": candidate_start_frame,
+                                "candidate_end_frame": candidate_end_frame,
                             }
                         )
                         if debug_alignments:
@@ -1983,33 +2756,27 @@ def generate_ctc_wac_feature_bundle(
                                     source_index=index,
                                     expected_keyword_id=expected_keyword_id,
                                     status="empty_candidate_crop",
-                                    candidate=candidate,
+                                    candidate=forced_candidate,
+                                    contextual_candidate=contextual_candidate,
                                     token_alignments=token_alignments,
                                 )
                             )
                         continue
-                    keyword_vs_filler = ctc_keyword_vs_filler_score(
-                        ctc[candidate.start_frame:candidate.end_frame + 1],
-                        keywords[candidate.keyword_index].token_ids,
-                        blank_id=contract.blank_id,
-                        beam_size=int(competitor_beam_size),
-                        token_prune=competitor_token_prune,
-                    )
                     crop = np.asarray(encoder[crop_start:crop_end], dtype=np.float32)
                     crop.tofile(raw_handle)
                     candidate_length = int(crop.shape[0])
-                    score_rows.append(candidate.scores)
-                    top_rows.append(candidate.top_score)
-                    keyword_score_rows.append(keyword_vs_filler.keyword_score)
-                    filler_score_rows.append(keyword_vs_filler.filler_score)
-                    raw_score_rows.append(keyword_vs_filler.raw_score)
-                    normalized_raw_score_rows.append(keyword_vs_filler.normalized_raw_score)
-                    confidence_rows.append(keyword_vs_filler.confidence)
-                    normalized_confidence_rows.append(keyword_vs_filler.normalized_confidence)
-                    segment_length_rows.append(keyword_vs_filler.segment_length)
-                    margin_rows.append(candidate.margin)
+                    score_rows.append(candidate_scores)
+                    top_rows.append(candidate_top_score)
+                    keyword_score_rows.append(selected_keyword_score)
+                    filler_score_rows.append(selected_filler_score)
+                    raw_score_rows.append(selected_raw_score)
+                    normalized_raw_score_rows.append(selected_normalized_raw_score)
+                    confidence_rows.append(selected_confidence)
+                    normalized_confidence_rows.append(selected_normalized_confidence)
+                    segment_length_rows.append(selected_segment_length)
+                    margin_rows.append(candidate_margin)
                     onehot = np.zeros((len(keywords),), dtype=np.float32)
-                    onehot[candidate.keyword_index] = 1.0
+                    onehot[candidate_keyword_index] = 1.0
                     winner_rows.append(onehot)
                     lengths.append(candidate_length)
                     offsets.append(offsets[-1] + candidate_length)
@@ -2021,32 +2788,55 @@ def generate_ctc_wac_feature_bundle(
                             "path": str(path_value),
                             "label": record.get("label"),
                             "expected_keyword_id": expected_keyword_id,
-                            "keyword_id": keywords[candidate.keyword_index].id,
-                            "candidate_frame": candidate.frame,
-                            "candidate_start_frame": candidate.start_frame,
-                            "candidate_end_frame": candidate.end_frame,
+                            "keyword_id": keywords[candidate_keyword_index].id,
+                            "candidate_frame": candidate_frame,
+                            "candidate_start_frame": candidate_start_frame,
+                            "candidate_end_frame": candidate_end_frame,
                             "crop_start_frame": crop_start,
                             "crop_end_frame": crop_end,
                             "candidate_length_frames": candidate_length,
                             "candidate_duration_ms": candidate_length * contract.encoder_frame_shift_ms,
-                            "top_score": candidate.top_score,
-                            "normalized_ctc_score": candidate.top_score,
-                            "keyword_score": keyword_vs_filler.keyword_score,
-                            "filler_score": keyword_vs_filler.filler_score,
-                            "raw_score": keyword_vs_filler.raw_score,
-                            "normalized_raw_score": keyword_vs_filler.normalized_raw_score,
-                            "confidence": keyword_vs_filler.confidence,
-                            "normalized_confidence": keyword_vs_filler.normalized_confidence,
-                            "segment_length": keyword_vs_filler.segment_length,
-                            "filler_token_ids": list(keyword_vs_filler.filler_token_ids),
-                            "filler_method": "ctc_prefix_beam_best_nonkeyword",
-                            "competitor_beam_size": int(competitor_beam_size),
-                            "competitor_token_prune": (
-                                int(competitor_token_prune) if competitor_token_prune is not None else None
-                            ),
-                            "margin": candidate.margin,
+                            "top_score": candidate_top_score,
+                            "normalized_ctc_score": candidate_top_score,
+                            "keyword_score": selected_keyword_score,
+                            "filler_score": selected_filler_score,
+                            "raw_score": selected_raw_score,
+                            "normalized_raw_score": selected_normalized_raw_score,
+                            "confidence": selected_confidence,
+                            "normalized_confidence": selected_normalized_confidence,
+                            "segment_length": selected_segment_length,
+                            "filler_token_ids": list(selected_filler_token_ids),
+                            "margin": candidate_margin,
                         }
                     )
+                    if contextual_candidate is not None:
+                        rows[-1].update(
+                            {
+                                "decoder_mode": "contextual_wuw_beam",
+                                "normalized_contextual_confidence": candidate_top_score,
+                                "bonus": contextual_candidate.bonus,
+                                "acoustic_score": contextual_candidate.acoustic_score,
+                                "decoded_token_ids": list(contextual_candidate.decoded_token_ids),
+                                "occurrence_token_start": contextual_candidate.occurrence_token_start,
+                                "occurrence_token_end": contextual_candidate.occurrence_token_end,
+                                "filler_method": "contextual_ctc_beam_forbid_wuw",
+                                "contextual_beam_size": int(contextual_beam_size),
+                                "contextual_token_prune": (
+                                    int(contextual_token_prune) if contextual_token_prune is not None else None
+                                ),
+                                "contextual_lookahead": bool(contextual_lookahead),
+                            }
+                        )
+                    else:
+                        rows[-1].update(
+                            {
+                                "filler_method": "ctc_prefix_beam_best_nonkeyword",
+                                "competitor_beam_size": int(competitor_beam_size),
+                                "competitor_token_prune": (
+                                    int(competitor_token_prune) if competitor_token_prune is not None else None
+                                ),
+                            }
+                        )
                     if debug_alignments:
                         debug_alignment_rows.append(
                             debug_alignment_row(
@@ -2054,9 +2844,12 @@ def generate_ctc_wac_feature_bundle(
                                 source_index=index,
                                 expected_keyword_id=expected_keyword_id,
                                 status="ok",
-                                candidate=candidate,
+                                candidate=forced_candidate,
+                                contextual_candidate=contextual_candidate,
                                 token_alignments=token_alignments,
-                                keyword_vs_filler=keyword_vs_filler,
+                                keyword_vs_filler=(
+                                    keyword_vs_filler if forced_candidate is not None else None
+                                ),
                             )
                         )
                     row += 1
@@ -2166,26 +2959,55 @@ def generate_ctc_wac_feature_bundle(
             "keyword_token_fingerprint": keyword_token_fingerprint(keywords),
             "expected_keyword_counts": expected_keyword_counts,
             "expected_keyword_invalid_alignment_counts": expected_keyword_invalid_alignment_counts,
+            "expected_keyword_no_wuw_counts": expected_keyword_no_wuw_counts,
             "stage1_contract_fingerprint": contract.fingerprint(),
             "stage1_model": str(model_path),
             "stage1_contract": str(contract_path),
             "keyword_tokens": str(keywords_path),
             "stage1_providers": stage1.providers,
             "sample_rate": contract.sample_rate,
-            "score_domain": "normalized_log_probability",
-            "keyword_vs_filler": {
-                "filler_method": "ctc_prefix_beam_best_nonkeyword",
-                "keyword_score_domain": "ctc_forward_log_probability",
-                "filler_score_domain": "ctc_forward_log_probability",
-                "raw_score_domain": "keyword_score_minus_filler_score",
-                "normalized_raw_score_domain": "raw_score_per_selected_candidate_encoder_frame",
-                "confidence_domain": "sigmoid(keyword_score_minus_filler_score)",
-                "normalized_confidence_domain": "sigmoid(raw_score_per_selected_candidate_encoder_frame)",
-                "competitor_beam_size": int(competitor_beam_size),
-                "competitor_token_prune": (
-                    int(competitor_token_prune) if competitor_token_prune is not None else None
-                ),
-            },
+            "candidate_search": mode,
+            "score_domain": (
+                "normalized_contextual_wuw_confidence"
+                if mode == "contextual_wuw_beam"
+                else "normalized_log_probability"
+            ),
+            "contextual_wuw_bias_tsv": str(wuw_bias_tsv) if wuw_bias_tsv is not None else None,
+            "contextual_wuw_bias_fingerprint": contextual_bias_fingerprint,
+            "contextual_wuw_decoder_fingerprint": contextual_decoder_fingerprint,
+            "keyword_vs_filler": (
+                {
+                    "filler_method": "contextual_ctc_beam_forbid_wuw",
+                    "keyword_score_domain": "contextual_ctc_prefix_beam_acoustic_score_plus_completion_bonus",
+                    "filler_score_domain": "contextual_ctc_prefix_beam_acoustic_score_without_complete_wuw",
+                    "raw_score_domain": "keyword_score_minus_filler_score",
+                    "normalized_raw_score_domain": "raw_score_per_full_ctc_window_frame",
+                    "confidence_domain": "sigmoid(keyword_score_minus_filler_score)",
+                    "normalized_confidence_domain": "sigmoid(raw_score_per_full_ctc_window_frame)",
+                    "all_scores_domain": "per_keyword_normalized_contextual_confidence",
+                    "contextual_beam_size": int(contextual_beam_size),
+                    "contextual_token_prune": (
+                        int(contextual_token_prune) if contextual_token_prune is not None else None
+                    ),
+                    "contextual_lookahead": bool(contextual_lookahead),
+                    "completion_bonus_only": True,
+                    "repeat_bonus_policy": "best_single_occurrence",
+                }
+                if mode == "contextual_wuw_beam"
+                else {
+                    "filler_method": "ctc_prefix_beam_best_nonkeyword",
+                    "keyword_score_domain": "ctc_forward_log_probability",
+                    "filler_score_domain": "ctc_forward_log_probability",
+                    "raw_score_domain": "keyword_score_minus_filler_score",
+                    "normalized_raw_score_domain": "raw_score_per_selected_candidate_encoder_frame",
+                    "confidence_domain": "sigmoid(keyword_score_minus_filler_score)",
+                    "normalized_confidence_domain": "sigmoid(raw_score_per_selected_candidate_encoder_frame)",
+                    "competitor_beam_size": int(competitor_beam_size),
+                    "competitor_token_prune": (
+                        int(competitor_token_prune) if competitor_token_prune is not None else None
+                    ),
+                }
+            ),
             "encoder_frame_shift_ms": contract.encoder_frame_shift_ms,
             "input_count": len(records),
             "input_duration_seconds": input_duration_seconds,
@@ -2194,6 +3016,8 @@ def generate_ctc_wac_feature_bundle(
             "debug_alignment_rows": len(debug_alignment_rows) if debug_alignments else 0,
             "invalid_alignment_rows": len(invalid_alignments),
             "invalid_alignments": invalid_alignments[:50],
+            "no_wuw_hypothesis_rows": no_wuw_hypothesis_rows,
+            "no_wuw_hypotheses": no_wuw_hypotheses[:50],
             "candidate_pre_margin_frames": int(candidate_pre_margin_frames),
             "candidate_post_margin_frames": int(candidate_post_margin_frames),
             "max_search_frames": int(max_search_frames) if max_search_frames is not None else None,
