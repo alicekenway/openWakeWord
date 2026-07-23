@@ -3338,7 +3338,15 @@ def load_stage2_onnx(path: Path) -> tuple[Any, dict[str, tuple[int | None, ...]]
         import onnxruntime as ort
     except ImportError as exc:
         raise RuntimeError("onnxruntime is required for CTC-WAC evaluation") from exc
-    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    # The test pipeline commonly runs one Slurm-array task per allocated CPU.
+    # Letting ONNX Runtime use its default thread pool here can oversubscribe a
+    # node heavily and emits affinity warnings under cpuset-based Slurm jobs.
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = _onnx_intra_op_threads()
+    options.inter_op_num_threads = 1
+    session = ort.InferenceSession(
+        str(path), sess_options=options, providers=["CPUExecutionProvider"]
+    )
     expected = {"encoder_features", "frame_mask", "top_score", "margin", "winner_onehot"}
     available = {item.name: item for item in session.get_inputs()}
     missing = sorted(expected - set(available))
