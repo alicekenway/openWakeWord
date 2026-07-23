@@ -426,7 +426,16 @@ def _ctc_wac_record(
     cached_comparisons: list[Any | None] = [None] * len(keywords)
     emitted_keys: list[tuple[int, int, int] | None] = [None] * len(keywords)
     candidates: list[dict[str, Any]] = []
-    for index in range(score_traces.shape[0]):
+    frame_count = int(score_traces.shape[0])
+    # Add one synthetic end-of-stream iteration. During ordinary streaming we
+    # wait for a frame after the final non-blank keyword token so that a token
+    # extension is not emitted prematurely. A finite audio clip may end on
+    # that token, however, so no following frame will ever arrive. Reusing the
+    # last score row once at EOF flushes that valid candidate and matches the
+    # offline feature-mining behavior.
+    for stream_index in range(frame_count + 1):
+        finalized_at_eof = stream_index == frame_count
+        index = min(stream_index, frame_count - 1)
         row = score_traces[index:index + 1]
         top, margin, winner = rank_keyword_scores(row)
         winner_index = int(winner[0])
@@ -448,7 +457,7 @@ def _ctc_wac_record(
                 float(top[0]) >= ctc_proposal_score_floor
                 and start_frame >= 0
                 and end_frame >= start_frame
-                and end_frame < index
+                and end_frame < stream_index
             ):
                 candidate_key = (winner_index, start_frame, end_frame)
                 if cached_keys[winner_index] != candidate_key:
@@ -501,6 +510,7 @@ def _ctc_wac_record(
             {
                 "keyword_id": keywords[winner_index].id,
                 "trigger_frame": index,
+                "finalized_at_eof": finalized_at_eof,
                 "candidate_start_frame": start_frame,
                 "candidate_end_frame": end_frame,
                 "crop_start_frame": crop_start,
