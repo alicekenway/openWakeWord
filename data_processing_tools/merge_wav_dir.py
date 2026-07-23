@@ -173,6 +173,15 @@ def parse_args() -> argparse.Namespace:
         help="Minimum target duration per merged WAV, in seconds",
     )
     parser.add_argument(
+        "--max-output-files",
+        type=int,
+        default=None,
+        help=(
+            "Optional upper limit on merged WAV files to write. "
+            "For example, --max-output-files 10 writes only the first 10 groups."
+        ),
+    )
+    parser.add_argument(
         "--absolute-paths",
         action="store_true",
         help="Write absolute WAV paths in metadata.jsonl instead of paths relative to --output-dir",
@@ -196,6 +205,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError(f"--wav-dir is not a directory: {wav_dir}")
     if not math.isfinite(args.length) or args.length <= 0:
         raise ValueError("--length must be a finite number greater than 0")
+    if args.max_output_files is not None and args.max_output_files < 1:
+        raise ValueError("--max-output-files must be an integer greater than 0")
 
     excluded_dir = output_wav_dir if output_wav_dir.is_relative_to(wav_dir) else None
     wav_paths = collect_wavs(wav_dir, excluded_dir)
@@ -205,7 +216,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     wavs = [inspect_wav(path) for path in wav_paths]
     wav_format = validate_formats(wavs)
     target_frames = math.ceil(args.length * wav_format.sample_rate)
-    groups = group_wavs(wavs, target_frames)
+    all_groups = group_wavs(wavs, target_frames)
+    groups = all_groups[:args.max_output_files] if args.max_output_files is not None else all_groups
     output_paths = [output_wav_dir / f"merged_{index:08d}.wav" for index in range(len(groups))]
 
     previous_merged_outputs = sorted(output_wav_dir.glob("merged_*.wav"))
@@ -240,6 +252,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             stale_path.unlink()
 
     total_input_frames = sum(wav.frames for wav in wavs)
+    merged_input_frames = sum(wav.frames for group in groups for wav in group)
     summary: dict[str, object] = {
         "input_wav_dir": str(wav_dir),
         "output_dir": str(output_dir),
@@ -251,7 +264,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "sample_width_bytes": wav_format.sample_width,
         "input_wav_files": len(wavs),
         "input_duration_seconds": round(total_input_frames / wav_format.sample_rate, 3),
+        "merged_input_wav_files": sum(len(group) for group in groups),
+        "merged_input_duration_seconds": round(merged_input_frames / wav_format.sample_rate, 3),
         "merged_wav_files": len(groups),
+        "max_output_files": args.max_output_files,
+        "output_limit_reached": len(groups) < len(all_groups),
         "written_rows": written_rows,
         "output_durations_seconds": [round(duration, 3) for duration in output_durations],
         "final_output_below_target": bool(output_durations and output_durations[-1] < args.length),
