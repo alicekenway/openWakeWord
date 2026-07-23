@@ -171,6 +171,20 @@ def test_manifest_normalization_replaces_duplicate_audio_paths(tmp_path: Path) -
     assert record["vad_trim"]["threshold"] == 0.5
 
 
+def test_manifest_normalization_accepts_nemo_audio_filepath(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.wav"
+    audio.touch()
+    manifest = tmp_path / "input.jsonl"
+    write_jsonl(manifest, [{"audio_filepath": str(audio), "text": "not a wake word"}])
+    output = tmp_path / "normalized.jsonl"
+
+    normalise_manifest_inputs([ManifestInput(manifest, None)], output)
+
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["path"] == str(audio.resolve())
+    assert "audio_filepath" not in record
+
+
 def test_probability_bce_disables_autocast_and_uses_float32() -> None:
     predictions = torch.tensor([0.8, 0.2], dtype=torch.bfloat16, requires_grad=True)
     labels = torch.tensor([1.0, 0.0], dtype=torch.bfloat16)

@@ -13,7 +13,18 @@ from typing import Any, Iterable
 from .config import ConfigurationError, IniConfig, parse_json
 
 
-AUDIO_PATH_KEYS = ("path", "audiofile_path", "audio_file", "audio_path", "file", "filename")
+# ``audio_filepath`` is used by NeMo/GigaSpeech-style manifests.  Keep the
+# canonical ``path`` first so records containing both fields retain the
+# pipeline's explicitly generated path.
+AUDIO_PATH_KEYS = (
+    "path",
+    "audio_filepath",
+    "audiofile_path",
+    "audio_file",
+    "audio_path",
+    "file",
+    "filename",
+)
 
 
 def replace_audio_path(record: dict[str, Any], value: str | Path) -> dict[str, Any]:

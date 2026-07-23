@@ -486,9 +486,10 @@ audio path field:
 {"path": "wav/000000000.wav", "text": "Hey Siri"}
 ```
 
-New output uses exactly one canonical `path` field. Readers also accept the
-legacy keys `audiofile_path`, `audio_file`, `audio_path`, `file`, and
-`filename` so older source datasets remain usable.
+New output uses exactly one canonical `path` field. Readers also accept
+`audio_filepath` (the NeMo/GigaSpeech manifest convention) and the legacy
+keys `audiofile_path`, `audio_file`, `audio_path`, `file`, and `filename` so
+older source datasets remain usable.
 
 In a config file, each dataset can be either a single JSONL path:
 

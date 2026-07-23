@@ -53,7 +53,15 @@ DEFAULT_SR = 16000
 DEFAULT_IO_WORKERS = max(1, min(8, os.cpu_count() or 2))
 DEFAULT_IO_CHUNKSIZE = 64
 VALID_PLACEMENTS = {"start", "end", "center", "random"}
-AUDIO_PATH_KEYS = ("path", "audiofile_path", "audio_file", "audio_path", "file", "filename")
+AUDIO_PATH_KEYS = (
+    "path",
+    "audio_filepath",
+    "audiofile_path",
+    "audio_file",
+    "audio_path",
+    "file",
+    "filename",
+)
 EVALUATION_DEFAULTS: dict[str, Any] = {
     "threshold": 0.5,
     "debounce_seconds": 1.0,
