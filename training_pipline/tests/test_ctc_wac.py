@@ -1038,6 +1038,31 @@ def test_bundle_keeps_all_rows_but_loader_applies_stage1_threshold(tmp_path: Pat
     assert changed_loaded.retained_count == 0
 
 
+def test_bundle_loader_can_gate_with_normalized_confidence(tmp_path: Path) -> None:
+    keywords_path = _keyword_file(tmp_path)
+    bundle = tmp_path / "features.npy"
+    _write_bundle(bundle, label=1, keywords_path=keywords_path, seed=7)
+    confidence_thresholds = tmp_path / "keywords_confidence_threshold.json"
+    write_json(
+        confidence_thresholds,
+        {
+            "keywords": [
+                {"id": "wake_a", "display_text": "wake a", "token_ids": [1, 2], "threshold": 0.5},
+                {"id": "wake_b", "display_text": "wake b", "token_ids": [2, 1], "threshold": 0.5},
+            ]
+        },
+    )
+    block = FeatureBlock("feature.positive", bundle, 1, "train", (6, 5), 4)
+    loaded = CtcWacFeatureBlock.from_feature_block(
+        block,
+        load_keywords(confidence_thresholds),
+        stage1_gate_score="normalized_confidence",
+    )
+    # sigmoid(raw_score / segment_length) is above .5 for rows zero and two.
+    assert loaded.retained_indices.tolist() == [0, 2]
+    assert loaded.filtering_summary()["stage1_gate_score"] == "normalized_confidence"
+
+
 def test_cascade_record_feeds_all_masked_wac_inputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     keywords_path = _keyword_file(tmp_path)
     keywords = load_keywords(keywords_path)
@@ -1197,8 +1222,10 @@ def test_stage1_report_summarizes_ragged_candidate_scores(tmp_path: Path) -> Non
     negative = tmp_path / "negative.npy"
     _write_bundle(positive, label=1, keywords_path=keywords_path, seed=1)
     _write_bundle(negative, label=0, keywords_path=keywords_path, seed=2)
-    # Make a non-winning keyword pass the threshold in both sets. The report
-    # must count only the argmax winner, rather than every passing score.
+    # Make a non-winning keyword pass the threshold in both sets. A positive
+    # clip only needs its selected winner to pass, regardless of which keyword
+    # was expected. A negative clip is still attributed only to its argmax
+    # winner, rather than to every passing score.
     positive_paths = feature_bundle_paths(positive)
     positive_scores = np.load(positive_paths.all_scores)
     positive_scores[3] = np.asarray([-1.0, -1.5], dtype=np.float32)
@@ -1255,7 +1282,7 @@ normalized_confidence_threshold_step = 0.5
     )
     PipelineRunner(load_ini_config(config)).run()
     payload = json.loads((tmp_path / "experiment" / "report.json").read_text(encoding="utf-8"))
-    assert payload["report_schema"] == 5
+    assert payload["report_schema"] == 6
     positive_tables = payload["blocks"][0]["score_tables"]
     negative_tables = payload["blocks"][1]["score_tables"]
     positive_table = positive_tables["normalized_ctc_score"]["threshold_table"]
@@ -1265,8 +1292,8 @@ normalized_confidence_threshold_step = 0.5
     negative_at_zero = next(item for item in negative_table if item["threshold"] == 0.0)
     assert positive_at_minus_two["keywords"]["wake_a"]["accuracy"] == 1.0
     assert positive_at_minus_two["keywords"]["wake_a"]["false_rejection_rate"] == 0.0
-    assert positive_at_minus_two["keywords"]["wake_b"]["accuracy"] == 0.5
-    assert positive_at_minus_two["keywords"]["wake_b"]["false_rejection_rate"] == 0.5
+    assert positive_at_minus_two["keywords"]["wake_b"]["accuracy"] == 1.0
+    assert positive_at_minus_two["keywords"]["wake_b"]["false_rejection_rate"] == 0.0
     assert negative_at_minus_two["keywords"]["wake_a"]["false_accepts_per_hour"] == 2.0
     assert negative_at_minus_two["keywords"]["wake_b"]["false_accepts_per_hour"] == 1.0
     assert negative_at_minus_two["keywords"]["wake_a"]["false_accept_rate"] == 0.5
@@ -1281,7 +1308,11 @@ normalized_confidence_threshold_step = 0.5
     assert negative_at_zero["keywords"]["wake_b"]["false_accept_share"] is None
     assert positive_at_minus_two["overall"]["false_rejections"] == 0
     assert positive_at_minus_two["overall"]["false_rejection_rate"] == 0.0
-    assert positive_at_minus_two["overall"]["wrong_keyword_passes"] == 1
+    assert "wrong_keyword_passes" not in positive_at_minus_two["overall"]
+    assert (
+        positive_tables["normalized_ctc_score"]["metric"]
+        == "per_expected_keyword_any_hit_accuracy_and_false_rejection_rate"
+    )
     positive_confidence_at_half = next(
         item for item in positive_tables["confidence"]["threshold_table"] if item["threshold"] == 0.5
     )
@@ -1299,9 +1330,9 @@ normalized_confidence_threshold_step = 0.5
     assert positive_confidence_at_half["overall"]["false_rejections"] == 2
     assert positive_confidence_at_half["overall"]["false_rejection_rate"] == 0.5
     markdown = (tmp_path / "experiment" / "report.md").read_text(encoding="utf-8")
-    assert "No-pass FR" in markdown
+    assert "Any-hit Acc / No-hit FR" in markdown
     assert "Total FA/h" in markdown
-    assert "share of FAs" in markdown
+    assert "FAs / FA/h" in markdown
     assert "Keyword-versus-filler confidence" in markdown
     assert "Length-normalized keyword-versus-filler confidence" in markdown
     assert "quantile" not in markdown.lower()

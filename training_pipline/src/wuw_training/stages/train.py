@@ -52,6 +52,17 @@ def _ctc_wac_keywords_path(ctx: Any) -> Path:
     return ctx.config.resolve_path(require(ctx.section, "keywords", ctx.step))
 
 
+def _ctc_wac_stage1_gate_score(ctx: Any) -> str:
+    """Return the per-row score scale used for the Stage-1 training gate."""
+
+    value = ctx.section.get("stage1_gate_score", "normalized_ctc_score").strip().lower()
+    allowed = {"normalized_ctc_score", "confidence", "normalized_confidence"}
+    if value not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ConfigurationError(f"[{ctx.step}] stage1_gate_score must be one of {choices}, got {value!r}")
+    return value
+
+
 def _feature_block(ctx: Any, name: str) -> FeatureBlock:
     if not name.startswith("feature."):
         raise ConfigurationError(f"[{ctx.step}] feature reference must name a feature.* block, got {name!r}")
@@ -391,6 +402,7 @@ def _validate_ctc_wac(ctx: Any) -> None:
     if not keywords_path.is_file():
         raise ConfigurationError(f"[{ctx.step}] keywords does not exist: {keywords_path}")
     load_keywords(keywords_path)
+    _ctc_wac_stage1_gate_score(ctx)
     ctc_wac_model_config(ctx.section, section_name=ctx.step)
     _phase_plan(ctx)
     if number(ctx.section, "max_negative_weight", ctx.step, 1.0) < 1:
@@ -1496,10 +1508,17 @@ class CtcWacTrainer:
 def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
     keywords_path = _ctc_wac_keywords_path(ctx)
     keywords = load_keywords(keywords_path)
+    stage1_gate_score = _ctc_wac_stage1_gate_score(ctx)
     train_feature_blocks = _blocks(ctx, "train")
     validation_feature_blocks = _validation_blocks(ctx)
-    train_blocks = [CtcWacFeatureBlock.from_feature_block(block, keywords) for block in train_feature_blocks]
-    validation_blocks = [CtcWacFeatureBlock.from_feature_block(block, keywords) for block in validation_feature_blocks]
+    train_blocks = [
+        CtcWacFeatureBlock.from_feature_block(block, keywords, stage1_gate_score=stage1_gate_score)
+        for block in train_feature_blocks
+    ]
+    validation_blocks = [
+        CtcWacFeatureBlock.from_feature_block(block, keywords, stage1_gate_score=stage1_gate_score)
+        for block in validation_feature_blocks
+    ]
     for group_name, blocks in (("train", train_blocks), ("dev", validation_blocks)):
         for label in (0, 1):
             retained = sum(block.retained_count for block in blocks if block.label == label)

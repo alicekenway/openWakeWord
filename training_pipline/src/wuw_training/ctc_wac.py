@@ -2024,23 +2024,35 @@ def retained_stage1_indices(
     scores: np.ndarray,
     keywords: Sequence[Keyword],
     *,
+    gate_scores: np.ndarray | None = None,
     chunk_rows: int = 65536,
 ) -> np.ndarray:
     """Return gated row IDs without materializing a large score memory-map.
 
     A background corpus can contain millions of fixed windows.  The artifact
-    stays on disk, so filtering must also stay bounded in memory.
+    stays on disk, so filtering must also stay bounded in memory. The winning
+    keyword always comes from ``scores``. By default, its normalized CTC score
+    is compared with the keyword threshold. Callers may instead provide one
+    scalar gate score per row, such as ``normalized_confidence``.
     """
 
     if scores.ndim != 2 or scores.shape[1] != len(keywords):
         raise ValueError("Score columns do not match the keyword configuration")
+    if gate_scores is not None:
+        if gate_scores.ndim not in {1, 2} or (gate_scores.ndim == 2 and gate_scores.shape[1] != 1):
+            raise ValueError("Stage-1 gate scores must have shape [N] or [N, 1]")
+        if gate_scores.shape[0] != scores.shape[0]:
+            raise ValueError("Stage-1 gate scores do not match CTC score rows")
     thresholds = np.asarray([item.threshold for item in keywords], dtype=np.float32)
     kept: list[np.ndarray] = []
     for start in range(0, int(scores.shape[0]), max(1, int(chunk_rows))):
         values = np.asarray(scores[start:start + chunk_rows], dtype=np.float32)
         winner = np.argmax(values, axis=1)
-        top = values[np.arange(values.shape[0]), winner]
-        local = np.flatnonzero(top >= thresholds[winner]).astype(np.int64)
+        if gate_scores is None:
+            selected_scores = values[np.arange(values.shape[0]), winner]
+        else:
+            selected_scores = np.asarray(gate_scores[start:start + values.shape[0]], dtype=np.float32).reshape(-1)
+        local = np.flatnonzero(selected_scores >= thresholds[winner]).astype(np.int64)
         if local.size:
             kept.append(local + start)
     return np.concatenate(kept) if kept else np.empty((0,), dtype=np.int64)
@@ -3066,10 +3078,17 @@ class CtcWacFeatureBlock:
     top_score: np.ndarray
     margin: np.ndarray
     winner_onehot_values: np.ndarray
+    stage1_gate_score: str
     retained_indices: np.ndarray
 
     @classmethod
-    def from_feature_block(cls, block: Any, keywords: Sequence[Keyword]) -> "CtcWacFeatureBlock":
+    def from_feature_block(
+        cls,
+        block: Any,
+        keywords: Sequence[Keyword],
+        *,
+        stage1_gate_score: str = "normalized_ctc_score",
+    ) -> "CtcWacFeatureBlock":
         if not feature_bundle_valid(block.path):
             raise ConfigurationError(
                 f"[{block.name}] is not a valid CTC-WAC feature bundle; run its wenet_ctc_wac feature stage first"
@@ -3088,6 +3107,18 @@ class CtcWacFeatureBlock:
         top = np.load(paths.top_score, mmap_mode="r")
         margin = np.load(paths.margin, mmap_mode="r")
         onehot = np.load(paths.winner_onehot, mmap_mode="r")
+        gate_paths = {
+            "normalized_ctc_score": paths.top_score,
+            "confidence": paths.confidence,
+            "normalized_confidence": paths.normalized_confidence,
+        }
+        try:
+            gate_values = np.load(gate_paths[stage1_gate_score], mmap_mode="r")
+        except KeyError as exc:
+            choices = ", ".join(sorted(gate_paths))
+            raise ConfigurationError(
+                f"[{block.name}] unknown stage-1 gate score {stage1_gate_score!r}; choose one of {choices}"
+            ) from exc
         return cls(
             name=block.name,
             label=int(block.label),
@@ -3100,7 +3131,8 @@ class CtcWacFeatureBlock:
             top_score=top,
             margin=margin,
             winner_onehot_values=onehot,
-            retained_indices=retained_stage1_indices(scores, keywords),
+            stage1_gate_score=stage1_gate_score,
+            retained_indices=retained_stage1_indices(scores, keywords, gate_scores=gate_values),
         )
 
     @property
@@ -3155,11 +3187,12 @@ class CtcWacFeatureBlock:
             np.full(selected.shape[0], self.label, dtype=np.float32),
         )
 
-    def filtering_summary(self) -> dict[str, int]:
+    def filtering_summary(self) -> dict[str, int | str]:
         return {
             "input_rows": self.input_count,
             "retained_rows": self.retained_count,
             "dropped_rows": self.input_count - self.retained_count,
+            "stage1_gate_score": self.stage1_gate_score,
             "min_retained_frames": int(np.min(self.lengths[self.retained_indices])) if self.retained_count else 0,
             "max_retained_frames": int(np.max(self.lengths[self.retained_indices])) if self.retained_count else 0,
         }

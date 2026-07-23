@@ -218,7 +218,7 @@ def validate_outputs(ctx: Any) -> bool:
         return False
     try:
         payload = read_json(output_json)
-        return payload.get("report_schema") == 5 and "Stage-1 Threshold Tables" in output_report.read_text(
+        return payload.get("report_schema") == 6 and "Stage-1 Threshold Tables" in output_report.read_text(
             encoding="utf-8"
         )
     except Exception:
@@ -335,7 +335,6 @@ def _positive_table(
     keyword_ids: list[str],
     summary: dict[str, Any],
     thresholds: list[float],
-    winners: np.ndarray,
     selected_scores: np.ndarray,
 ) -> dict[str, Any]:
     rows_by_keyword, expected_counts = _positive_rows(
@@ -345,11 +344,6 @@ def _positive_table(
         keyword_ids=keyword_ids,
         summary=summary,
     )
-    expected_columns = np.full(scores.shape[0], -1, dtype=np.int64)
-    for column, keyword_id in enumerate(keyword_ids):
-        expected_columns[rows_by_keyword[keyword_id]] = column
-    if np.any(expected_columns < 0):
-        raise RuntimeError(f"{block.name} positive rows are missing an expected keyword column")
     total_expected_rows = sum(expected_counts.values())
     table: list[dict[str, Any]] = []
     for threshold in thresholds:
@@ -359,16 +353,14 @@ def _positive_table(
         # alignments have no row and count as a no-pass false rejection.
         any_keyword_passes = int(np.count_nonzero(passes))
         no_keyword_passes = total_expected_rows - any_keyword_passes
-        wrong_keyword_passes = int(np.count_nonzero(passes & (winners != expected_columns)))
         values: dict[str, Any] = {}
-        for column, keyword_id in enumerate(keyword_ids):
+        for keyword_id in keyword_ids:
             total = expected_counts[keyword_id]
             rows = rows_by_keyword[keyword_id]
-            accepted = (
-                int(np.count_nonzero((winners[rows] == column) & (selected_scores[rows] >= threshold)))
-                if rows.size
-                else 0
-            )
+            # Stage 1 is a binary wake-word candidate detector.  Attribute a
+            # passed candidate to the source clip's expected keyword even when
+            # another keyword won the Stage-1 search.
+            accepted = int(np.count_nonzero(passes[rows])) if rows.size else 0
             false_rejections = total - accepted
             values[keyword_id] = {
                 "expected_rows": total,
@@ -387,16 +379,12 @@ def _positive_table(
                     "false_rejection_rate": (
                         no_keyword_passes / total_expected_rows if total_expected_rows else None
                     ),
-                    "wrong_keyword_passes": wrong_keyword_passes,
-                    "wrong_keyword_pass_rate": (
-                        wrong_keyword_passes / total_expected_rows if total_expected_rows else None
-                    ),
                 },
                 "keywords": values,
             }
         )
     return {
-        "metric": "per_keyword_false_rejection_and_no_keyword_pass_false_rejection_rate",
+        "metric": "per_expected_keyword_any_hit_accuracy_and_false_rejection_rate",
         "expected_keyword_rows": expected_counts,
         "expected_rows": total_expected_rows,
         "threshold_table": table,
@@ -503,7 +491,6 @@ def _score_table(
                 keyword_ids=keyword_ids,
                 summary=summary,
                 thresholds=thresholds,
-                winners=winners,
                 selected_scores=selected_scores,
             ),
         }
@@ -576,10 +563,9 @@ def _markdown(payload: dict[str, Any]) -> str:
             "Each score below only decides whether that already-selected candidate passes its threshold."
         ),
         (
-            "For positives, each keyword FR uses only that keyword's expected examples. A wrong winner or a "
-            "below-threshold winner is an FR for that expected keyword. `No-pass FR` is separate: it counts a "
-            "case only when its selected stage-1 candidate did not pass; a wrong keyword that passed is shown "
-            "separately."
+            "For positives, Stage 1 is evaluated as a binary wake-word candidate detector. Each keyword column "
+            "uses that ground-truth keyword's examples, and any selected keyword above the threshold is a hit. "
+            "A passed different keyword is therefore correct, not an FR."
         ),
         (
             "For negatives, `Total FA/h` and `Total FA rate` use all input clips in the block. Each negative "
@@ -609,29 +595,28 @@ def _markdown(payload: dict[str, Any]) -> str:
                     [
                         "Positive set. Each per-keyword denominator is shown in its column header.",
                         "",
-                        "| Threshold | No-pass FR (n="
-                        + str(total)
-                        + ") | Wrong-keyword pass (n="
+                        "| Threshold | Any-hit Acc / No-hit FR (n="
                         + str(total)
                         + ") | "
                         + " | ".join(
-                            f"{keyword_id} (FR; n={counts[keyword_id]})" for keyword_id in keyword_ids
+                            f"{keyword_id} (Acc / FR; n={counts[keyword_id]})" for keyword_id in keyword_ids
                         )
                         + " |",
-                        "| ---: | " + " | ".join("---:" for _ in range(len(keyword_ids) + 2)) + " |",
+                        "| ---: | " + " | ".join("---:" for _ in range(len(keyword_ids) + 1)) + " |",
                     ]
                 )
                 for threshold_row in score_table["threshold_table"]:
                     overall = threshold_row["overall"]
                     cells = [
-                        f"{overall['false_rejections']} / "
-                        f"{_format_percent(overall['false_rejection_rate'])}",
-                        f"{overall['wrong_keyword_passes']} / "
-                        f"{_format_percent(overall['wrong_keyword_pass_rate'])}",
+                        f"{_format_percent(1.0 - overall['false_rejection_rate'])} / "
+                        f"{overall['false_rejections']} ({_format_percent(overall['false_rejection_rate'])})",
                     ]
                     for keyword_id in keyword_ids:
                         value = threshold_row["keywords"][keyword_id]
-                        cells.append(f"{value['false_rejections']} / {_format_percent(value['false_rejection_rate'])}")
+                        cells.append(
+                            f"{_format_percent(value['accuracy'])} / "
+                            f"{value['false_rejections']} ({_format_percent(value['false_rejection_rate'])})"
+                        )
                     lines.append(f"| {threshold_row['threshold']:.6g} | " + " | ".join(cells) + " |")
             else:
                 duration = score_table["input_duration_seconds"] / 3600.0
@@ -640,7 +625,7 @@ def _markdown(payload: dict[str, Any]) -> str:
                         f"Negative set. Source duration: {duration:.6f} h.",
                         "",
                         "| Threshold | Total FAs | Total FA/h | Total FA rate | "
-                        + " | ".join(f"{keyword_id} (share of FAs)" for keyword_id in keyword_ids)
+                        + " | ".join(f"{keyword_id} (FAs / FA/h)" for keyword_id in keyword_ids)
                         + " |",
                         "| ---: | ---: | ---: | ---: | " + " | ".join("---:" for _ in keyword_ids) + " |",
                     ]
@@ -654,7 +639,7 @@ def _markdown(payload: dict[str, Any]) -> str:
                     ]
                     for keyword_id in keyword_ids:
                         value = threshold_row["keywords"][keyword_id]
-                        cells.append(f"{value['false_accepts']} / {_format_percent(value['false_accept_share'])}")
+                        cells.append(f"{value['false_accepts']} / {value['false_accepts_per_hour']:.4f}")
                     lines.append(f"| {threshold_row['threshold']:.6g} | " + " | ".join(cells) + " |")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -663,7 +648,7 @@ def run(ctx: Any) -> dict[str, Any]:
     score_thresholds = _score_thresholds(ctx)
     blocks = [_block_payload(block, score_thresholds) for block in _blocks(ctx)]
     payload = {
-        "report_schema": 5,
+        "report_schema": 6,
         # Keep the original field temporarily for readers that only consume
         # the existing normalized CTC score.
         "threshold_sweep": _threshold_sweep(score_thresholds["normalized_ctc_score"]),

@@ -159,17 +159,20 @@ found by prefix beam search on exactly the same candidate frames.
 `[stage1_report]` writes threshold-by-keyword tables before any filtering.
 Each row has one selected stage-1 keyword: the highest-scoring keyword for
 that candidate. Positive tables give each keyword's FR using only that
-keyword's expected examples as its denominator. They also show a separate
-no-pass FR over all positive examples: a case is counted only when its selected
-candidate does not pass the threshold. A passed wrong keyword is shown
-separately. Negative tables give total `FA/h` and total FA rate over all input
-clips, followed by the share of false accepts assigned to each winning keyword;
-a negative clip contributes to at most one keyword. Positive FR includes
-examples where no complete CTC alignment was found. The
+keyword's expected examples as its denominator. Stage 1 is treated as a binary
+candidate detector: if any selected keyword passes, the positive clip is a hit
+even when the winning keyword differs from the expected keyword. Negative
+tables give total `FA/h` and total FA rate over all input clips, followed by
+per-winning-keyword false-accept counts and `FA/h`; a negative clip contributes
+to at most one keyword. Positive FR includes examples where no complete CTC
+alignment was found or whose selected candidate is below threshold. The
 `[train] structure = ctc_wac` step applies each wake word's manual stage-1
 threshold later, immediately before training the WAC model. That means you can
 choose a threshold and retrain stage 2 without rerunning the expensive CTC
-model.
+model. The default gate is `stage1_gate_score = normalized_ctc_score`, the
+older negative CTC-score scale stored in `top_score`. Thresholds must use the
+same scale as the selected gate. For the `[0, 1]` keyword-versus-filler values
+reported below, set `stage1_gate_score = normalized_confidence` in `[train]`.
 
 ### Keyword-versus-filler CTC confidence
 
@@ -185,6 +188,12 @@ same sigmoid after dividing the score difference by the selected segment's
 encoder-frame length. The old `top_score` / `normalized_ctc_score` remains
 unchanged for comparison and is still the score used by the existing stage-2
 model.
+
+The Stage-2 gate can independently choose one of these stored scalar values:
+`normalized_ctc_score` (default), `confidence`, or
+`normalized_confidence`. This gate decides which Stage-1 candidates enter
+Stage-2 training; the Stage-2 model itself continues to receive the frozen
+normalized CTC score, margin, and winner one-hot context.
 
 The feature options below control the approximate competitor search. Their
 defaults are shown; `competitor_token_prune` keeps only the best non-blank
