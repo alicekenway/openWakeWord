@@ -360,6 +360,18 @@ feature block may instead use `keywords` directly for a simpler first setup,
 but then a threshold edit will make the normal pipeline cache re-run feature
 generation too.
 
+For a CTC-WAC `[testing.*]` block, set
+`stage1_gate_score = normalized_confidence` when the keyword JSON contains
+the `[0, 1]` normalized keyword-versus-filler thresholds used for Stage-2
+mining. The evaluator then calculates that same confidence on each completed
+candidate segment before passing it to Stage 2. Its internal
+`ctc_proposal_score_floor` only limits how many candidate segments need the
+beam comparison; it is not a wake-word acceptance threshold. The default
+`stage1_gate_score = normalized_ctc_score` is retained only for compatibility
+with older keyword files whose thresholds are negative normalized CTC log
+scores. The `[testing.*] threshold_range` always sweeps the final Stage-2
+classifier probability, independently of the Stage-1 gate.
+
 If you use some other ONNX exporter, you must create its contract manually.
 The example is a template, not a universal WeNet interface. For example, a
 cache entry looks like this:

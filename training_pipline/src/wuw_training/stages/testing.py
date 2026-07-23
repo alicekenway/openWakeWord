@@ -22,6 +22,7 @@ from ..ctc_wac import (
     StreamingCtcStage1,
     audio_to_fbank,
     ctc_keyword_alignment_traces,
+    ctc_keyword_vs_filler_score,
     load_audio,
     load_keywords,
     load_stage2_onnx,
@@ -76,6 +77,38 @@ def _stage1_contract(ctx: Any) -> Path:
 
 def _keywords(ctx: Any) -> Path:
     return ctx.config.resolve_path(require(ctx.section, "keywords", ctx.step))
+
+
+def _ctc_wac_stage1_gate_score(ctx: Any) -> str:
+    """Return the score definition used by the user-facing Stage-1 gate."""
+
+    value = ctx.section.get("stage1_gate_score", "normalized_ctc_score").strip().lower()
+    allowed = {"normalized_ctc_score", "normalized_confidence"}
+    if value not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ConfigurationError(f"[{ctx.step}] stage1_gate_score must be one of {choices}, got {value!r}")
+    return value
+
+
+def _ctc_proposal_score_floor(ctx: Any) -> float:
+    """Return the internal CTC floor used only to avoid excessive beam work."""
+
+    value = number(ctx.section, "ctc_proposal_score_floor", ctx.step, -8.0)
+    if not math.isfinite(value):
+        raise ConfigurationError(f"[{ctx.step}] ctc_proposal_score_floor must be finite")
+    return value
+
+
+def _ctc_competitor_options(ctx: Any) -> tuple[int, int | None]:
+    beam_size = integer(ctx.section, "competitor_beam_size", ctx.step, 16)
+    if beam_size < 2:
+        raise ConfigurationError(f"[{ctx.step}] competitor_beam_size must be >= 2")
+    token_prune = optional_integer(ctx.section, "competitor_token_prune", ctx.step)
+    if token_prune is None:
+        token_prune = 8
+    if token_prune < 1:
+        raise ConfigurationError(f"[{ctx.step}] competitor_token_prune must be >= 1")
+    return beam_size, token_prune
 
 
 def _ctc_max_search_frames(ctx: Any, contract: Stage1Contract) -> int | None:
@@ -148,6 +181,9 @@ def validate(ctx: Any) -> None:
                 raise ConfigurationError(f"[{ctx.step}] {name} does not exist: {path}")
         contract = Stage1Contract.from_json(_stage1_contract(ctx))
         load_keywords(_keywords(ctx))
+        _ctc_wac_stage1_gate_score(ctx)
+        _ctc_proposal_score_floor(ctx)
+        _ctc_competitor_options(ctx)
         if number(ctx.config.section("main"), "sample_rate", "main", contract.sample_rate) != contract.sample_rate:
             raise ConfigurationError(
                 f"[{ctx.step}] [main] sample_rate must match stage-1 contract sample_rate={contract.sample_rate}"
@@ -345,6 +381,10 @@ def _ctc_wac_record(
     candidate_pre_margin_frames: int = 3,
     candidate_post_margin_frames: int = 0,
     max_search_frames: int | None = None,
+    stage1_gate_score: str = "normalized_ctc_score",
+    ctc_proposal_score_floor: float = -8.0,
+    competitor_beam_size: int = 16,
+    competitor_token_prune: int | None = 8,
 ) -> dict[str, Any]:
     """Run both stages on one full audio record and retain candidate details."""
 
@@ -371,22 +411,73 @@ def _ctc_wac_record(
     )
     if score_traces.shape[1] == 0:
         raise RuntimeError("Stage-1 CTC scorer returned no keyword scores")
+    if stage1_gate_score not in {"normalized_ctc_score", "normalized_confidence"}:
+        raise ValueError(f"Unsupported Stage-1 gate score {stage1_gate_score!r}")
+    if competitor_beam_size < 2:
+        raise ValueError("competitor_beam_size must be >= 2")
+    if competitor_token_prune is not None and competitor_token_prune < 1:
+        raise ValueError("competitor_token_prune must be >= 1 when configured")
     thresholds = np.asarray([item.threshold for item in keywords], dtype=np.float32)
     previous_above = np.zeros(len(keywords), dtype=bool)
+    # A confidence comparison is calculated only once after a candidate's
+    # final non-blank token has been followed by a frame.  This avoids running
+    # a beam search repeatedly while a token is still being extended.
+    cached_keys: list[tuple[int, int, int] | None] = [None] * len(keywords)
+    cached_comparisons: list[Any | None] = [None] * len(keywords)
+    emitted_keys: list[tuple[int, int, int] | None] = [None] * len(keywords)
     candidates: list[dict[str, Any]] = []
     for index in range(score_traces.shape[0]):
         row = score_traces[index:index + 1]
         top, margin, winner = rank_keyword_scores(row)
         winner_index = int(winner[0])
-        above_by_keyword = row[0] >= thresholds
-        is_candidate = bool(top[0] >= thresholds[winner_index] and not previous_above[winner_index])
+        start_frame = int(start_traces[index, winner_index])
+        end_frame = int(end_traces[index, winner_index])
+        comparison: Any | None = None
+        if stage1_gate_score == "normalized_ctc_score":
+            gate_value = float(top[0])
+            above_by_keyword = row[0] >= thresholds
+            candidate_key: tuple[int, int, int] | None = None
+        else:
+            above_by_keyword = np.zeros(len(keywords), dtype=bool)
+            candidate_key = None
+            gate_value = 0.0
+            # The CTC score is a proposal floor only. It is not an operating
+            # threshold: the configured per-keyword gate below is the same
+            # normalized keyword-versus-filler confidence used during mining.
+            if (
+                float(top[0]) >= ctc_proposal_score_floor
+                and start_frame >= 0
+                and end_frame >= start_frame
+                and end_frame < index
+            ):
+                candidate_key = (winner_index, start_frame, end_frame)
+                if cached_keys[winner_index] != candidate_key:
+                    cached_comparisons[winner_index] = ctc_keyword_vs_filler_score(
+                        ctc[start_frame:end_frame + 1],
+                        keywords[winner_index].token_ids,
+                        blank_id=stage1.contract.blank_id,
+                        beam_size=competitor_beam_size,
+                        token_prune=competitor_token_prune,
+                    )
+                    cached_keys[winner_index] = candidate_key
+                comparison = cached_comparisons[winner_index]
+                assert comparison is not None
+                gate_value = float(comparison.normalized_confidence)
+                above_by_keyword[winner_index] = gate_value >= float(thresholds[winner_index])
+        # For a normalized-confidence gate, ``above_by_keyword`` stays false
+        # until a completed candidate has an actual keyword-vs-filler score.
+        # This matters for legitimate threshold 0.0 entries: an unavailable
+        # confidence must never be treated as a passing zero.
+        is_candidate = bool(above_by_keyword[winner_index] and not previous_above[winner_index])
+        if candidate_key is not None and candidate_key == emitted_keys[winner_index]:
+            is_candidate = False
         previous_above = above_by_keyword
         if not is_candidate:
             continue
-        start_frame = int(start_traces[index, winner_index])
-        end_frame = int(end_traces[index, winner_index])
         if start_frame < 0 or end_frame < start_frame:
             continue
+        if candidate_key is not None:
+            emitted_keys[winner_index] = candidate_key
         features, frame_mask, crop_start, crop_end = _ctc_wac_candidate_features(
             encoder,
             start_frame=start_frame,
@@ -417,8 +508,20 @@ def _ctc_wac_record(
                 "start_time": float(start_frame * frame_shift),
                 "end_time": float((end_frame + 1) * frame_shift),
                 "candidate_duration_frames": end_frame - start_frame + 1,
-                "stage1_score": float(top[0]),
+                "stage1_gate_score_name": stage1_gate_score,
+                "stage1_gate_score": gate_value,
+                "stage1_ctc_score": float(top[0]),
+                "stage1_normalized_confidence": (
+                    float(comparison.normalized_confidence) if comparison is not None else None
+                ),
+                "stage1_confidence": float(comparison.confidence) if comparison is not None else None,
+                "stage1_keyword_score": float(comparison.keyword_score) if comparison is not None else None,
+                "stage1_filler_score": float(comparison.filler_score) if comparison is not None else None,
+                "stage1_filler_token_ids": list(comparison.filler_token_ids) if comparison is not None else None,
                 "margin": float(margin[0]),
+                "stage2_score": float(np.asarray(probability).reshape(-1)[0]),
+                # Keep the former key for existing report readers. It is the
+                # Stage-2 classifier probability, never a Stage-1 score.
                 "score": float(np.asarray(probability).reshape(-1)[0]),
             }
         )
@@ -454,6 +557,8 @@ def _ctc_wac_markdown_report(
     per_keyword: dict[str, int],
     max_search_frames: int | None,
     encoder_frame_shift_ms: float,
+    stage1_gate_score: str,
+    ctc_proposal_score_floor: float,
 ) -> str:
     base = _markdown_report(
         step=ctx.step,
@@ -475,6 +580,13 @@ def _ctc_wac_markdown_report(
         "",
         f"- Stage-1 ONNX: `{_stage1_model(ctx)}`",
         f"- Contract: `{_stage1_contract(ctx)}`",
+        f"- User-facing Stage-1 gate: `{stage1_gate_score}`",
+        (
+            f"- Internal CTC proposal floor: `{ctc_proposal_score_floor:.6g}` "
+            "(not an acceptance threshold)"
+            if stage1_gate_score == "normalized_confidence"
+            else "- Internal CTC proposal floor: `not used`"
+        ),
         (
             f"- Rolling CTC search horizon: `{max_search_frames}` encoder frames "
             f"({max_search_frames * encoder_frame_shift_ms / 1000.0:.6g} seconds)"
@@ -508,6 +620,9 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
     contract = Stage1Contract.from_json(_stage1_contract(ctx))
     max_search_frames = _ctc_max_search_frames(ctx, contract)
     keywords = load_keywords(_keywords(ctx))
+    stage1_gate_score = _ctc_wac_stage1_gate_score(ctx)
+    ctc_proposal_score_floor = _ctc_proposal_score_floor(ctx)
+    competitor_beam_size, competitor_token_prune = _ctc_competitor_options(ctx)
     stage1 = StreamingCtcStage1(
         _stage1_model(ctx),
         contract,
@@ -554,6 +669,10 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
                     candidate_pre_margin_frames=integer(ctx.section, "candidate_pre_margin_frames", ctx.step, 3),
                     candidate_post_margin_frames=integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0),
                     max_search_frames=max_search_frames,
+                    stage1_gate_score=stage1_gate_score,
+                    ctc_proposal_score_floor=ctc_proposal_score_floor,
+                    competitor_beam_size=competitor_beam_size,
+                    competitor_token_prune=competitor_token_prune,
                 )
                 temporary_handle.write(json.dumps(detail) + "\n")
                 candidates = list(detail["stage1_candidates"])
@@ -611,6 +730,8 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
             per_keyword=per_keyword,
             max_search_frames=max_search_frames,
             encoder_frame_shift_ms=contract.encoder_frame_shift_ms,
+            stage1_gate_score=stage1_gate_score,
+            ctc_proposal_score_floor=ctc_proposal_score_floor,
         ),
         encoding="utf-8",
     )
@@ -944,6 +1065,10 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
                 stage1_candidate_events=stage1_candidate_events,
                 inference_seconds=inference_seconds,
                 per_keyword=per_keyword,
+                max_search_frames=_ctc_max_search_frames(ctx, Stage1Contract.from_json(_stage1_contract(ctx))),
+                encoder_frame_shift_ms=Stage1Contract.from_json(_stage1_contract(ctx)).encoder_frame_shift_ms,
+                stage1_gate_score=_ctc_wac_stage1_gate_score(ctx),
+                ctc_proposal_score_floor=_ctc_proposal_score_floor(ctx),
             ),
             encoding="utf-8",
         )

@@ -1109,6 +1109,50 @@ def test_cascade_record_feeds_all_masked_wac_inputs(monkeypatch: pytest.MonkeyPa
     assert stage2.feed["winner_onehot"].shape == (1, 2)
 
 
+def test_cascade_record_can_gate_with_mining_normalized_confidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    keywords_path = _keyword_file(tmp_path)
+    keywords = load_keywords(keywords_path)
+
+    class FakeStage1:
+        contract = SimpleNamespace(sample_rate=16000, blank_id=0, encoder_frame_shift_ms=40.0)
+
+        def infer_fbank(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            encoder = np.arange(20, dtype=np.float32).reshape(4, 5)
+            probabilities = np.asarray(
+                [[0.05, 0.90, 0.05], [0.80, 0.10, 0.10], [0.05, 0.05, 0.90], [0.8, 0.1, 0.1]],
+                dtype=np.float32,
+            )
+            return encoder, np.log(probabilities)
+
+    class FakeStage2:
+        def run(self, _outputs: object, _feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+            return [np.asarray([[0.75]], dtype=np.float32)]
+
+    monkeypatch.setattr("wuw_training.stages.testing.load_audio", lambda path, sample_rate: np.zeros(32000, dtype=np.float32))
+    monkeypatch.setattr(
+        "wuw_training.stages.testing.audio_to_fbank",
+        lambda audio, contract: np.zeros((4, 80), dtype=np.float32),
+    )
+    detail = _ctc_wac_record(
+        record={"id": "one", "path": str(tmp_path / "audio.wav"), "text": "wake a"},
+        stage1=FakeStage1(),  # type: ignore[arg-type]
+        keywords=keywords,
+        stage2=FakeStage2(),  # type: ignore[arg-type]
+        feature_dim=5,
+        expected_label=1,
+        stage1_gate_score="normalized_confidence",
+        ctc_proposal_score_floor=-10.0,
+    )
+    assert detail["stage1_candidate_count"] >= 1
+    candidate = detail["stage1_candidates"][0]
+    assert candidate["stage1_gate_score_name"] == "normalized_confidence"
+    assert 0.0 <= candidate["stage1_gate_score"] <= 1.0
+    assert candidate["stage1_normalized_confidence"] == candidate["stage1_gate_score"]
+    assert candidate["stage2_score"] == pytest.approx(0.75)
+
+
 def test_ctc_wac_train_and_export_masked_dynamic_onnx(tmp_path: Path) -> None:
     has_onnx = importlib.util.find_spec("onnx") is not None
     has_ort = importlib.util.find_spec("onnxruntime") is not None
