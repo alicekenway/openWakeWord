@@ -174,6 +174,23 @@ older negative CTC-score scale stored in `top_score`. Thresholds must use the
 same scale as the selected gate. For the `[0, 1]` keyword-versus-filler values
 reported below, set `stage1_gate_score = normalized_confidence` in `[train]`.
 
+To teach an existing Stage-2 model additional hard negatives without starting
+again from random weights, set `initialize_from_model` to its PyTorch `.pt`
+artifact (not the exported `.onnx` file):
+
+```ini
+[train]
+structure = ctc_wac
+initialize_from_model = /path/to/existing_stage2.pt
+```
+
+The keyword IDs/order, feature dimension, and WAC architecture must match.
+Fine-tuning keeps the source model's score normalization and evaluates the
+unchanged source model as the step-zero validation baseline. If every later
+checkpoint has worse validation loss, the exported model retains the source
+weights. Normal checkpoint `resume` still takes priority when a compatible
+checkpoint for the current run exists.
+
 ### Keyword-versus-filler CTC confidence
 
 For each selected candidate segment, the feature stage runs CTC prefix beam

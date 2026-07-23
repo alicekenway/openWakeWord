@@ -63,6 +63,11 @@ def _ctc_wac_stage1_gate_score(ctx: Any) -> str:
     return value
 
 
+def _ctc_wac_initial_model(ctx: Any) -> Path | None:
+    raw = ctx.section.get("initialize_from_model", "").strip()
+    return ctx.config.resolve_path(raw) if raw else None
+
+
 def _feature_block(ctx: Any, name: str) -> FeatureBlock:
     if not name.startswith("feature."):
         raise ConfigurationError(f"[{ctx.step}] feature reference must name a feature.* block, got {name!r}")
@@ -404,6 +409,9 @@ def _validate_ctc_wac(ctx: Any) -> None:
     load_keywords(keywords_path)
     _ctc_wac_stage1_gate_score(ctx)
     ctc_wac_model_config(ctx.section, section_name=ctx.step)
+    initial_model = _ctc_wac_initial_model(ctx)
+    if initial_model is not None and not initial_model.is_file():
+        raise ConfigurationError(f"[{ctx.step}] initialize_from_model does not exist: {initial_model}")
     _phase_plan(ctx)
     if number(ctx.section, "max_negative_weight", ctx.step, 1.0) < 1:
         raise ConfigurationError(f"[{ctx.step}] max_negative_weight must be >= 1")
@@ -430,6 +438,9 @@ def input_paths(ctx: Any) -> list[Path]:
     if _structure(ctx) == "ctc_wac":
         blocks = [*_blocks(ctx, "train"), *_validation_blocks(ctx)]
         paths: list[Path] = [_ctc_wac_keywords_path(ctx)]
+        initial_model = _ctc_wac_initial_model(ctx)
+        if initial_model is not None:
+            paths.append(initial_model)
         for block in blocks:
             paths.extend(feature_bundle_paths(block.path).all())
         # Preserve order while avoiding duplicate shared paths in the runner's
@@ -1157,6 +1168,43 @@ class CtcWacTrainer:
             raise ConfigurationError("CTC-WAC feature bundle keyword count does not match the training keyword config")
         self.model_config = ctc_wac_model_config(ctx.section, section_name=ctx.step)
         self.scalar_normalization = _ctc_wac_scalar_statistics(train_blocks)
+        self.initial_model_path = _ctc_wac_initial_model(ctx)
+        initial_payload: dict[str, Any] | None = None
+        if self.initial_model_path is not None:
+            loaded = _torch_load(self.initial_model_path)
+            if (
+                not isinstance(loaded, dict)
+                or loaded.get("structure") != "ctc_wac"
+                or int(loaded.get("schema_version", 0)) != 2
+                or "model_state_dict" not in loaded
+            ):
+                raise ConfigurationError(
+                    f"[{ctx.step}] initialize_from_model is not a schema-2 CTC-WAC PyTorch model: "
+                    f"{self.initial_model_path}"
+                )
+            if int(loaded.get("feature_dim", -1)) != self.feature_dim:
+                raise ConfigurationError(
+                    f"[{ctx.step}] initialize_from_model feature_dim does not match the training features"
+                )
+            expected_keyword_ids = [item.id for item in self.keywords]
+            if list(loaded.get("keyword_ids", [])) != expected_keyword_ids:
+                raise ConfigurationError(
+                    f"[{ctx.step}] initialize_from_model keyword IDs or order do not match keywords"
+                )
+            if loaded.get("model_config") != self.model_config:
+                raise ConfigurationError(
+                    f"[{ctx.step}] initialize_from_model architecture does not match the configured WAC model"
+                )
+            normalization = loaded.get("scalar_normalization")
+            required_normalization = {"score_mean", "score_std", "margin_mean", "margin_std"}
+            if not isinstance(normalization, dict) or not required_normalization.issubset(normalization):
+                raise ConfigurationError(
+                    f"[{ctx.step}] initialize_from_model has no complete scalar normalization"
+                )
+            self.scalar_normalization = {
+                key: float(normalization[key]) for key in sorted(required_normalization)
+            }
+            initial_payload = loaded
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.use_amp = boolean(ctx.section, "mixed_precision", ctx.step, False) and self.device.type == "cuda"
         self.network = make_ctc_wac_model(
@@ -1165,6 +1213,13 @@ class CtcWacTrainer:
             model_config=self.model_config,
             **self.scalar_normalization,
         ).to(self.device)
+        if initial_payload is not None:
+            try:
+                self.network.load_state_dict(initial_payload["model_state_dict"], strict=True)
+            except (KeyError, RuntimeError) as exc:
+                raise ConfigurationError(
+                    f"[{ctx.step}] initialize_from_model weights do not match the configured WAC model"
+                ) from exc
         self.plan = _phase_plan(ctx)
         self.optimizer = torch.optim.AdamW(self.network.parameters(), lr=float(self.plan[0]["learning_rate"]))
         try:
@@ -1403,10 +1458,17 @@ class CtcWacTrainer:
         resumed = self._try_resume() if resume else False
         if not resumed:
             self._seed_everything()
+            if self.initial_model_path is not None:
+                # Keep the source model as a real baseline. If every fine-tuned
+                # checkpoint makes validation worse, export the unchanged
+                # source weights instead of silently regressing.
+                self._record_validation(self._validation())
         self._log_event(
             "run_start",
-            f"[ctc_wac train] start device={self.device} resumed={resumed} (stage 1 is frozen)",
+            f"[ctc_wac train] start device={self.device} resumed={resumed} "
+            f"initialized_from={self.initial_model_path} (stage 1 is frozen)",
             resumed=resumed,
+            initialized_from_model=str(self.initial_model_path) if self.initial_model_path else None,
             device=str(self.device),
             mixed_precision=self.use_amp,
             filtering={block.name: block.filtering_summary() for block in [*self.train_blocks, *self.validation_blocks]},
@@ -1475,6 +1537,7 @@ class CtcWacTrainer:
             "output_model": str(model_path),
             "model_checkpoint_dir": str(self.checkpoint_dir),
             "resumed": resumed,
+            "initialized_from_model": str(self.initial_model_path) if self.initial_model_path else None,
             "completed_phases": len(self.plan),
             "global_steps": self.global_step,
             "phase_plan": self.plan,
