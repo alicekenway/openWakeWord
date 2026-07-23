@@ -90,12 +90,27 @@ def _ctc_wac_stage1_gate_score(ctx: Any) -> str:
     return value
 
 
-def _ctc_proposal_score_floor(ctx: Any) -> float:
-    """Return the internal CTC floor used only to avoid excessive beam work."""
+def _ctc_proposal_score_floor(ctx: Any) -> float | None:
+    """Return an optional raw-CTC optimization floor.
 
-    value = number(ctx.section, "ctc_proposal_score_floor", ctx.step, -8.0)
+    ``normalized_confidence`` and the raw normalized CTC log score are
+    different domains. The latter must not silently become a second required
+    gate, so the floor is disabled unless a caller explicitly opts into it.
+    """
+
+    raw = ctx.section.get("ctc_proposal_score_floor", "none").strip().lower()
+    if raw in {"", "none", "off", "disabled"}:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"[{ctx.step}] ctc_proposal_score_floor must be a finite number or none"
+        ) from exc
     if not math.isfinite(value):
-        raise ConfigurationError(f"[{ctx.step}] ctc_proposal_score_floor must be finite")
+        raise ConfigurationError(
+            f"[{ctx.step}] ctc_proposal_score_floor must be a finite number or none"
+        )
     return value
 
 
@@ -382,7 +397,7 @@ def _ctc_wac_record(
     candidate_post_margin_frames: int = 0,
     max_search_frames: int | None = None,
     stage1_gate_score: str = "normalized_ctc_score",
-    ctc_proposal_score_floor: float = -8.0,
+    ctc_proposal_score_floor: float | None = None,
     competitor_beam_size: int = 16,
     competitor_token_prune: int | None = 8,
 ) -> dict[str, Any]:
@@ -454,7 +469,7 @@ def _ctc_wac_record(
             # threshold: the configured per-keyword gate below is the same
             # normalized keyword-versus-filler confidence used during mining.
             if (
-                float(top[0]) >= ctc_proposal_score_floor
+                (ctc_proposal_score_floor is None or float(top[0]) >= ctc_proposal_score_floor)
                 and start_frame >= 0
                 and end_frame >= start_frame
                 and end_frame < stream_index
@@ -568,7 +583,7 @@ def _ctc_wac_markdown_report(
     max_search_frames: int | None,
     encoder_frame_shift_ms: float,
     stage1_gate_score: str,
-    ctc_proposal_score_floor: float,
+    ctc_proposal_score_floor: float | None,
 ) -> str:
     base = _markdown_report(
         step=ctx.step,
@@ -592,8 +607,12 @@ def _ctc_wac_markdown_report(
         f"- Contract: `{_stage1_contract(ctx)}`",
         f"- User-facing Stage-1 gate: `{stage1_gate_score}`",
         (
-            f"- Internal CTC proposal floor: `{ctc_proposal_score_floor:.6g}` "
-            "(not an acceptance threshold)"
+            (
+                "- Internal CTC proposal floor: `disabled`"
+                if ctc_proposal_score_floor is None
+                else f"- Internal CTC proposal floor: `{ctc_proposal_score_floor:.6g}` "
+                "(optional compute optimization)"
+            )
             if stage1_gate_score == "normalized_confidence"
             else "- Internal CTC proposal floor: `not used`"
         ),

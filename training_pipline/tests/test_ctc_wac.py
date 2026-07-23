@@ -53,7 +53,7 @@ from wuw_training.config import ConfigurationError, load_ini_config  # noqa: E40
 from wuw_training.legacy import get_legacy_module  # noqa: E402
 from wuw_training.stages.train import FeatureBlock  # noqa: E402
 from wuw_training.stages.feature import _merge_ctc_wac_features  # noqa: E402
-from wuw_training.stages.testing import _ctc_wac_record  # noqa: E402
+from wuw_training.stages.testing import _ctc_proposal_score_floor, _ctc_wac_record  # noqa: E402
 import wuw_training.ctc_wac as ctc_wac_module  # noqa: E402
 
 
@@ -1063,6 +1063,25 @@ def test_bundle_loader_can_gate_with_normalized_confidence(tmp_path: Path) -> No
     assert loaded.filtering_summary()["stage1_gate_score"] == "normalized_confidence"
 
 
+def test_ctc_proposal_floor_is_optional_and_disabled_by_default() -> None:
+    assert _ctc_proposal_score_floor(SimpleNamespace(section={}, step="testing.example")) is None
+    assert (
+        _ctc_proposal_score_floor(
+            SimpleNamespace(
+                section={"ctc_proposal_score_floor": "none"},
+                step="testing.example",
+            )
+        )
+        is None
+    )
+    assert _ctc_proposal_score_floor(
+        SimpleNamespace(
+            section={"ctc_proposal_score_floor": "-8"},
+            step="testing.example",
+        )
+    ) == pytest.approx(-8.0)
+
+
 def test_cascade_record_feeds_all_masked_wac_inputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     keywords_path = _keyword_file(tmp_path)
     keywords = load_keywords(keywords_path)
@@ -1143,7 +1162,7 @@ def test_cascade_record_can_gate_with_mining_normalized_confidence(
         feature_dim=5,
         expected_label=1,
         stage1_gate_score="normalized_confidence",
-        ctc_proposal_score_floor=-10.0,
+        ctc_proposal_score_floor=None,
     )
     assert detail["stage1_candidate_count"] >= 1
     candidate = detail["stage1_candidates"][0]
@@ -1192,7 +1211,7 @@ def test_cascade_record_flushes_keyword_that_ends_on_final_ctc_frame(
         feature_dim=5,
         expected_label=1,
         stage1_gate_score="normalized_confidence",
-        ctc_proposal_score_floor=-10.0,
+        ctc_proposal_score_floor=None,
     )
 
     assert detail["stage1_candidate_count"] == 1
