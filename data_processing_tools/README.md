@@ -173,12 +173,13 @@ manifest is `merged_dataset/metadata.jsonl`:
 {"duration": 3601.25, "path": "wav/merged_00000000.wav", "text": ""}
 ```
 
-The tool concatenates WAV sample frames without decoding or resampling, so all
-inputs must have the same sample rate, channel count, sample width, and
-compression type. The last output is still written when the remaining audio is
-shorter than `--length`. Add `--max-output-files 10` to write only the first
-ten merged files, `--absolute-paths` to store absolute paths in the manifest,
-or `--overwrite` to replace files from an earlier run.
+The tool uses `soundfile`/libsndfile, so it supports integer PCM WAV and
+IEEE-float WAV (for example, float32 CosyVoice output). All inputs must have
+the same sample rate, channel count, WAV container, and subtype; the merged
+file preserves that subtype. The last output is still written when the
+remaining audio is shorter than `--length`. Add `--max-output-files 10` to
+write only the first ten merged files, `--absolute-paths` to store absolute
+paths in the manifest, or `--overwrite` to replace files from an earlier run.
 
 ## Group-Safe JSONL Split
 

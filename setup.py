@@ -60,6 +60,7 @@ setuptools.setup(
                     'torchinfo>=1.8.0,<2',
                     'torchmetrics>=0.11.4,<2',
                     'speechbrain>=0.5.14,<2',
+                    'soundfile>=0.12,<1',
                     'audiomentations>=0.30.0,<1',
                     'torch-audiomentations>=0.11.0,<1',
                     'tqdm>=4.64.0,<5',

@@ -6,10 +6,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
+
+try:
+    import soundfile as sf
+except ImportError:
+    sf = None
 
 
 COPY_CHUNK_FRAMES = 1024 * 1024
@@ -18,10 +22,9 @@ COPY_CHUNK_FRAMES = 1024 * 1024
 @dataclass(frozen=True)
 class WavFormat:
     channels: int
-    sample_width: int
     sample_rate: int
-    compression_type: str
-    compression_name: str
+    container: str
+    subtype: str
 
 
 @dataclass(frozen=True)
@@ -29,6 +32,17 @@ class WavInfo:
     path: Path
     frames: int
     wav_format: WavFormat
+
+
+def soundfile_module() -> Any:
+    """Import soundfile lazily so --help remains available without it."""
+
+    if sf is None:
+        raise RuntimeError(
+            "soundfile is required to merge WAV files. Install it with "
+            "`python -m pip install soundfile`."
+        )
+    return sf
 
 
 def collect_wavs(wav_dir: Path, excluded_dir: Path | None = None) -> list[Path]:
@@ -44,33 +58,32 @@ def collect_wavs(wav_dir: Path, excluded_dir: Path | None = None) -> list[Path]:
 
 
 def inspect_wav(path: Path) -> WavInfo:
+    soundfile = soundfile_module()
     try:
-        with wave.open(str(path), "rb") as reader:
-            wav_format = WavFormat(
-                channels=reader.getnchannels(),
-                sample_width=reader.getsampwidth(),
-                sample_rate=reader.getframerate(),
-                compression_type=reader.getcomptype(),
-                compression_name=reader.getcompname(),
-            )
-            return WavInfo(path=path, frames=reader.getnframes(), wav_format=wav_format)
-    except (EOFError, wave.Error) as exc:
+        info = soundfile.info(str(path))
+        wav_format = WavFormat(
+            channels=int(info.channels),
+            sample_rate=int(info.samplerate),
+            container=str(info.format),
+            subtype=str(info.subtype),
+        )
+        return WavInfo(path=path, frames=int(info.frames), wav_format=wav_format)
+    except RuntimeError as exc:
         raise ValueError(f"Cannot read WAV header from {path}: {exc}") from exc
 
 
 def validate_formats(wavs: list[WavInfo]) -> WavFormat:
     expected = wavs[0].wav_format
-    if expected.compression_type != "NONE":
+    if expected.container != "WAV":
         raise ValueError(
-            f"Compressed WAV input is not supported: {wavs[0].path} "
-            f"uses compression type {expected.compression_type!r}"
+            f"Only WAV input is supported: {wavs[0].path} uses {expected.container!r}"
         )
 
     for wav in wavs[1:]:
         if wav.wav_format != expected:
             raise ValueError(
-                "All input WAV files must have the same channels, sample width, "
-                "sample rate, and compression. "
+                "All input WAV files must have the same channels, sample rate, "
+                "container, and subtype. "
                 f"Expected {expected}, but {wav.path} has {wav.wav_format}."
             )
     return expected
@@ -94,32 +107,35 @@ def group_wavs(wavs: list[WavInfo], target_frames: int) -> list[list[WavInfo]]:
     return groups
 
 
-def copy_wav_frames(reader: wave.Wave_read, writer: wave.Wave_write, source_path: Path) -> int:
+def copy_wav_frames(reader: Any, writer: Any, source_path: Path) -> int:
+    """Copy samples through libsndfile without changing the WAV subtype."""
+
     frames_copied = 0
-    bytes_per_frame = reader.getnchannels() * reader.getsampwidth()
     while True:
-        data = reader.readframes(COPY_CHUNK_FRAMES)
-        if not data:
+        data = reader.read(COPY_CHUNK_FRAMES, dtype="float64", always_2d=True)
+        if data.shape[0] == 0:
             break
-        if len(data) % bytes_per_frame != 0:
-            raise ValueError(f"WAV data ends with an incomplete sample frame: {source_path}")
-        writer.writeframesraw(data)
-        frames_copied += len(data) // bytes_per_frame
+        writer.write(data)
+        frames_copied += int(data.shape[0])
     return frames_copied
 
 
 def merge_group(group: list[WavInfo], output_path: Path, wav_format: WavFormat) -> int:
+    soundfile = soundfile_module()
     temporary_path = output_path.with_name(f".{output_path.name}.tmp")
     temporary_path.unlink(missing_ok=True)
     frames_written = 0
     try:
-        with wave.open(str(temporary_path), "wb") as writer:
-            writer.setnchannels(wav_format.channels)
-            writer.setsampwidth(wav_format.sample_width)
-            writer.setframerate(wav_format.sample_rate)
-            writer.setcomptype(wav_format.compression_type, wav_format.compression_name)
+        with soundfile.SoundFile(
+            str(temporary_path),
+            mode="w",
+            samplerate=wav_format.sample_rate,
+            channels=wav_format.channels,
+            format=wav_format.container,
+            subtype=wav_format.subtype,
+        ) as writer:
             for wav in group:
-                with wave.open(str(wav.path), "rb") as reader:
+                with soundfile.SoundFile(str(wav.path), mode="r") as reader:
                     copied = copy_wav_frames(reader, writer, wav.path)
                 if copied != wav.frames:
                     raise ValueError(
@@ -261,7 +277,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "target_length_seconds": args.length,
         "sample_rate": wav_format.sample_rate,
         "channels": wav_format.channels,
-        "sample_width_bytes": wav_format.sample_width,
+        "wav_container": wav_format.container,
+        "wav_subtype": wav_format.subtype,
         "input_wav_files": len(wavs),
         "input_duration_seconds": round(total_input_frames / wav_format.sample_rate, 3),
         "merged_input_wav_files": sum(len(group) for group in groups),
