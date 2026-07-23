@@ -229,10 +229,15 @@ class SlurmExecutor:
             return False
 
     def _batch_script(self, work_dir: Path, snapshot: Path, spec: Path) -> Path:
-        entrypoint = Path(__file__).resolve().parents[1] / "wuw_pipeline.py"
+        # Do not start the legacy wuw_pipeline.py wrapper here.  It imports the
+        # original openWakeWord stack before dispatching the INI subcommand,
+        # so a CTC-WAC-only Slurm job would incorrectly require legacy-only
+        # dependencies such as scipy and torchinfo.
+        module_root = Path(__file__).resolve().parents[1]
         static_args = [
             self.settings.python_executable,
-            str(entrypoint),
+            "-m",
+            "wuw_training.cli",
             "__slurm-worker",
             "--config",
             str(snapshot),
@@ -243,7 +248,11 @@ class SlurmExecutor:
         ]
         command = " ".join(shlex.quote(value) for value in static_args)
         script = work_dir / "run_worker.sh"
-        lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
+        lines = [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            f"export PYTHONPATH={shlex.quote(str(module_root))}${{PYTHONPATH:+:${{PYTHONPATH}}}}",
+        ]
         if self.settings.setup_commands.strip():
             lines.append(self.settings.setup_commands.rstrip())
         lines.append(f'exec {command} --task-id "${{SLURM_ARRAY_TASK_ID:-0}}"')

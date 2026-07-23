@@ -61,6 +61,18 @@ def test_slurm_step_settings_validate_task_count_and_owned_options(tmp_path: Pat
         _step_settings(config, "feature.demo")
 
 
+def test_batch_script_uses_the_ctc_pipeline_cli_directly(tmp_path: Path) -> None:
+    config = load_ini_config(_slurm_config(tmp_path))
+    executor = SlurmExecutor(config)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    script = executor._batch_script(work_dir, tmp_path / "config.ini", tmp_path / "spec.json")
+    text = script.read_text(encoding="utf-8")
+    assert "-m wuw_training.cli __slurm-worker" in text
+    assert "wuw_pipeline.py" not in text
+    assert "export PYTHONPATH=" in text
+
+
 def test_feature_shards_are_contiguous_and_cap_tasks_at_record_count(tmp_path: Path) -> None:
     manifest = tmp_path / "input.jsonl"
     write_jsonl(manifest, [{"path": f"clip-{index}.wav"} for index in range(3)])
