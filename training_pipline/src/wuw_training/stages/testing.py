@@ -783,6 +783,7 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
     stage1_candidate_clips = 0
     stage1_candidate_events = 0
     audio_windows_evaluated = 0
+    audio_windows_evaluated = 0
     per_keyword = {item.id: 0 for item in keywords}
     errors: list[dict[str, Any]] = []
     report = _output_report(ctx)
@@ -1163,6 +1164,7 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
                 inference_seconds += float(entry.get("processing_seconds", 0.0))
                 stage1_candidate_clips += int(bool(candidates))
                 stage1_candidate_events += len(candidates)
+                audio_windows_evaluated += int(entry.get("audio_window_count", 1))
                 for candidate in candidates:
                     key = str(candidate["keyword_id"])
                     per_keyword[key] = per_keyword.get(key, 0) + 1
@@ -1196,6 +1198,8 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
     )
     report.parent.mkdir(parents=True, exist_ok=True)
     if is_ctc_wac:
+        contract = Stage1Contract.from_json(_stage1_contract(ctx))
+        audio_window_seconds, audio_window_stride_seconds = _ctc_audio_window_options(ctx)
         report.write_text(
             _ctc_wac_markdown_report(
                 ctx=ctx,
@@ -1209,10 +1213,13 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
                 stage1_candidate_events=stage1_candidate_events,
                 inference_seconds=inference_seconds,
                 per_keyword=per_keyword,
-                max_search_frames=_ctc_max_search_frames(ctx, Stage1Contract.from_json(_stage1_contract(ctx))),
-                encoder_frame_shift_ms=Stage1Contract.from_json(_stage1_contract(ctx)).encoder_frame_shift_ms,
+                max_search_frames=_ctc_max_search_frames(ctx, contract),
+                encoder_frame_shift_ms=contract.encoder_frame_shift_ms,
                 stage1_gate_score=_ctc_wac_stage1_gate_score(ctx),
                 ctc_proposal_score_floor=_ctc_proposal_score_floor(ctx),
+                audio_window_seconds=audio_window_seconds,
+                audio_window_stride_seconds=audio_window_stride_seconds,
+                audio_windows_evaluated=audio_windows_evaluated,
             ),
             encoding="utf-8",
         )
@@ -1249,6 +1256,7 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
                 "structure": "ctc_wac",
                 "stage1_candidate_clips": stage1_candidate_clips,
                 "stage1_candidate_events": stage1_candidate_events,
+                "audio_windows_evaluated": audio_windows_evaluated,
                 "stage1_candidate_events_per_hour": stage1_candidate_events / (evaluated_seconds / 3600.0)
                 if evaluated_seconds
                 else 0.0,
