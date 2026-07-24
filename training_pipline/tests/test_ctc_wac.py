@@ -55,6 +55,7 @@ from wuw_training.stages.train import FeatureBlock  # noqa: E402
 from wuw_training.stages.feature import _merge_ctc_wac_features  # noqa: E402
 from wuw_training.stages.testing import _ctc_proposal_score_floor, _ctc_wac_record  # noqa: E402
 import wuw_training.ctc_wac as ctc_wac_module  # noqa: E402
+import wuw_training.stages.testing as testing_module  # noqa: E402
 
 
 def _keyword_file(root: Path) -> Path:
@@ -974,6 +975,70 @@ def test_slurm_merge_rebuilds_ragged_offsets(tmp_path: Path) -> None:
     summary = json.loads(paths.summary.read_text(encoding="utf-8"))
     assert summary["expected_keyword_counts"] == {"wake_a": 4, "wake_b": 4}
     assert summary["expected_keyword_invalid_alignment_counts"] == {"wake_a": 0, "wake_b": 0}
+
+
+def test_testing_slurm_merge_counts_audio_windows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    details = tmp_path / "shard" / "eval_details.jsonl"
+    write_jsonl(
+        details,
+        [
+            {
+                "index": 0,
+                "duration_seconds": 12.0,
+                "audio_window_count": 4,
+                "processing_seconds": 1.0,
+                "stage1_candidates": [
+                    {"keyword_id": "wake_a", "score": 0.8, "end_time": 3.0}
+                ],
+            }
+        ],
+    )
+    captured: dict[str, object] = {}
+
+    def fake_report(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return "| Threshold | FA/hour | FA rate | FR rate |\n"
+
+    monkeypatch.setattr(testing_module, "_ctc_wac_markdown_report", fake_report)
+    monkeypatch.setattr(
+        testing_module.Stage1Contract,
+        "from_json",
+        classmethod(
+            lambda cls, path: SimpleNamespace(encoder_frame_shift_ms=40.0)
+        ),
+    )
+    monkeypatch.setattr(
+        testing_module,
+        "load_keywords",
+        lambda path: [SimpleNamespace(id="wake_a")],
+    )
+    output_dir = tmp_path / "merged"
+    ctx = SimpleNamespace(
+        step="testing.positive",
+        section={
+            "structure": "ctc_wac",
+            "expected_label": "1",
+            "threshold_range": "[0, 1]",
+            "threshold_step": "1",
+            "output_dir": str(output_dir),
+            "stage1_contract": str(tmp_path / "contract.json"),
+            "keywords": str(tmp_path / "keywords.json"),
+            "audio_window_seconds": "5.12",
+            "audio_window_stride_seconds": "2.56",
+        },
+        config=SimpleNamespace(resolve_path=lambda value: Path(value).resolve()),
+    )
+    result = testing_module.merge_slurm_shards(
+        ctx,
+        [{"details": str(details), "count": 1, "start": 0}],
+    )
+
+    assert captured["audio_windows_evaluated"] == 4
+    assert captured["audio_window_seconds"] == 5.12
+    assert captured["audio_window_stride_seconds"] == 2.56
+    assert result["audio_windows_evaluated"] == 4
 
 
 def test_generated_contract_fields_and_first_chunk_attention_mask(tmp_path: Path) -> None:

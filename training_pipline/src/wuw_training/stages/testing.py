@@ -783,7 +783,6 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
     stage1_candidate_clips = 0
     stage1_candidate_events = 0
     audio_windows_evaluated = 0
-    audio_windows_evaluated = 0
     per_keyword = {item.id: 0 for item in keywords}
     errors: list[dict[str, Any]] = []
     report = _output_report(ctx)
@@ -1144,6 +1143,7 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
     inference_seconds = 0.0
     stage1_candidate_clips = 0
     stage1_candidate_events = 0
+    audio_windows_evaluated = 0
     per_keyword: dict[str, int] = {}
     if is_ctc_wac:
         per_keyword = {item.id: 0 for item in load_keywords(_keywords(ctx))}
