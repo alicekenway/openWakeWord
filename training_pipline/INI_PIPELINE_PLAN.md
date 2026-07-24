@@ -65,10 +65,11 @@ opset 14 or newer automatically.
 
 Each `testing.*` block writes raw, threshold-independent sliding-window
 details. `[summary]` reads those details and reports FR rate for positive sets
-and both FA/hour and crop-based FA rate for negative sets. Crop-based FA rate
-is the number of inference crops with a false accept divided by the number of
-crops sent through the system. Thresholds such as `0.1` through `0.9` at
-`0.2` increments are configured only in `[summary]`.
+and both FA/hour and crop-based FA rate for negative sets, using one threshold
+table per dataset. Crop-based FA rate is the number of inference crops with a
+false accept divided by the number of crops sent through the system. Thresholds
+such as `0.1` through `0.9` at `0.2` increments are configured only in
+`[summary]`.
 
 ## Verification
 

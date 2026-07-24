@@ -102,7 +102,15 @@ output_report = ${{main:experiment_dir}}/REPORT.md
     assert payload["thresholds"][0]["sets"]["testing.negative"]["false_accept_rate"] == 1.0
     assert payload["thresholds"][0]["combined_negative"]["false_accept_rate"] == 1.0
     report = (tmp_path / "experiment" / "REPORT.md").read_text(encoding="utf-8")
-    assert "Combined negative FA crop rate" in report
+    assert "## testing.positive" in report
+    assert "## testing.negative" in report
+    assert "| Threshold | Accuracy / recall | False rejects | FR rate |" in report
+    assert (
+        "| Threshold | FA events | FA source files | FA crops | Evaluated crops | FA/hour | FA rate |"
+        in report
+    )
+    assert "| 0.5 | 1.000000 | 0 | 0.000000 |" in report
+    assert "| 0.5 | 1 | 1 | 1 | 3 | 1800.000000 | 0.333333 |" in report
     assert payload["thresholds"][2]["sets"]["testing.negative"]["false_accept_crops"] == 1
     assert payload["thresholds"][2]["sets"]["testing.negative"]["crops_evaluated"] == 3
     assert payload["thresholds"][2]["sets"]["testing.negative"]["false_accept_rate"] == pytest.approx(1 / 3)

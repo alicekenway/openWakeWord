@@ -245,37 +245,60 @@ def _markdown_report(payload: dict[str, Any]) -> str:
         f"- Test blocks: `{', '.join(payload['tests'])}`",
         "- FA rate: false-accepted inference crops / evaluated inference crops",
         "- FA/hour: debounced false-accept events / evaluated audio hours",
-        "",
-        "| Threshold | Recall / FRR by positive set | Combined negative FA/hour | Combined negative FA crop rate |",
-        "| --- | --- | --- | --- |",
     ]
-    for item in payload["thresholds"]:
-        positive_parts = []
-        for name, metrics in item["sets"].items():
-            if "recall" in metrics:
-                recall = metrics["recall"]
-                frr = metrics["false_reject_rate"]
-                if recall is None or frr is None:
-                    positive_parts.append(f"{name}: n/a")
-                else:
-                    positive_parts.append(f"{name}: {recall:.4f} / {frr:.4f}")
-        combined_negative = item.get("combined_negative") or {}
-        combined = combined_negative.get("false_accepts_per_hour")
-        combined_text = "n/a" if combined is None else f"{combined:.4f}"
-        combined_rate = combined_negative.get("false_accept_rate")
-        combined_rate_text = "n/a" if combined_rate is None else f"{combined_rate:.2%}"
-        lines.append(
-            f"| {item['threshold']:.6g} | {'; '.join(positive_parts) or 'n/a'} | "
-            f"{combined_text} | {combined_rate_text} |"
-        )
 
-    for item in payload["thresholds"]:
-        lines.extend(["", f"## Threshold {item['threshold']:.6g}", ""])
-        for name, metrics in item["sets"].items():
-            lines.append(f"### {name}")
-            for key, value in metrics.items():
-                lines.append(f"- {key}: {value}")
-            lines.append("")
+    def metric(value: Any) -> str:
+        return "n/a" if value is None else f"{float(value):.6f}"
+
+    for test_name in payload["tests"]:
+        values = [
+            (float(item["threshold"]), item["sets"][test_name])
+            for item in payload["thresholds"]
+            if test_name in item["sets"]
+        ]
+        lines.extend(["", f"## {test_name}", ""])
+        if not values:
+            lines.append("No evaluated threshold rows.")
+            continue
+        first = values[0][1]
+        lines.extend(
+            [
+                f"- Evaluated source files: `{first['clips_evaluated']}`",
+                f"- Evaluated crops: `{first['crops_evaluated']}`",
+                f"- Evaluated duration: `{first['evaluated_hours']:.6f}` hours",
+                f"- Evaluation errors: `{first['error_count']}`",
+                "",
+            ]
+        )
+        if "recall" in first:
+            lines.extend(
+                [
+                    "| Threshold | Accuracy / recall | False rejects | FR rate |",
+                    "| ---: | ---: | ---: | ---: |",
+                ]
+            )
+            for threshold, values_at_threshold in values:
+                lines.append(
+                    f"| {threshold:.6g} | {metric(values_at_threshold['recall'])} | "
+                    f"{values_at_threshold['false_rejects']} | "
+                    f"{metric(values_at_threshold['false_reject_rate'])} |"
+                )
+        else:
+            lines.extend(
+                [
+                    "| Threshold | FA events | FA source files | FA crops | Evaluated crops | FA/hour | FA rate |",
+                    "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+                ]
+            )
+            for threshold, values_at_threshold in values:
+                lines.append(
+                    f"| {threshold:.6g} | {values_at_threshold['false_accept_events']} | "
+                    f"{values_at_threshold['false_accept_clips']} | "
+                    f"{values_at_threshold['false_accept_crops']} | "
+                    f"{values_at_threshold['crops_evaluated']} | "
+                    f"{metric(values_at_threshold['false_accepts_per_hour'])} | "
+                    f"{metric(values_at_threshold['false_accept_rate'])} |"
+                )
     return "\n".join(lines).rstrip() + "\n"
 
 

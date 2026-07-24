@@ -115,10 +115,11 @@ trusted `setup_commands` when compute nodes need a different environment.
   `eval_summary.json` inference metadata.
 - `[summary]` reads one or more completed `testing.*` blocks and performs the
   inexpensive threshold sweep. Changing its threshold range does not rerun
-  model inference. Positive metrics use source utterances for FR. Negative
-  `FA rate` is false-accepted inference crops divided by all evaluated
-  inference crops; `FA/hour` remains the debounced event count divided by
-  evaluated audio duration.
+  model inference. Its Markdown report gives every test dataset its own
+  threshold table. Positive tables use source utterances for accuracy/recall
+  and FR. In negative tables, `FA rate` is false-accepted inference crops
+  divided by all evaluated inference crops; `FA/hour` remains the debounced
+  event count divided by evaluated audio duration.
 
 Run independent tests together, then generate the report:
 
