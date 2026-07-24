@@ -147,6 +147,30 @@ def _ctc_max_search_frames(ctx: Any, contract: Stage1Contract) -> int | None:
     return max(1, int(math.ceil(seconds * count * 1000.0 / contract.encoder_frame_shift_ms)))
 
 
+def _ctc_audio_window_options(ctx: Any) -> tuple[float | None, float | None]:
+    """Return optional independent long-audio window and stride durations."""
+
+    raw_window = ctx.section.get("audio_window_seconds")
+    raw_stride = ctx.section.get("audio_window_stride_seconds")
+    if raw_window is None:
+        if raw_stride is not None:
+            raise ConfigurationError(
+                f"[{ctx.step}] audio_window_stride_seconds requires audio_window_seconds"
+            )
+        return None, None
+    window = number(ctx.section, "audio_window_seconds", ctx.step)
+    stride = number(ctx.section, "audio_window_stride_seconds", ctx.step, window / 2.0)
+    if window <= 0 or stride <= 0:
+        raise ConfigurationError(
+            f"[{ctx.step}] audio_window_seconds and audio_window_stride_seconds must be > 0"
+        )
+    if stride > window:
+        raise ConfigurationError(
+            f"[{ctx.step}] audio_window_stride_seconds must not exceed audio_window_seconds"
+        )
+    return window, stride
+
+
 def _thresholds(ctx: Any) -> list[Decimal]:
     range_text = ctx.section.get("threshold_range")
     if range_text is not None:
@@ -213,6 +237,7 @@ def validate(ctx: Any) -> None:
         if integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0) < 0:
             raise ConfigurationError(f"[{ctx.step}] candidate_post_margin_frames must be >= 0")
         _ctc_max_search_frames(ctx, contract)
+        _ctc_audio_window_options(ctx)
         _output_report(ctx)
         return
     model_dir = _model_dir(ctx)
@@ -261,7 +286,9 @@ def validate_outputs(ctx: Any) -> bool:
 def _event_count(windows: list[dict[str, Any]], threshold: float, debounce_seconds: float) -> int:
     previous = -float("inf")
     count = 0
-    for window in windows:
+    # Overlapping audio windows are evaluated in window order, which is not
+    # necessarily global event-time order. Sort before debouncing.
+    for window in sorted(windows, key=lambda value: float(value.get("end_time", float("inf")))):
         try:
             score = float(window["score"])
             event_time = float(window["end_time"])
@@ -400,13 +427,77 @@ def _ctc_wac_record(
     ctc_proposal_score_floor: float | None = None,
     competitor_beam_size: int = 16,
     competitor_token_prune: int | None = 8,
+    audio_window_seconds: float | None = None,
+    audio_window_stride_seconds: float | None = None,
+    _audio_override: np.ndarray | None = None,
+    _audio_time_offset_seconds: float = 0.0,
+    _audio_window_index: int | None = None,
 ) -> dict[str, Any]:
     """Run both stages on one full audio record and retain candidate details."""
 
     path = Path(str(record["path"]))
     started = time.perf_counter()
-    audio = load_audio(path, stage1.contract.sample_rate)
+    audio = (
+        np.asarray(_audio_override, dtype=np.float32)
+        if _audio_override is not None
+        else load_audio(path, stage1.contract.sample_rate)
+    )
     duration = audio.size / float(stage1.contract.sample_rate)
+    if audio_window_seconds is not None:
+        if _audio_override is not None:
+            raise ValueError("Nested CTC-WAC audio windowing is not supported")
+        if audio_window_stride_seconds is None:
+            audio_window_stride_seconds = audio_window_seconds / 2.0
+        window_samples = max(1, int(round(audio_window_seconds * stage1.contract.sample_rate)))
+        stride_samples = max(1, int(round(audio_window_stride_seconds * stage1.contract.sample_rate)))
+        if stride_samples > window_samples:
+            raise ValueError("audio_window_stride_seconds must not exceed audio_window_seconds")
+        last_start = max(0, int(audio.size) - window_samples)
+        starts = list(range(0, last_start + 1, stride_samples))
+        if not starts or starts[-1] != last_start:
+            starts.append(last_start)
+        candidates: list[dict[str, Any]] = []
+        for window_index, start_sample in enumerate(starts):
+            segment = audio[start_sample:min(start_sample + window_samples, audio.size)]
+            detail = _ctc_wac_record(
+                record=record,
+                stage1=stage1,
+                keywords=keywords,
+                stage2=stage2,
+                feature_dim=feature_dim,
+                expected_label=expected_label,
+                candidate_pre_margin_frames=candidate_pre_margin_frames,
+                candidate_post_margin_frames=candidate_post_margin_frames,
+                max_search_frames=max_search_frames,
+                stage1_gate_score=stage1_gate_score,
+                ctc_proposal_score_floor=ctc_proposal_score_floor,
+                competitor_beam_size=competitor_beam_size,
+                competitor_token_prune=competitor_token_prune,
+                _audio_override=segment,
+                _audio_time_offset_seconds=start_sample / float(stage1.contract.sample_rate),
+                _audio_window_index=window_index,
+            )
+            candidates.extend(detail["stage1_candidates"])
+        candidates.sort(key=lambda value: (float(value["end_time"]), float(value["start_time"])))
+        elapsed = time.perf_counter() - started
+        expected_keyword = record.get("keyword_id", record.get("wakeword_id"))
+        return {
+            "id": record.get("id"),
+            "path": str(path),
+            "expected_label": expected_label,
+            "expected_keyword_id": expected_keyword,
+            "text": record.get("text", "") if expected_label == 1 else "",
+            "duration_seconds": float(duration),
+            "audio_window_mode": "sliding",
+            "audio_window_seconds": float(audio_window_seconds),
+            "audio_window_stride_seconds": float(audio_window_stride_seconds),
+            "audio_window_count": len(starts),
+            "stage1_candidate_count": len(candidates),
+            "stage1_candidates": candidates,
+            "best_window": max(candidates, key=lambda value: value["score"], default=None),
+            "processing_seconds": elapsed,
+            "real_time_factor": elapsed / duration if duration else None,
+        }
     fbank = audio_to_fbank(audio, stage1.contract)
     encoder, ctc = stage1.infer_fbank(fbank)
     if encoder.shape[1] != feature_dim:
@@ -530,8 +621,10 @@ def _ctc_wac_record(
                 "candidate_end_frame": end_frame,
                 "crop_start_frame": crop_start,
                 "crop_end_frame": crop_end,
-                "start_time": float(start_frame * frame_shift),
-                "end_time": float((end_frame + 1) * frame_shift),
+                "start_time": float(_audio_time_offset_seconds + start_frame * frame_shift),
+                "end_time": float(_audio_time_offset_seconds + (end_frame + 1) * frame_shift),
+                "audio_window_index": _audio_window_index,
+                "audio_window_start_time": float(_audio_time_offset_seconds),
                 "candidate_duration_frames": end_frame - start_frame + 1,
                 "stage1_gate_score_name": stage1_gate_score,
                 "stage1_gate_score": gate_value,
@@ -559,6 +652,8 @@ def _ctc_wac_record(
         "expected_keyword_id": expected_keyword,
         "text": record.get("text", "") if expected_label == 1 else "",
         "duration_seconds": float(duration),
+        "audio_window_mode": "continuous",
+        "audio_window_count": 1,
         "stage1_candidate_count": len(candidates),
         "stage1_candidates": candidates,
         "best_window": max(candidates, key=lambda value: value["score"], default=None),
@@ -584,6 +679,9 @@ def _ctc_wac_markdown_report(
     encoder_frame_shift_ms: float,
     stage1_gate_score: str,
     ctc_proposal_score_floor: float | None,
+    audio_window_seconds: float | None,
+    audio_window_stride_seconds: float | None,
+    audio_windows_evaluated: int,
 ) -> str:
     base = _markdown_report(
         step=ctx.step,
@@ -622,6 +720,14 @@ def _ctc_wac_markdown_report(
             if max_search_frames is not None
             else "- Rolling CTC search horizon: `unbounded` (legacy configuration)"
         ),
+        (
+            f"- Audio evaluation mode: independent sliding windows of "
+            f"`{audio_window_seconds:.6g}` seconds with "
+            f"`{audio_window_stride_seconds:.6g}`-second stride"
+            if audio_window_seconds is not None and audio_window_stride_seconds is not None
+            else "- Audio evaluation mode: continuous Stage-1 cache"
+        ),
+        f"- Audio windows evaluated: `{audio_windows_evaluated}`",
         f"- Candidate clips: `{stage1_candidate_clips}` / `{evaluated}`",
         f"- Candidate events: `{stage1_candidate_events}`",
         f"- Candidate events/hour: `{stage1_candidate_events / hours if hours else 0.0:.6f}`",
@@ -648,6 +754,7 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
         records = records[:positive_limit]
     contract = Stage1Contract.from_json(_stage1_contract(ctx))
     max_search_frames = _ctc_max_search_frames(ctx, contract)
+    audio_window_seconds, audio_window_stride_seconds = _ctc_audio_window_options(ctx)
     keywords = load_keywords(_keywords(ctx))
     stage1_gate_score = _ctc_wac_stage1_gate_score(ctx)
     ctc_proposal_score_floor = _ctc_proposal_score_floor(ctx)
@@ -675,6 +782,7 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
     inference_seconds = 0.0
     stage1_candidate_clips = 0
     stage1_candidate_events = 0
+    audio_windows_evaluated = 0
     per_keyword = {item.id: 0 for item in keywords}
     errors: list[dict[str, Any]] = []
     report = _output_report(ctx)
@@ -702,6 +810,8 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
                     ctc_proposal_score_floor=ctc_proposal_score_floor,
                     competitor_beam_size=competitor_beam_size,
                     competitor_token_prune=competitor_token_prune,
+                    audio_window_seconds=audio_window_seconds,
+                    audio_window_stride_seconds=audio_window_stride_seconds,
                 )
                 temporary_handle.write(json.dumps(detail) + "\n")
                 candidates = list(detail["stage1_candidates"])
@@ -711,6 +821,7 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
                 inference_seconds += float(detail["processing_seconds"])
                 stage1_candidate_clips += int(bool(candidates))
                 stage1_candidate_events += len(candidates)
+                audio_windows_evaluated += int(detail.get("audio_window_count", 1))
                 for candidate in candidates:
                     per_keyword[str(candidate["keyword_id"])] = per_keyword.get(str(candidate["keyword_id"]), 0) + 1
                 for accumulator in accumulators:
@@ -761,6 +872,9 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
             encoder_frame_shift_ms=contract.encoder_frame_shift_ms,
             stage1_gate_score=stage1_gate_score,
             ctc_proposal_score_floor=ctc_proposal_score_floor,
+            audio_window_seconds=audio_window_seconds,
+            audio_window_stride_seconds=audio_window_stride_seconds,
+            audio_windows_evaluated=audio_windows_evaluated,
         ),
         encoding="utf-8",
     )
@@ -776,6 +890,7 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
         "evaluated_hours": evaluated_seconds / 3600.0,
         "stage1_candidate_clips": stage1_candidate_clips,
         "stage1_candidate_events": stage1_candidate_events,
+        "audio_windows_evaluated": audio_windows_evaluated,
         "stage1_candidate_events_per_hour": stage1_candidate_events / (evaluated_seconds / 3600.0)
         if evaluated_seconds
         else 0.0,

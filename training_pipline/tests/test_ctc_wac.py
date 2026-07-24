@@ -1172,6 +1172,65 @@ def test_cascade_record_can_gate_with_mining_normalized_confidence(
     assert candidate["stage2_score"] == pytest.approx(0.75)
 
 
+def test_cascade_record_uses_independent_overlapping_audio_windows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    keywords = load_keywords(_keyword_file(tmp_path))
+
+    class FakeStage1:
+        contract = SimpleNamespace(sample_rate=10, blank_id=0, encoder_frame_shift_ms=40.0)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def infer_fbank(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            self.calls += 1
+            encoder = np.arange(20, dtype=np.float32).reshape(4, 5)
+            probabilities = np.asarray(
+                [[0.05, 0.90, 0.05], [0.80, 0.10, 0.10], [0.05, 0.05, 0.90], [0.8, 0.1, 0.1]],
+                dtype=np.float32,
+            )
+            return encoder, np.log(probabilities)
+
+    class FakeStage2:
+        def run(self, _outputs: object, _feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+            return [np.asarray([[0.75]], dtype=np.float32)]
+
+    monkeypatch.setattr(
+        "wuw_training.stages.testing.load_audio",
+        lambda path, sample_rate: np.zeros(120, dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        "wuw_training.stages.testing.audio_to_fbank",
+        lambda audio, contract: np.zeros((4, 80), dtype=np.float32),
+    )
+    stage1 = FakeStage1()
+    detail = _ctc_wac_record(
+        record={"id": "long", "path": str(tmp_path / "audio.wav"), "text": ""},
+        stage1=stage1,  # type: ignore[arg-type]
+        keywords=keywords,
+        stage2=FakeStage2(),  # type: ignore[arg-type]
+        feature_dim=5,
+        expected_label=0,
+        audio_window_seconds=5.0,
+        audio_window_stride_seconds=2.5,
+    )
+
+    assert stage1.calls == 4
+    assert detail["audio_window_mode"] == "sliding"
+    assert detail["audio_window_count"] == 4
+    assert detail["duration_seconds"] == pytest.approx(12.0)
+    assert {candidate["audio_window_start_time"] for candidate in detail["stage1_candidates"]} == {
+        0.0,
+        2.5,
+        5.0,
+        7.0,
+    }
+    assert [candidate["end_time"] for candidate in detail["stage1_candidates"]] == sorted(
+        candidate["end_time"] for candidate in detail["stage1_candidates"]
+    )
+
+
 def test_cascade_record_flushes_keyword_that_ends_on_final_ctc_frame(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

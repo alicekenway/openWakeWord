@@ -296,12 +296,23 @@ positives and randomly crop long negatives.
 Use the same `window_seconds` and `window_count` in every CTC feature and test
 section. Feature generation scores the continuous `[T, V]` output with that
 bounded horizon and records the best candidate's score, margin, and exact
-non-blank encoder crop. Evaluation also keeps the stage-1 ONNX cache
-continuous; it does not run independent overlapping audio windows. It simply
-allows paths beginning in the most recent configured horizon, then passes
-newly rising stage-1 candidates to stage 2. Recalibrate stage-1 and final
-thresholds after changing the horizon, because a longer search range changes
-the maximum-score distribution on negative audio.
+non-blank encoder crop. By default, evaluation also keeps the stage-1 ONNX
+cache continuous. For long recordings, independent overlapping inference
+windows can instead bound the model cache and protect wake words crossing a
+window boundary:
+
+```ini
+[testing.long_negative]
+audio_window_seconds = 5.12
+audio_window_stride_seconds = 2.56
+```
+
+Each audio window resets the Stage-1 cache. Candidate times are converted back
+to absolute recording times, and threshold reporting sorts and debounces
+events across overlaps. `window_seconds` and `window_count` still control the
+CTC path-search horizon inside each audio window; they do not themselves
+enable audio slicing. Recalibrate stage-1 and final thresholds after changing
+either horizon because the negative maximum-score distribution may change.
 
 ### Optional CTC token-alignment debug log
 
