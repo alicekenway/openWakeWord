@@ -33,6 +33,61 @@ def parse_csv(value: str) -> list[str]:
     return [part.strip() for part in value.replace("\n", ",").split(",") if part.strip()]
 
 
+def parse_step_groups(value: str) -> list[list[str]]:
+    """Parse sequential pipeline steps with optional bracketed parallel groups.
+
+    ``a, b, c`` produces three sequential groups. ``[a, b], c`` runs ``a``
+    and ``b`` together, waits for both, and then runs ``c``.
+    """
+
+    groups: list[list[str]] = []
+    token: list[str] = []
+    parallel: list[str] | None = None
+
+    def finish_token(*, required: bool = False) -> None:
+        nonlocal token
+        name = "".join(token).strip()
+        token = []
+        if not name:
+            if required:
+                raise ConfigurationError("[steps] parallel groups cannot contain empty stage names")
+            return
+        if parallel is None:
+            groups.append([name])
+        else:
+            parallel.append(name)
+
+    for character in value:
+        if character == "[":
+            if parallel is not None:
+                raise ConfigurationError("[steps] nested parallel groups are not supported")
+            if "".join(token).strip():
+                raise ConfigurationError("[steps] '[' must begin a new parallel group")
+            token = []
+            parallel = []
+        elif character == "]":
+            if parallel is None:
+                raise ConfigurationError("[steps] has an unmatched ']'")
+            finish_token(required=True)
+            if not parallel:
+                raise ConfigurationError("[steps] parallel groups cannot be empty")
+            groups.append(parallel)
+            parallel = None
+        elif character == ",":
+            finish_token(required=parallel is not None)
+        elif character == "\n" and parallel is None:
+            finish_token()
+        else:
+            token.append(character)
+
+    if parallel is not None:
+        raise ConfigurationError("[steps] has an unclosed '[' parallel group")
+    finish_token()
+    if not groups:
+        raise ConfigurationError("[steps] steps cannot be empty")
+    return groups
+
+
 @dataclass(frozen=True)
 class IniConfig:
     """A loaded config and the directory against which relative paths resolve."""

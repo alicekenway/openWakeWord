@@ -1,4 +1,4 @@
-"""Independent ONNX test sets with per-set Markdown threshold reports."""
+"""Threshold-independent ONNX inference for reusable test-set scores."""
 
 from __future__ import annotations
 
@@ -8,15 +8,14 @@ import os
 import tempfile
 import time
 from dataclasses import replace
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from tqdm import tqdm
 
-from ..artifacts import normalise_manifest_inputs, read_jsonl, write_jsonl
-from ..config import ConfigurationError, parse_json
+from ..artifacts import normalise_manifest_inputs, read_json, read_jsonl, write_json, write_jsonl
+from ..config import ConfigurationError
 from ..ctc_wac import (
     Stage1Contract,
     StreamingCtcStage1,
@@ -43,13 +42,12 @@ def _output_dir(ctx: Any) -> Path:
     return ctx.config.resolve_path(require(ctx.section, "output_dir", ctx.step))
 
 
-def _output_report(ctx: Any) -> Path:
-    configured = ctx.section.get("output_report")
-    return ctx.config.resolve_path(configured) if configured else _output_dir(ctx) / "threshold_summary.md"
-
-
 def _details_path(ctx: Any) -> Path:
     return _output_dir(ctx) / "eval_details.jsonl"
+
+
+def _summary_path(ctx: Any) -> Path:
+    return _output_dir(ctx) / "eval_summary.json"
 
 
 def _model(ctx: Any) -> Path:
@@ -171,41 +169,10 @@ def _ctc_audio_window_options(ctx: Any) -> tuple[float | None, float | None]:
     return window, stride
 
 
-def _thresholds(ctx: Any) -> list[Decimal]:
-    range_text = ctx.section.get("threshold_range")
-    if range_text is not None:
-        values = parse_json(range_text, f"[{ctx.step}] threshold_range", list)
-        if len(values) != 2:
-            raise ConfigurationError(f"[{ctx.step}] threshold_range must be [start, stop]")
-        start_text, stop_text = (str(value) for value in values)
-    else:
-        start_text = require(ctx.section, "threshold_start", ctx.step)
-        stop_text = require(ctx.section, "threshold_stop", ctx.step)
-    try:
-        start = Decimal(start_text)
-        stop = Decimal(stop_text)
-        increment = Decimal(require(ctx.section, "threshold_step", ctx.step))
-    except InvalidOperation as exc:
-        raise ConfigurationError(f"[{ctx.step}] threshold range and step must be decimal numbers") from exc
-    if start < 0 or stop > 1 or start > stop or increment <= 0:
-        raise ConfigurationError(
-            f"[{ctx.step}] threshold range must satisfy 0 <= start <= stop <= 1 and threshold_step > 0"
-        )
-    thresholds: list[Decimal] = []
-    current = start
-    while current <= stop:
-        thresholds.append(current)
-        current += increment
-    if thresholds[-1] != stop:
-        raise ConfigurationError(f"[{ctx.step}] threshold_step must reach the end of threshold_range exactly")
-    return thresholds
-
-
 def validate(ctx: Any) -> None:
     expected_label = integer(ctx.section, "expected_label", ctx.step)
     if expected_label not in {0, 1}:
         raise ConfigurationError(f"[{ctx.step}] expected_label must be 0 or 1")
-    _thresholds(ctx)
     for item in _inputs(ctx):
         if item.audio_base_dir and not item.audio_base_dir.is_dir():
             raise ConfigurationError(f"[{ctx.step}] audio_base_dir does not exist: {item.audio_base_dir}")
@@ -230,24 +197,20 @@ def validate(ctx: Any) -> None:
         device = ctx.section.get("stage1_device", "cpu").lower()
         if device not in {"auto", "cpu", "gpu"}:
             raise ConfigurationError(f"[{ctx.step}] stage1_device must be auto, cpu, or gpu")
-        if number(ctx.section, "debounce_seconds", ctx.step, 1.0) < 0:
-            raise ConfigurationError(f"[{ctx.step}] debounce_seconds must be >= 0")
         if integer(ctx.section, "candidate_pre_margin_frames", ctx.step, 3) < 0:
             raise ConfigurationError(f"[{ctx.step}] candidate_pre_margin_frames must be >= 0")
         if integer(ctx.section, "candidate_post_margin_frames", ctx.step, 0) < 0:
             raise ConfigurationError(f"[{ctx.step}] candidate_post_margin_frames must be >= 0")
         _ctc_max_search_frames(ctx, contract)
         _ctc_audio_window_options(ctx)
-        _output_report(ctx)
+        _output_dir(ctx)
         return
     model_dir = _model_dir(ctx)
     if model_dir.exists() and not model_dir.is_dir():
         raise ConfigurationError(f"[{ctx.step}] model_dir is not a directory: {model_dir}")
-    if number(ctx.section, "debounce_seconds", ctx.step, 1.0) < 0:
-        raise ConfigurationError(f"[{ctx.step}] debounce_seconds must be >= 0")
     if integer(ctx.section, "chunk_size", ctx.step, 1280) < 1:
         raise ConfigurationError(f"[{ctx.step}] chunk_size must be >= 1")
-    _output_report(ctx)
+    _output_dir(ctx)
 
 
 def input_paths(ctx: Any) -> list[Path]:
@@ -269,113 +232,53 @@ def input_paths(ctx: Any) -> list[Path]:
 
 
 def output_paths(ctx: Any) -> list[Path]:
-    return [_output_report(ctx), _details_path(ctx)]
+    return [_summary_path(ctx), _details_path(ctx)]
 
 
 def validate_outputs(ctx: Any) -> bool:
-    report, details = output_paths(ctx)
-    if not report.is_file() or not details.is_file():
+    summary, details = output_paths(ctx)
+    if not summary.is_file() or not details.is_file():
         return False
     try:
-        text = report.read_text(encoding="utf-8")
-        return "| Threshold |" in text and "FA/hour" in text and "FA rate" in text and "FR rate" in text
-    except OSError:
+        payload = read_json(summary)
+        return (
+            payload.get("schema_version") == 1
+            and payload.get("test_step") == ctx.step
+            and int(payload.get("expected_label", -1)) in {0, 1}
+            and int(payload.get("clips_evaluated", -1)) >= 0
+        )
+    except (OSError, TypeError, ValueError):
         return False
 
 
-def _event_count(windows: list[dict[str, Any]], threshold: float, debounce_seconds: float) -> int:
-    previous = -float("inf")
-    count = 0
-    # Overlapping audio windows are evaluated in window order, which is not
-    # necessarily global event-time order. Sort before debouncing.
-    for window in sorted(windows, key=lambda value: float(value.get("end_time", float("inf")))):
-        try:
-            score = float(window["score"])
-            event_time = float(window["end_time"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if score >= threshold and event_time - previous >= debounce_seconds:
-            count += 1
-            previous = event_time
-    return count
-
-
-def _metric_rows(
-    accumulators: list[dict[str, Any]],
+def _write_inference_summary(
+    ctx: Any,
     *,
     expected_label: int,
-    evaluated: int,
-    evaluated_seconds: float,
-) -> list[dict[str, Any]]:
-    hours = evaluated_seconds / 3600.0
-    rows: list[dict[str, Any]] = []
-    for values in accumulators:
-        row = {
-            "threshold": values["threshold"],
-            "false_accept_events": values["false_accept_events"] if expected_label == 0 else None,
-            "false_accept_clips": values["false_accept_clips"] if expected_label == 0 else None,
-            "false_accepts_per_hour": (
-                values["false_accept_events"] / hours if expected_label == 0 and hours else None
-            ),
-            "false_accept_rate": (
-                values["false_accept_clips"] / evaluated if expected_label == 0 and evaluated else None
-            ),
-            "false_rejects": values["false_rejects"] if expected_label == 1 else None,
-            "false_reject_rate": (
-                values["false_rejects"] / evaluated if expected_label == 1 and evaluated else None
-            ),
-        }
-        rows.append(row)
-    return rows
-
-
-def _format_metric(value: Any, digits: int = 6) -> str:
-    return "n/a" if value is None else f"{float(value):.{digits}f}"
-
-
-def _markdown_report(
-    *,
-    step: str,
-    model: Path,
-    input_manifests: list[Path],
-    expected_label: int,
-    debounce_seconds: float,
     requested: int,
     evaluated: int,
     evaluated_seconds: float,
     errors: list[dict[str, Any]],
-    rows: list[dict[str, Any]],
-) -> str:
-    label = "positive" if expected_label == 1 else "negative"
-    lines = [
-        f"# Threshold Evaluation: {step}",
-        "",
-        f"- Model: `{model}`",
-        f"- Expected label: `{label}`",
-        f"- Input manifest(s): `{', '.join(str(path) for path in input_manifests)}`",
-        f"- Debounce: `{debounce_seconds}` seconds",
-        f"- Clips requested/evaluated: `{requested}` / `{evaluated}`",
-        f"- Evaluated duration: `{evaluated_seconds / 3600.0:.6f}` hours",
-        f"- Evaluation errors: `{len(errors)}`",
-        "",
-        "| Threshold | FA events | FA clips | FA/hour | FA rate | False rejects | FR rate |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for row in rows:
-        fa_events = "n/a" if row["false_accept_events"] is None else str(row["false_accept_events"])
-        fa_clips = "n/a" if row["false_accept_clips"] is None else str(row["false_accept_clips"])
-        false_rejects = "n/a" if row["false_rejects"] is None else str(row["false_rejects"])
-        lines.append(
-            f"| {row['threshold']:.6g} | {fa_events} | {fa_clips} | "
-            f"{_format_metric(row['false_accepts_per_hour'])} | "
-            f"{_format_metric(row['false_accept_rate'])} | {false_rejects} | "
-            f"{_format_metric(row['false_reject_rate'])} |"
-        )
-    if errors:
-        lines.extend(["", "## Evaluation errors", ""])
-        for error in errors[:50]:
-            lines.append(f"- index `{error.get('index')}` path `{error.get('path')}`: `{error.get('error')}`")
-    return "\n".join(lines).rstrip() + "\n"
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "test_step": ctx.step,
+        "structure": _structure(ctx),
+        "expected_label": expected_label,
+        "clips_requested": requested,
+        "clips_evaluated": evaluated,
+        "evaluated_seconds": evaluated_seconds,
+        "evaluated_hours": evaluated_seconds / 3600.0,
+        "error_count": len(errors),
+        "details": str(_details_path(ctx)),
+    }
+    if extra:
+        payload.update(extra)
+    summary = _summary_path(ctx)
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    write_json(summary, payload)
+    return payload
 
 
 def _ctc_wac_stage2_shape(shapes: dict[str, tuple[int | None, ...]]) -> tuple[int, int]:
@@ -662,88 +565,6 @@ def _ctc_wac_record(
     }
 
 
-def _ctc_wac_markdown_report(
-    *,
-    ctx: Any,
-    expected_label: int,
-    requested: int,
-    evaluated: int,
-    evaluated_seconds: float,
-    errors: list[dict[str, Any]],
-    rows: list[dict[str, Any]],
-    stage1_candidate_clips: int,
-    stage1_candidate_events: int,
-    inference_seconds: float,
-    per_keyword: dict[str, int],
-    max_search_frames: int | None,
-    encoder_frame_shift_ms: float,
-    stage1_gate_score: str,
-    ctc_proposal_score_floor: float | None,
-    audio_window_seconds: float | None,
-    audio_window_stride_seconds: float | None,
-    audio_windows_evaluated: int,
-) -> str:
-    base = _markdown_report(
-        step=ctx.step,
-        model=_model(ctx),
-        input_manifests=[item.path for item in _inputs(ctx)],
-        expected_label=expected_label,
-        debounce_seconds=number(ctx.section, "debounce_seconds", ctx.step, 1.0),
-        requested=requested,
-        evaluated=evaluated,
-        evaluated_seconds=evaluated_seconds,
-        errors=errors,
-        rows=rows,
-    ).rstrip()
-    hours = evaluated_seconds / 3600.0
-    lines = [
-        base,
-        "",
-        "## Stage-1 CTC gate",
-        "",
-        f"- Stage-1 ONNX: `{_stage1_model(ctx)}`",
-        f"- Contract: `{_stage1_contract(ctx)}`",
-        f"- User-facing Stage-1 gate: `{stage1_gate_score}`",
-        (
-            (
-                "- Internal CTC proposal floor: `disabled`"
-                if ctc_proposal_score_floor is None
-                else f"- Internal CTC proposal floor: `{ctc_proposal_score_floor:.6g}` "
-                "(optional compute optimization)"
-            )
-            if stage1_gate_score == "normalized_confidence"
-            else "- Internal CTC proposal floor: `not used`"
-        ),
-        (
-            f"- Rolling CTC search horizon: `{max_search_frames}` encoder frames "
-            f"({max_search_frames * encoder_frame_shift_ms / 1000.0:.6g} seconds)"
-            if max_search_frames is not None
-            else "- Rolling CTC search horizon: `unbounded` (legacy configuration)"
-        ),
-        (
-            f"- Audio evaluation mode: independent sliding windows of "
-            f"`{audio_window_seconds:.6g}` seconds with "
-            f"`{audio_window_stride_seconds:.6g}`-second stride"
-            if audio_window_seconds is not None and audio_window_stride_seconds is not None
-            else "- Audio evaluation mode: continuous Stage-1 cache"
-        ),
-        f"- Audio windows evaluated: `{audio_windows_evaluated}`",
-        f"- Candidate clips: `{stage1_candidate_clips}` / `{evaluated}`",
-        f"- Candidate events: `{stage1_candidate_events}`",
-        f"- Candidate events/hour: `{stage1_candidate_events / hours if hours else 0.0:.6f}`",
-        f"- Stage-1 candidate recall: `{stage1_candidate_clips / evaluated if expected_label == 1 and evaluated else 'n/a'}`",
-        f"- End-to-end inference RTF: `{inference_seconds / evaluated_seconds if evaluated_seconds else 0.0:.6f}`",
-        "",
-        "## Candidates by stage-1 winner",
-        "",
-        "| Keyword | Candidate events |",
-        "| --- | ---: |",
-    ]
-    for key in sorted(per_keyword):
-        lines.append(f"| {key} | {per_keyword[key]} |")
-    return "\n".join(lines).rstrip() + "\n"
-
-
 def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
     normalized = stage_work_path(ctx, "input.jsonl")
     expected_label = integer(ctx.section, "expected_label", ctx.step)
@@ -770,13 +591,7 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
         raise ConfigurationError(
             f"Stage-2 ONNX expects {keyword_count} keywords but {len(keywords)} are configured"
         )
-    thresholds = [float(value) for value in _thresholds(ctx)]
-    accumulators = [
-        {"threshold": threshold, "false_accept_events": 0, "false_accept_clips": 0, "false_rejects": 0}
-        for threshold in thresholds
-    ]
     negative_limit_seconds = optional_number(ctx.section, "limit_negative_seconds", ctx.step)
-    debounce = number(ctx.section, "debounce_seconds", ctx.step, 1.0)
     evaluated = 0
     evaluated_seconds = 0.0
     inference_seconds = 0.0
@@ -785,9 +600,7 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
     audio_windows_evaluated = 0
     per_keyword = {item.id: 0 for item in keywords}
     errors: list[dict[str, Any]] = []
-    report = _output_report(ctx)
     details = _details_path(ctx)
-    report.parent.mkdir(parents=True, exist_ok=True)
     details.parent.mkdir(parents=True, exist_ok=True)
     temporary_handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=details.parent, delete=False)
     temporary_path = Path(temporary_handle.name)
@@ -824,13 +637,6 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
                 audio_windows_evaluated += int(detail.get("audio_window_count", 1))
                 for candidate in candidates:
                     per_keyword[str(candidate["keyword_id"])] = per_keyword.get(str(candidate["keyword_id"]), 0) + 1
-                for accumulator in accumulators:
-                    event_count = _event_count(candidates, float(accumulator["threshold"]), debounce)
-                    if expected_label == 1:
-                        accumulator["false_rejects"] += int(event_count == 0)
-                    else:
-                        accumulator["false_accept_clips"] += int(event_count > 0)
-                        accumulator["false_accept_events"] += event_count
             except Exception as exc:
                 error = {
                     "set": ctx.step,
@@ -849,54 +655,35 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
         temporary_handle.close()
         temporary_path.unlink(missing_ok=True)
         raise
-    rows = _metric_rows(
-        accumulators,
+    summary = _write_inference_summary(
+        ctx,
         expected_label=expected_label,
+        requested=len(records),
         evaluated=evaluated,
         evaluated_seconds=evaluated_seconds,
-    )
-    report.write_text(
-        _ctc_wac_markdown_report(
-            ctx=ctx,
-            expected_label=expected_label,
-            requested=len(records),
-            evaluated=evaluated,
-            evaluated_seconds=evaluated_seconds,
-            errors=errors,
-            rows=rows,
-            stage1_candidate_clips=stage1_candidate_clips,
-            stage1_candidate_events=stage1_candidate_events,
-            inference_seconds=inference_seconds,
-            per_keyword=per_keyword,
-            max_search_frames=max_search_frames,
-            encoder_frame_shift_ms=contract.encoder_frame_shift_ms,
-            stage1_gate_score=stage1_gate_score,
-            ctc_proposal_score_floor=ctc_proposal_score_floor,
-            audio_window_seconds=audio_window_seconds,
-            audio_window_stride_seconds=audio_window_stride_seconds,
-            audio_windows_evaluated=audio_windows_evaluated,
-        ),
-        encoding="utf-8",
+        errors=errors,
+        extra={
+            "stage1_candidate_clips": stage1_candidate_clips,
+            "stage1_candidate_events": stage1_candidate_events,
+            "audio_windows_evaluated": audio_windows_evaluated,
+            "stage1_candidate_events_per_hour": (
+                stage1_candidate_events / (evaluated_seconds / 3600.0)
+                if evaluated_seconds
+                else 0.0
+            ),
+            "real_time_factor": inference_seconds / evaluated_seconds if evaluated_seconds else 0.0,
+            "candidates_by_stage1_winner": per_keyword,
+            "max_search_frames": max_search_frames,
+            "encoder_frame_shift_ms": contract.encoder_frame_shift_ms,
+            "stage1_gate_score": stage1_gate_score,
+            "ctc_proposal_score_floor": ctc_proposal_score_floor,
+            "audio_window_seconds": audio_window_seconds,
+            "audio_window_stride_seconds": audio_window_stride_seconds,
+        },
     )
     if not validate_outputs(ctx):
         raise RuntimeError(f"CTC-WAC testing output validation failed for {ctx.step}")
-    return {
-        "structure": "ctc_wac",
-        "report": str(report),
-        "details": str(details),
-        "expected_label": expected_label,
-        "threshold_count": len(rows),
-        "clips_evaluated": evaluated,
-        "evaluated_hours": evaluated_seconds / 3600.0,
-        "stage1_candidate_clips": stage1_candidate_clips,
-        "stage1_candidate_events": stage1_candidate_events,
-        "audio_windows_evaluated": audio_windows_evaluated,
-        "stage1_candidate_events_per_hour": stage1_candidate_events / (evaluated_seconds / 3600.0)
-        if evaluated_seconds
-        else 0.0,
-        "real_time_factor": inference_seconds / evaluated_seconds if evaluated_seconds else 0.0,
-        "error_count": len(errors),
-    }
+    return {**summary, "summary": str(_summary_path(ctx))}
 
 
 def run(ctx: Any) -> dict[str, Any]:
@@ -918,18 +705,7 @@ def run(ctx: Any) -> dict[str, Any]:
         inference_framework="onnx",
         **model_kwargs,
     )
-    thresholds = [float(value) for value in _thresholds(ctx)]
-    accumulators = [
-        {
-            "threshold": threshold,
-            "false_accept_events": 0,
-            "false_accept_clips": 0,
-            "false_rejects": 0,
-        }
-        for threshold in thresholds
-    ]
     main = ctx.config.section("main")
-    debounce = number(ctx.section, "debounce_seconds", ctx.step, 1.0)
     score_config = {
         "sample_rate": integer(main, "sample_rate", "main", 16000),
         "chunk_size": integer(ctx.section, "chunk_size", ctx.step, 1280),
@@ -946,12 +722,11 @@ def run(ctx: Any) -> dict[str, Any]:
     negative_limit_seconds = optional_number(ctx.section, "limit_negative_seconds", ctx.step)
     evaluated = 0
     evaluated_seconds = 0.0
+    audio_windows_evaluated = 0
     errors: list[dict[str, Any]] = []
-    report = _output_report(ctx)
     details = _details_path(ctx)
-    report.parent.mkdir(parents=True, exist_ok=True)
     details.parent.mkdir(parents=True, exist_ok=True)
-    for obsolete_name in ("eval_summary.json", "eval_abnormal.jsonl", "evaluation_config.json"):
+    for obsolete_name in ("eval_abnormal.jsonl", "evaluation_config.json"):
         (_output_dir(ctx) / obsolete_name).unlink(missing_ok=True)
     temporary_handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=details.parent, delete=False)
     temporary_path = Path(temporary_handle.name)
@@ -976,13 +751,7 @@ def run(ctx: Any) -> dict[str, Any]:
                 duration = float(detail.get("duration_seconds") or 0.0)
                 evaluated += 1
                 evaluated_seconds += duration
-                for accumulator in accumulators:
-                    event_count = _event_count(windows, float(accumulator["threshold"]), debounce)
-                    if expected_label == 1:
-                        accumulator["false_rejects"] += int(event_count == 0)
-                    else:
-                        accumulator["false_accept_clips"] += int(event_count > 0)
-                        accumulator["false_accept_events"] += event_count
+                audio_windows_evaluated += len(windows)
             except Exception as exc:
                 error = {
                     "set": ctx.step,
@@ -1002,38 +771,18 @@ def run(ctx: Any) -> dict[str, Any]:
         temporary_path.unlink(missing_ok=True)
         raise
 
-    metric_rows = _metric_rows(
-        accumulators,
+    summary = _write_inference_summary(
+        ctx,
         expected_label=expected_label,
+        requested=len(records),
         evaluated=evaluated,
         evaluated_seconds=evaluated_seconds,
-    )
-    report.write_text(
-        _markdown_report(
-            step=ctx.step,
-            model=model_path,
-            input_manifests=[item.path for item in _inputs(ctx)],
-            expected_label=expected_label,
-            debounce_seconds=debounce,
-            requested=len(records),
-            evaluated=evaluated,
-            evaluated_seconds=evaluated_seconds,
-            errors=errors,
-            rows=metric_rows,
-        ),
-        encoding="utf-8",
+        errors=errors,
+        extra={"audio_windows_evaluated": audio_windows_evaluated},
     )
     if not validate_outputs(ctx):
         raise RuntimeError(f"Testing output validation failed for {ctx.step}")
-    return {
-        "report": str(report),
-        "details": str(details),
-        "expected_label": expected_label,
-        "threshold_count": len(metric_rows),
-        "clips_evaluated": evaluated,
-        "evaluated_hours": evaluated_seconds / 3600.0,
-        "error_count": len(errors),
-    }
+    return {**summary, "summary": str(_summary_path(ctx))}
 
 
 def prepare_slurm_shards(ctx: Any, work_dir: Path, task_count: int) -> list[dict[str, Any]]:
@@ -1065,7 +814,7 @@ def prepare_slurm_shards(ctx: Any, work_dir: Path, task_count: int) -> list[dict
                 "count": stop - start,
                 "input_manifest": str(input_manifest),
                 "output_dir": str(output_dir),
-                "output_report": str(output_dir / "threshold_summary.md"),
+                "summary": str(output_dir / "eval_summary.json"),
                 "details": str(output_dir / "eval_details.jsonl"),
                 "normalized_manifest": str(normalized),
             }
@@ -1083,7 +832,6 @@ def _slurm_task_context(ctx: Any, task: dict[str, Any]) -> Any:
     section.pop("limit_positive", None)
     section.pop("limit_negative_seconds", None)
     section["output_dir"] = str(task["output_dir"])
-    section["output_report"] = str(task["output_report"])
     parser = ctx.config.parser
     parser.set(ctx.step, "input_jsonl", str(task["input_manifest"]))
     parser.remove_option(ctx.step, "audio_base_dir")
@@ -1103,13 +851,17 @@ def run_slurm_shard(ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
 
 
 def validate_slurm_shard(ctx: Any, task: dict[str, Any]) -> bool:
-    report = Path(str(task["output_report"])).resolve()
+    summary = Path(str(task["summary"])).resolve()
     details = Path(str(task["details"])).resolve()
-    if not report.is_file() or not details.is_file():
+    if not summary.is_file() or not details.is_file():
         return False
     try:
-        return "| Threshold |" in report.read_text(encoding="utf-8")
-    except OSError:
+        payload = read_json(summary)
+        return (
+            payload.get("schema_version") == 1
+            and int(payload.get("expected_label", -1)) in {0, 1}
+        )
+    except (OSError, TypeError, ValueError):
         return False
 
 
@@ -1129,12 +881,6 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
     entries = _slurm_entries(tasks)
     requested = sum(int(task["count"]) for task in tasks)
     negative_limit_seconds = optional_number(ctx.section, "limit_negative_seconds", ctx.step)
-    debounce = number(ctx.section, "debounce_seconds", ctx.step, 1.0)
-    thresholds = [float(value) for value in _thresholds(ctx)]
-    accumulators = [
-        {"threshold": threshold, "false_accept_events": 0, "false_accept_clips": 0, "false_rejects": 0}
-        for threshold in thresholds
-    ]
     evaluated = 0
     evaluated_seconds = 0.0
     errors: list[dict[str, Any]] = []
@@ -1168,16 +914,8 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
                 for candidate in candidates:
                     key = str(candidate["keyword_id"])
                     per_keyword[key] = per_keyword.get(key, 0) + 1
-                windows = candidates
             else:
-                windows = list(entry.get("sliding_windows", []))
-            for accumulator in accumulators:
-                event_count = _event_count(windows, float(accumulator["threshold"]), debounce)
-                if expected_label == 1:
-                    accumulator["false_rejects"] += int(event_count == 0)
-                else:
-                    accumulator["false_accept_clips"] += int(event_count > 0)
-                    accumulator["false_accept_events"] += event_count
+                audio_windows_evaluated += len(entry.get("sliding_windows", []))
         except Exception as exc:
             error = {
                 "set": ctx.step,
@@ -1188,85 +926,45 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
             errors.append(error)
 
     details = _details_path(ctx)
-    report = _output_report(ctx)
     write_jsonl(details, selected)
-    rows = _metric_rows(
-        accumulators,
-        expected_label=expected_label,
-        evaluated=evaluated,
-        evaluated_seconds=evaluated_seconds,
-    )
-    report.parent.mkdir(parents=True, exist_ok=True)
+    extra: dict[str, Any] = {"audio_windows_evaluated": audio_windows_evaluated}
     if is_ctc_wac:
         contract = Stage1Contract.from_json(_stage1_contract(ctx))
         audio_window_seconds, audio_window_stride_seconds = _ctc_audio_window_options(ctx)
-        report.write_text(
-            _ctc_wac_markdown_report(
-                ctx=ctx,
-                expected_label=expected_label,
-                requested=requested,
-                evaluated=evaluated,
-                evaluated_seconds=evaluated_seconds,
-                errors=errors,
-                rows=rows,
-                stage1_candidate_clips=stage1_candidate_clips,
-                stage1_candidate_events=stage1_candidate_events,
-                inference_seconds=inference_seconds,
-                per_keyword=per_keyword,
-                max_search_frames=_ctc_max_search_frames(ctx, contract),
-                encoder_frame_shift_ms=contract.encoder_frame_shift_ms,
-                stage1_gate_score=_ctc_wac_stage1_gate_score(ctx),
-                ctc_proposal_score_floor=_ctc_proposal_score_floor(ctx),
-                audio_window_seconds=audio_window_seconds,
-                audio_window_stride_seconds=audio_window_stride_seconds,
-                audio_windows_evaluated=audio_windows_evaluated,
-            ),
-            encoding="utf-8",
-        )
-    else:
-        report.write_text(
-            _markdown_report(
-                step=ctx.step,
-                model=_model(ctx),
-                input_manifests=[item.path for item in _inputs(ctx)],
-                expected_label=expected_label,
-                debounce_seconds=debounce,
-                requested=requested,
-                evaluated=evaluated,
-                evaluated_seconds=evaluated_seconds,
-                errors=errors,
-                rows=rows,
-            ),
-            encoding="utf-8",
-        )
-    if not validate_outputs(ctx):
-        raise RuntimeError(f"Testing merge validation failed for {ctx.step}")
-    result = {
-        "report": str(report),
-        "details": str(details),
-        "expected_label": expected_label,
-        "threshold_count": len(rows),
-        "clips_evaluated": evaluated,
-        "evaluated_hours": evaluated_seconds / 3600.0,
-        "error_count": len(errors),
-    }
-    if is_ctc_wac:
-        result.update(
+        extra.update(
             {
-                "structure": "ctc_wac",
                 "stage1_candidate_clips": stage1_candidate_clips,
                 "stage1_candidate_events": stage1_candidate_events,
-                "audio_windows_evaluated": audio_windows_evaluated,
-                "stage1_candidate_events_per_hour": stage1_candidate_events / (evaluated_seconds / 3600.0)
-                if evaluated_seconds
-                else 0.0,
+                "stage1_candidate_events_per_hour": (
+                    stage1_candidate_events / (evaluated_seconds / 3600.0)
+                    if evaluated_seconds
+                    else 0.0
+                ),
                 "real_time_factor": inference_seconds / evaluated_seconds if evaluated_seconds else 0.0,
+                "candidates_by_stage1_winner": per_keyword,
+                "max_search_frames": _ctc_max_search_frames(ctx, contract),
+                "encoder_frame_shift_ms": contract.encoder_frame_shift_ms,
+                "stage1_gate_score": _ctc_wac_stage1_gate_score(ctx),
+                "ctc_proposal_score_floor": _ctc_proposal_score_floor(ctx),
+                "audio_window_seconds": audio_window_seconds,
+                "audio_window_stride_seconds": audio_window_stride_seconds,
             }
         )
-    return result
+    summary = _write_inference_summary(
+        ctx,
+        expected_label=expected_label,
+        requested=requested,
+        evaluated=evaluated,
+        evaluated_seconds=evaluated_seconds,
+        errors=errors,
+        extra=extra,
+    )
+    if not validate_outputs(ctx):
+        raise RuntimeError(f"Testing merge validation failed for {ctx.step}")
+    return {**summary, "summary": str(_summary_path(ctx))}
 
 
 def cleanup_slurm_shards(tasks: list[dict[str, Any]]) -> None:
     for task in tasks:
         Path(str(task["details"])).unlink(missing_ok=True)
-        Path(str(task["output_report"])).unlink(missing_ok=True)
+        Path(str(task["summary"])).unlink(missing_ok=True)

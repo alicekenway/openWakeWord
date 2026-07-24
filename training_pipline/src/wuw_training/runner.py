@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,7 @@ from typing import Any
 from . import PIPELINE_VERSION
 from .artifacts import file_signature, hash_payload, read_json, write_json
 from .checkpoints import CheckpointManager, step_slug
-from .config import ConfigurationError, IniConfig, parse_csv
+from .config import ConfigurationError, IniConfig, parse_step_groups
 from .context import StageContext
 from .slurm import SlurmExecutor, execution_mode
 from .stages import StageHandler, handler_for_step
@@ -50,17 +51,20 @@ class PipelineRunner:
         self.execution_mode = execution_mode(self.config)
         self.slurm = SlurmExecutor(self.config) if self.execution_mode == "slurm" else None
         self._planned: list[PlannedStep] | None = None
+        self._planned_groups: list[list[PlannedStep]] | None = None
 
-    def steps(self) -> list[str]:
+    def step_groups(self) -> list[list[str]]:
         raw = self.config.get("steps", "steps")
         assert raw is not None
-        values = parse_csv(raw)
-        if not values:
-            raise ConfigurationError("[steps] steps cannot be empty")
+        groups = parse_step_groups(raw)
+        values = [value for group in groups for value in group]
         duplicates = sorted({value for value in values if values.count(value) > 1})
         if duplicates:
             raise ConfigurationError(f"[steps] contains duplicate stage(s): {', '.join(duplicates)}")
-        return values
+        return groups
+
+    def steps(self) -> list[str]:
+        return [value for group in self.step_groups() for value in group]
 
     def _context(self, step: str, *, force: bool = False) -> StageContext:
         if not self.config.has_section(step):
@@ -101,23 +105,40 @@ class PipelineRunner:
                 output_to_step[output] = step
             planned.append(PlannedStep(step, handler, outputs))
 
+        by_name = {item.name: item for item in planned}
+        planned_groups = [[by_name[name] for name in group] for group in self.step_groups()]
         seen: set[str] = set()
-        for item in planned:
-            ctx = self._context(item.name)
-            for input_path in item.handler.input_paths(ctx):
-                input_path = input_path.resolve()
-                if input_path.exists():
-                    continue
-                producer = output_to_step.get(input_path)
-                if producer is None:
-                    raise ConfigurationError(f"Input for {item.name} does not exist and is not produced by the pipeline: {input_path}")
-                if producer not in seen:
-                    raise ConfigurationError(
-                        f"Input {input_path} for {item.name} is produced by {producer}, which must appear earlier in [steps]"
-                    )
-            seen.add(item.name)
+        for group in planned_groups:
+            group_names = {item.name for item in group}
+            for item in group:
+                ctx = self._context(item.name)
+                for input_path in item.handler.input_paths(ctx):
+                    input_path = input_path.resolve()
+                    producer = output_to_step.get(input_path)
+                    if producer is not None:
+                        if producer in group_names:
+                            raise ConfigurationError(
+                                f"Input {input_path} for {item.name} is produced by {producer}, but both are in the "
+                                "same parallel group. Move the producer to an earlier group."
+                            )
+                        if producer not in seen:
+                            raise ConfigurationError(
+                                f"Input {input_path} for {item.name} is produced by {producer}, which must appear "
+                                "in an earlier [steps] group"
+                            )
+                    elif not input_path.exists():
+                        raise ConfigurationError(
+                            f"Input for {item.name} does not exist and is not produced by the pipeline: {input_path}"
+                        )
+            seen.update(group_names)
         self._planned = planned
+        self._planned_groups = planned_groups
         return planned
+
+    def plan_groups(self) -> list[list[PlannedStep]]:
+        self.plan()
+        assert self._planned_groups is not None
+        return self._planned_groups
 
     def validate(self) -> list[PlannedStep]:
         planned = self.plan()
@@ -141,7 +162,28 @@ class PipelineRunner:
 
     def _fingerprint(self, item: PlannedStep) -> str:
         ctx = self._context(item.name)
-        return hash_payload({"pipeline_version": PIPELINE_VERSION, "step": item.name, "section": ctx.section})
+        section = dict(ctx.section)
+        if item.name.startswith("testing."):
+            # Threshold reporting belongs to [summary]. Keep obsolete testing
+            # options fingerprint-neutral so editing a sweep cannot invalidate
+            # expensive model inference in an older configuration.
+            for option in (
+                "threshold_range",
+                "threshold_start",
+                "threshold_stop",
+                "threshold_step",
+                "debounce_seconds",
+                "output_report",
+                "record_window_scores",
+            ):
+                section.pop(option, None)
+        return hash_payload(
+            {
+                "pipeline_version": PIPELINE_VERSION,
+                "step": item.name,
+                "section": section,
+            }
+        )
 
     def _status_path(self) -> Path:
         return self.experiment_dir / "experiment_status.json"
@@ -161,13 +203,19 @@ class PipelineRunner:
         status["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         write_json(self._status_path(), status)
 
-    def _select(self, *, from_step: str | None, to_step: str | None, only_step: str | None) -> list[PlannedStep]:
+    def _select(
+        self,
+        *,
+        from_step: str | None,
+        to_step: str | None,
+        only_step: str | None,
+    ) -> list[list[PlannedStep]]:
         planned = self.plan()
         names = [item.name for item in planned]
         if only_step:
             if only_step not in names:
                 raise ConfigurationError(f"Step {only_step!r} is not listed in [steps]")
-            return [planned[names.index(only_step)]]
+            return [[planned[names.index(only_step)]]]
         start = 0
         stop = len(planned)
         if from_step:
@@ -180,7 +228,12 @@ class PipelineRunner:
             stop = names.index(to_step) + 1
         if start >= stop:
             raise ConfigurationError("--from must not come after --to")
-        return planned[start:stop]
+        selected_names = set(names[start:stop])
+        return [
+            [item for item in group if item.name in selected_names]
+            for group in self.plan_groups()
+            if any(item.name in selected_names for item in group)
+        ]
 
     def run(
         self,
@@ -206,73 +259,144 @@ class PipelineRunner:
             }
         )
 
-        for item in selected:
-            input_signature = self._input_signature(item)
-            fingerprint = self._fingerprint(item)
-            requested_force = item.name in force_steps
-            base_ctx = self._context(item.name)
-            complete, reason = self.manager.is_complete(
-                item.name,
-                fingerprint=fingerprint,
-                input_signature=input_signature,
-                outputs=list(item.outputs),
-                output_validator=lambda: item.handler.validate_outputs(base_ctx),
-            )
-            if complete and not requested_force:
-                status["steps"][item.name] = {"status": "skipped", "reason": reason}
-                self._write_status(status)
-                print(f"Skipping completed step: {item.name}", flush=True)
-                continue
-
-            # A stale completion record means old artifacts must be regenerated rather
-            # than adopted by a legacy helper's own shallow output check.
-            force = requested_force or (self.manager.read_complete(item.name) is not None and not complete)
-            ctx = self._context(item.name, force=force)
-            for path in item.handler.input_paths(ctx):
-                if not path.exists():
-                    raise FileNotFoundError(
-                        f"Input for {item.name} is unavailable: {path}. Run its prerequisite stage first."
-                    )
-            status["steps"][item.name] = {"status": "running", "reason": reason}
-            self._write_status(status)
-            started = time.time()
-            print(f"\n### {item.name}", flush=True)
-            try:
-                if self.slurm is not None:
-                    result = self.slurm.run_stage(
-                        name=item.name,
-                        handler=item.handler,
-                        ctx=ctx,
-                        fingerprint=fingerprint,
-                        input_signature=input_signature,
-                        force=force,
-                    )
-                else:
-                    result = item.handler.run(ctx)
-                if not item.handler.validate_outputs(ctx):
-                    raise RuntimeError(f"Stage output validation failed: {item.name}")
-                self.manager.mark_complete(
+        for group in selected:
+            prepared: list[dict[str, Any]] = []
+            for item in group:
+                input_signature = self._input_signature(item)
+                fingerprint = self._fingerprint(item)
+                requested_force = item.name in force_steps
+                base_ctx = self._context(item.name)
+                complete, reason = self.manager.is_complete(
                     item.name,
                     fingerprint=fingerprint,
                     input_signature=input_signature,
+                    outputs=list(item.outputs),
+                    output_validator=lambda ctx=base_ctx, handler=item.handler: handler.validate_outputs(ctx),
+                )
+                if complete and not requested_force:
+                    status["steps"][item.name] = {"status": "skipped", "reason": reason}
+                    print(f"Skipping completed step: {item.name}", flush=True)
+                    continue
+
+                # A stale completion record means old artifacts must be regenerated
+                # rather than adopted by a legacy helper's shallow output check.
+                force = requested_force or (
+                    self.manager.read_complete(item.name) is not None and not complete
+                )
+                ctx = self._context(item.name, force=force)
+                for path in item.handler.input_paths(ctx):
+                    if not path.exists():
+                        raise FileNotFoundError(
+                            f"Input for {item.name} is unavailable: {path}. "
+                            "Run its prerequisite stage first."
+                        )
+                status["steps"][item.name] = {"status": "running", "reason": reason}
+                prepared.append(
+                    {
+                        "item": item,
+                        "ctx": ctx,
+                        "input_signature": input_signature,
+                        "fingerprint": fingerprint,
+                        "force": force,
+                        "started": time.time(),
+                    }
+                )
+            self._write_status(status)
+            if not prepared:
+                continue
+
+            if len(prepared) > 1:
+                names = ", ".join(value["item"].name for value in prepared)
+                print(f"\n### Parallel group: {names}", flush=True)
+
+            def execute(value: dict[str, Any]) -> dict[str, Any]:
+                item = value["item"]
+                ctx = value["ctx"]
+                if len(prepared) == 1:
+                    print(f"\n### {item.name}", flush=True)
+                else:
+                    print(f"Starting parallel step: {item.name}", flush=True)
+                if self.slurm is not None:
+                    return self.slurm.run_stage(
+                        name=item.name,
+                        handler=item.handler,
+                        ctx=ctx,
+                        fingerprint=value["fingerprint"],
+                        input_signature=value["input_signature"],
+                        force=value["force"],
+                    )
+                return item.handler.run(ctx)
+
+            def finish(
+                value: dict[str, Any],
+                *,
+                result: dict[str, Any] | None = None,
+                error: Exception | None = None,
+            ) -> Exception | None:
+                item = value["item"]
+                ctx = value["ctx"]
+                elapsed = round(time.time() - float(value["started"]), 6)
+                if error is None:
+                    try:
+                        if result is None:
+                            raise RuntimeError(f"Stage {item.name} returned no result")
+                        if not item.handler.validate_outputs(ctx):
+                            raise RuntimeError(f"Stage output validation failed: {item.name}")
+                    except Exception as exc:
+                        error = exc
+                if error is not None:
+                    self.manager.mark_failed(item.name, error)
+                    status["steps"][item.name] = {
+                        "status": "failed",
+                        "elapsed_seconds": elapsed,
+                        "error": repr(error),
+                    }
+                    self._write_status(status)
+                    return error
+                assert result is not None
+                self.manager.mark_complete(
+                    item.name,
+                    fingerprint=value["fingerprint"],
+                    input_signature=value["input_signature"],
                     outputs=list(item.outputs),
                     result=result,
                 )
                 status["steps"][item.name] = {
                     "status": "done",
-                    "elapsed_seconds": round(time.time() - started, 6),
+                    "elapsed_seconds": elapsed,
                     "result": result,
                 }
                 self._write_status(status)
-            except Exception as exc:
-                self.manager.mark_failed(item.name, exc)
-                status["steps"][item.name] = {
-                    "status": "failed",
-                    "elapsed_seconds": round(time.time() - started, 6),
-                    "error": repr(exc),
-                }
-                self._write_status(status)
-                raise
+                return None
+
+            if len(prepared) == 1:
+                value = prepared[0]
+                try:
+                    error = finish(value, result=execute(value))
+                except Exception as exc:
+                    error = finish(value, error=exc)
+                if error is not None:
+                    raise error
+                continue
+
+            future_to_value: dict[Future[dict[str, Any]], dict[str, Any]] = {}
+            first_error: Exception | None = None
+            with ThreadPoolExecutor(max_workers=len(prepared), thread_name_prefix="pipeline-step") as executor:
+                for value in prepared:
+                    future_to_value[executor.submit(execute, value)] = value
+                for future in as_completed(future_to_value):
+                    value = future_to_value[future]
+                    try:
+                        error = finish(value, result=future.result())
+                    except Exception as exc:
+                        error = finish(value, error=exc)
+                    if first_error is None and error is not None:
+                        first_error = error
+
+            if first_error is not None:
+                # Every already-started member of the group is allowed to finish so
+                # successful Slurm jobs remain reusable. The next group never starts.
+                raise first_error
         status["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self._write_status(status)
         return status

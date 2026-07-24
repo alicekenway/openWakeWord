@@ -10,16 +10,17 @@ registry is used.
 ## Configuration Contract
 
 - `[main]` holds experiment-wide paths, sample settings, and pipeline state.
-- `[steps]` contains the exact comma/newline-separated execution order.
+- `[steps]` contains sequential entries and optional bracketed parallel groups.
+  A group is a barrier: all its steps finish before the following entry starts.
 - `augment.*`, `feature.*`, and `testing.*` are independently runnable
   sub-blocks.  Common sections are reused only through explicit interpolation.
 - A feature block defines its output NPY, label, and split.  `[train]` names
   feature blocks for train/dev/false-positive validation and supplies one
   `batch.<feature-block> = N` line for every training source.
 - `[export]` converts the final PyTorch training artifact to ONNX.
-- Each `testing.*` block scores its set once and writes a Markdown FA/hour plus
-  FA-rate table for negatives or an FR-rate table for positives over its own
-  inclusive threshold range.
+- Each `testing.*` block scores its set once and writes threshold-independent
+  details and inference metadata. `[summary]` performs the configurable
+  threshold sweep without rerunning inference.
 
 ## Modular Layout
 
@@ -62,11 +63,12 @@ CNN and convolution-attention settings are supplied through documented
 by the export stage when it rebuilds the model. Attention export uses ONNX
 opset 14 or newer automatically.
 
-Each `testing.*` block writes its own Markdown threshold summary and raw,
-threshold-independent sliding-window details. It reports FR rate for positive
-sets and both FA/hour and per-clip FA rate for negative sets without
-abnormal-case output. Thresholds such as `0.1` through `0.9` at `0.2`
-increments are configured independently for every test block.
+Each `testing.*` block writes raw, threshold-independent sliding-window
+details. `[summary]` reads those details and reports FR rate for positive sets
+and both FA/hour and crop-based FA rate for negative sets. Crop-based FA rate
+is the number of inference crops with a false accept divided by the number of
+crops sent through the system. Thresholds such as `0.1` through `0.9` at
+`0.2` increments are configured only in `[summary]`.
 
 ## Verification
 

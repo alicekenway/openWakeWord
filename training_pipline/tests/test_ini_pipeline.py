@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pytest
 import torch
 
 
@@ -17,11 +19,13 @@ if str(SRC) not in sys.path:
 
 from wuw_training.artifacts import ManifestInput, normalise_manifest_inputs, write_json, write_jsonl  # noqa: E402
 from wuw_training.checkpoints import CheckpointManager  # noqa: E402
-from wuw_training.config import load_ini_config  # noqa: E402
+from wuw_training.config import ConfigurationError, load_ini_config, parse_step_groups  # noqa: E402
 from wuw_training.legacy import get_legacy_module  # noqa: E402
 from wuw_training.runner import PipelineRunner  # noqa: E402
-from wuw_training.stages.testing import _markdown_report, _metric_rows  # noqa: E402
+from wuw_training.stages import StageHandler  # noqa: E402
+from wuw_training.stages.summary import _metrics as _summary_metrics  # noqa: E402
 from wuw_training.stages.train import _weighted_probability_bce  # noqa: E402
+import wuw_training.runner as runner_module  # noqa: E402
 
 
 def _write_test_result(root: Path, name: str, expected_label: int) -> Path:
@@ -42,7 +46,16 @@ def _write_test_result(root: Path, name: str, expected_label: int) -> Path:
             }
         ],
     )
-    write_json(output / "eval_summary.json", {"sets": {name: {"error_count": 0}}})
+    write_json(
+        output / "eval_summary.json",
+        {
+            "schema_version": 1,
+            "test_step": f"testing.{name}",
+            "expected_label": expected_label,
+            "clips_evaluated": 1,
+            "error_count": 0,
+        },
+    )
     return output
 
 
@@ -89,10 +102,206 @@ output_report = ${{main:experiment_dir}}/REPORT.md
     assert payload["thresholds"][0]["sets"]["testing.negative"]["false_accept_rate"] == 1.0
     assert payload["thresholds"][0]["combined_negative"]["false_accept_rate"] == 1.0
     report = (tmp_path / "experiment" / "REPORT.md").read_text(encoding="utf-8")
-    assert "Combined negative FA rate" in report
+    assert "Combined negative FA crop rate" in report
+    assert payload["thresholds"][2]["sets"]["testing.negative"]["false_accept_crops"] == 1
+    assert payload["thresholds"][2]["sets"]["testing.negative"]["crops_evaluated"] == 3
+    assert payload["thresholds"][2]["sets"]["testing.negative"]["false_accept_rate"] == pytest.approx(1 / 3)
 
     second = runner.run()
     assert second["steps"]["summary"]["status"] == "skipped"
+
+
+def test_summary_can_reuse_old_details_without_inference_summary(tmp_path: Path) -> None:
+    positive = _write_test_result(tmp_path, "positive", 1)
+    (positive / "eval_summary.json").unlink()
+    config_path = tmp_path / "summary_only.ini"
+    config_path.write_text(
+        f"""[main]
+experiment_dir = {tmp_path / 'experiment'}
+
+[steps]
+steps = summary
+
+[testing.positive]
+expected_label = 1
+output_dir = {positive}
+
+[summary]
+tests = testing.positive
+threshold_range = [0.2, 0.4]
+threshold_step = 0.2
+output_json = ${{main:experiment_dir}}/thresholds.json
+output_report = ${{main:experiment_dir}}/REPORT.md
+""",
+        encoding="utf-8",
+    )
+
+    result = PipelineRunner(load_ini_config(config_path)).run()
+
+    assert result["steps"]["summary"]["status"] == "done"
+    payload = json.loads((tmp_path / "experiment" / "thresholds.json").read_text(encoding="utf-8"))
+    assert [item["threshold"] for item in payload["thresholds"]] == [0.2, 0.4]
+
+
+def test_step_groups_parse_parallel_brackets() -> None:
+    assert parse_step_groups("step1,\nstep2,\nstep3") == [["step1"], ["step2"], ["step3"]]
+    assert parse_step_groups("[step1.1, step1.2,\nstep1.3], step2") == [
+        ["step1.1", "step1.2", "step1.3"],
+        ["step2"],
+    ]
+    with pytest.raises(ConfigurationError, match="unclosed"):
+        parse_step_groups("[step1, step2")
+
+
+def test_parallel_step_group_finishes_before_next_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    first = tmp_path / "first.done"
+    second = tmp_path / "second.done"
+    final = tmp_path / "final.done"
+    barrier = threading.Barrier(2)
+
+    def output_paths(ctx: Any) -> list[Path]:
+        return [ctx.config.resolve_path(ctx.section["output"])]
+
+    def input_paths(ctx: Any) -> list[Path]:
+        return [first, second] if ctx.step == "summary" else []
+
+    def run_stage(ctx: Any) -> dict[str, Any]:
+        output = output_paths(ctx)[0]
+        if ctx.step.startswith("testing."):
+            barrier.wait(timeout=2.0)
+        else:
+            assert first.is_file() and second.is_file()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(ctx.step, encoding="utf-8")
+        return {"output": str(output)}
+
+    handler = StageHandler(
+        validate=lambda ctx: None,
+        input_paths=input_paths,
+        output_paths=output_paths,
+        validate_outputs=lambda ctx: output_paths(ctx)[0].is_file(),
+        run=run_stage,
+    )
+    monkeypatch.setattr(runner_module, "handler_for_step", lambda step: handler)
+    config_path = tmp_path / "parallel.ini"
+    config_path.write_text(
+        f"""[main]
+experiment_dir = {tmp_path / 'experiment'}
+
+[steps]
+steps = [testing.one, testing.two], summary
+
+[testing.one]
+output = {first}
+
+[testing.two]
+output = {second}
+
+[summary]
+output = {final}
+""",
+        encoding="utf-8",
+    )
+
+    result = PipelineRunner(load_ini_config(config_path)).run()
+
+    assert result["steps"]["testing.one"]["status"] == "done"
+    assert result["steps"]["testing.two"]["status"] == "done"
+    assert result["steps"]["summary"]["status"] == "done"
+    assert final.read_text(encoding="utf-8") == "summary"
+
+
+def test_parallel_group_rejects_an_internal_dependency(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    produced = tmp_path / "produced"
+    handler = StageHandler(
+        validate=lambda ctx: None,
+        input_paths=lambda ctx: [produced] if ctx.step == "testing.consumer" else [],
+        output_paths=lambda ctx: [produced if ctx.step == "testing.producer" else tmp_path / "consumed"],
+        validate_outputs=lambda ctx: False,
+        run=lambda ctx: {},
+    )
+    monkeypatch.setattr(runner_module, "handler_for_step", lambda step: handler)
+    config_path = tmp_path / "invalid_parallel.ini"
+    config_path.write_text(
+        f"""[main]
+experiment_dir = {tmp_path / 'experiment'}
+
+[steps]
+steps = [testing.producer, testing.consumer]
+
+[testing.producer]
+
+[testing.consumer]
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="same parallel group"):
+        PipelineRunner(load_ini_config(config_path)).validate()
+
+
+def test_testing_threshold_options_do_not_change_inference_fingerprint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output = tmp_path / "scores.jsonl"
+    handler = StageHandler(
+        validate=lambda ctx: None,
+        input_paths=lambda ctx: [],
+        output_paths=lambda ctx: [output],
+        validate_outputs=lambda ctx: output.is_file(),
+        run=lambda ctx: {},
+    )
+    monkeypatch.setattr(runner_module, "handler_for_step", lambda step: handler)
+    config_path = tmp_path / "fingerprint.ini"
+    config_path.write_text(
+        f"""[main]
+experiment_dir = {tmp_path / 'experiment'}
+
+[steps]
+steps = testing.example
+
+[testing.example]
+output = {output}
+threshold_range = [0.1, 0.9]
+threshold_step = 0.1
+""",
+        encoding="utf-8",
+    )
+    config = load_ini_config(config_path)
+    runner = PipelineRunner(config)
+    item = runner.plan()[0]
+    original = runner._fingerprint(item)
+
+    config.parser.set("testing.example", "threshold_range", "[0.4, 0.8]")
+    assert runner._fingerprint(item) == original
+
+    config.parser.set("testing.example", "audio_window_seconds", "5.12")
+    assert runner._fingerprint(item) != original
+
+
+def test_ctc_summary_fa_rate_uses_audio_crops() -> None:
+    records = [
+        {
+            "duration_seconds": 10.0,
+            "audio_window_count": 4,
+            "stage1_candidates": [
+                {"score": 0.8, "end_time": 2.0, "audio_window_index": 1},
+                {"score": 0.9, "end_time": 2.2, "audio_window_index": 1},
+            ],
+        }
+    ]
+
+    metrics = _summary_metrics(records, 0, 0.5, 1.0, 0)
+
+    assert metrics["clips_evaluated"] == 1
+    assert metrics["crops_evaluated"] == 4
+    assert metrics["false_accept_clips"] == 1
+    assert metrics["false_accept_crops"] == 1
+    assert metrics["false_accept_rate"] == 0.25
 
 
 def test_completion_checkpoint_detects_output_changes(tmp_path: Path) -> None:
@@ -197,31 +406,6 @@ def test_probability_bce_disables_autocast_and_uses_float32() -> None:
     loss.backward()
     assert predictions.grad is not None
     assert torch.isfinite(predictions.grad).all()
-
-
-def test_threshold_metrics_and_markdown_are_per_set() -> None:
-    accumulators = [
-        {"threshold": 0.1, "false_accept_events": 4, "false_accept_clips": 3, "false_rejects": 0},
-        {"threshold": 0.3, "false_accept_events": 2, "false_accept_clips": 2, "false_rejects": 0},
-    ]
-    rows = _metric_rows(accumulators, expected_label=0, evaluated=10, evaluated_seconds=3600.0)
-    assert rows[0]["false_accepts_per_hour"] == 4.0
-    assert rows[0]["false_accept_rate"] == 0.3
-    assert rows[0]["false_reject_rate"] is None
-    report = _markdown_report(
-        step="testing.negative",
-        model=Path("model.onnx"),
-        input_manifests=[Path("negative.jsonl")],
-        expected_label=0,
-        debounce_seconds=1.0,
-        requested=10,
-        evaluated=10,
-        evaluated_seconds=3600.0,
-        errors=[],
-        rows=rows,
-    )
-    assert "| Threshold | FA events | FA clips | FA/hour | FA rate | False rejects | FR rate |" in report
-    assert "| 0.1 | 4 | 3 | 4.000000 | 0.300000 | n/a | n/a |" in report
 
 
 def test_score_details_do_not_contain_threshold_or_abnormal_fields(monkeypatch: Any, tmp_path: Path) -> None:

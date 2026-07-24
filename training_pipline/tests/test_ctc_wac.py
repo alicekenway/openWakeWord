@@ -995,13 +995,6 @@ def test_testing_slurm_merge_counts_audio_windows(
             }
         ],
     )
-    captured: dict[str, object] = {}
-
-    def fake_report(**kwargs: object) -> str:
-        captured.update(kwargs)
-        return "| Threshold | FA/hour | FA rate | FR rate |\n"
-
-    monkeypatch.setattr(testing_module, "_ctc_wac_markdown_report", fake_report)
     monkeypatch.setattr(
         testing_module.Stage1Contract,
         "from_json",
@@ -1035,10 +1028,11 @@ def test_testing_slurm_merge_counts_audio_windows(
         [{"details": str(details), "count": 1, "start": 0}],
     )
 
-    assert captured["audio_windows_evaluated"] == 4
-    assert captured["audio_window_seconds"] == 5.12
-    assert captured["audio_window_stride_seconds"] == 2.56
     assert result["audio_windows_evaluated"] == 4
+    assert result["audio_window_seconds"] == 5.12
+    assert result["audio_window_stride_seconds"] == 2.56
+    summary = json.loads((output_dir / "eval_summary.json").read_text(encoding="utf-8"))
+    assert summary["audio_windows_evaluated"] == 4
 
 
 def test_generated_contract_fields_and_first_chunk_attention_mask(tmp_path: Path) -> None:

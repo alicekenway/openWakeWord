@@ -89,9 +89,12 @@ trusted `setup_commands` when compute nodes need a different environment.
 
 - `[main]` defines the experiment directory, model name, feature-model assets,
   sample rate, clip length, seed, and pipeline checkpoint directory.
-- `[steps] steps = ...` is the single source of execution order. Use named
-  substeps such as `augment.positive_train`, `feature.negative_cv_train`, and
-  `testing.background`.
+- `[steps] steps = ...` is the single source of execution order. Plain entries
+  run sequentially. Put independent entries inside brackets to run them in
+  parallel, for example
+  `steps = [testing.positive, testing.negative], summary`. The next entry
+  starts only after every member of the bracket succeeds. A step cannot consume
+  an output from another step in the same bracket.
 - An `augment.*` block accepts `input_jsonl`, optional `audio_base_dir`, one or
   more `noise_jsonl`/`noise_dir` sources, augmentation settings, and an output
   WAV directory plus output manifest.
@@ -107,28 +110,48 @@ trusted `setup_commands` when compute nodes need a different environment.
   `false_positive` remain readable and are merged into the labeled dev list.
 - `[export]` reads the final training `.pt` artifact and writes ONNX. It can
   verify PyTorch/ONNX Runtime inference parity.
-- Every `testing.*` block evaluates one positive or negative set once, sweeps
-  its configured inclusive threshold range over the resulting window scores,
-  and writes `threshold_summary.md` plus threshold-independent score details.
-  Positive reports show false-reject rate; negative reports show false accepts
-  per hour and false-accept rate (the share of evaluated clips with at least
-  one false accept). No abnormal-case file or JSON summary is produced.
+- Every `testing.*` block evaluates one positive or negative set once and
+  writes threshold-independent `eval_details.jsonl` scores plus
+  `eval_summary.json` inference metadata.
+- `[summary]` reads one or more completed `testing.*` blocks and performs the
+  inexpensive threshold sweep. Changing its threshold range does not rerun
+  model inference. Positive metrics use source utterances for FR. Negative
+  `FA rate` is false-accepted inference crops divided by all evaluated
+  inference crops; `FA/hour` remains the debounced event count divided by
+  evaluated audio duration.
 
-Configure a per-set threshold sweep explicitly or interpolate common values:
+Run independent tests together, then generate the report:
 
 ```ini
-[testing.common]
+[steps]
+steps = [testing.positive, testing.negative], summary
+
+[testing.positive]
+expected_label = 1
+output_dir = ${main:experiment_dir}/evaluation/positive
+# model/input settings omitted
+
+[testing.negative]
+expected_label = 0
+output_dir = ${main:experiment_dir}/evaluation/negative
+# model/input settings omitted
+
+[summary]
+tests = testing.positive, testing.negative
 threshold_range = [0.1, 0.9]
 threshold_step = 0.2
 debounce_seconds = 1.0
-
-[testing.positive]
-threshold_range = ${testing.common:threshold_range}
-threshold_step = ${testing.common:threshold_step}
-output_report = ${main:experiment_dir}/evaluation/positive/threshold_summary.md
+output_json = ${main:experiment_dir}/thresholds.json
+output_report = ${main:experiment_dir}/REPORT.md
 ```
 
 `threshold_step` must reach the inclusive end of `threshold_range` exactly.
+To try another range after inference, edit only `[summary]` and run
+`--only summary`.
+Older `threshold_*`, `threshold_range`, `threshold_step`, and `output_report`
+lines inside `[testing.*]` are no longer used; move them to `[summary]`.
+Existing `eval_details.jsonl` files can be summarized directly, even when they
+were created before `eval_summary.json` was introduced.
 
 Only genuine lists use JSON syntax within the INI, for example
 `phase_learning_rates = [0.0001, 0.00001, 0.000001]` or
@@ -399,8 +422,8 @@ silently reject candidates before the configured confidence gate. Set it to a
 finite number only after measuring its recall impact; use `none` to disable
 it. The default `stage1_gate_score = normalized_ctc_score` is retained only
 for compatibility with older keyword files whose thresholds are negative
-normalized CTC log scores. The `[testing.*] threshold_range` always sweeps the final Stage-2
-classifier probability, independently of the Stage-1 gate.
+normalized CTC log scores. The `[summary] threshold_range` always sweeps the
+final Stage-2 classifier probability, independently of the Stage-1 gate.
 
 If you use some other ONNX exporter, you must create its contract manually.
 The example is a template, not a universal WeNet interface. For example, a
@@ -428,9 +451,10 @@ and evaluation should use the same stage-1 ONNX file.
 
 The CTC-WAC evaluator runs both ONNX files. It uses the same bounded CTC
 boundary scorer and candidate crop as feature generation, then supplies an
-all-one mask for the unpadded crop. It reports the effective rolling CTC
-horizon, stage-1 candidate rate, final false-accept/false-reject threshold
-sweep, candidate counts by winning wake word, and real-time factor.
+all-one mask for the unpadded crop. It saves the effective rolling CTC horizon,
+stage-1 candidate rate, candidate counts by winning wake word, and real-time
+factor as inference metadata. The separate `[summary]` stage calculates the
+final false-accept/false-reject threshold sweep.
 
 ### CNN and attention model choices
 
