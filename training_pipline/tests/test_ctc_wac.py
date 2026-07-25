@@ -1035,7 +1035,7 @@ def test_testing_slurm_merge_counts_audio_windows(
     assert summary["audio_windows_evaluated"] == 4
 
 
-def test_generated_contract_fields_and_first_chunk_attention_mask(tmp_path: Path) -> None:
+def test_generated_contract_fields_and_progressive_attention_mask(tmp_path: Path) -> None:
     contract_path = tmp_path / "stage1.contract.json"
     write_json(
         contract_path,
@@ -1069,6 +1069,14 @@ def test_generated_contract_fields_and_first_chunk_attention_mask(tmp_path: Path
     assert not first[..., :64].any()
     assert first[..., 64:].all()
     runner._chunks_run = 1
+    second = runner._streaming_attention_mask()
+    assert not second[..., :48].any()
+    assert second[..., 48:].all()
+    runner._chunks_run = 3
+    fourth = runner._streaming_attention_mask()
+    assert not fourth[..., :16].any()
+    assert fourth[..., 16:].all()
+    runner._chunks_run = 4
     assert runner._streaming_attention_mask().all()
 
 

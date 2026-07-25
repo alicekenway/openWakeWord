@@ -43,13 +43,150 @@ def add_meta_data(filename: Path, meta_data: Dict[str, Any]) -> None:
     onnx.save(model, str(filename))
 
 
+def _squeezeformer_forward_chunk(
+    encoder: torch.nn.Module,
+    xs: torch.Tensor,
+    offset: torch.Tensor,
+    required_cache_size: torch.Tensor,
+    att_cache: torch.Tensor,
+    cnn_cache: torch.Tensor,
+    att_mask: torch.Tensor,
+):
+    """Run Squeezeformer streaming inference with a cache-aware mask.
+
+    WeNet's Squeezeformer ``forward_chunk`` restores the full attention mask
+    after a time-reduction/recovery pair and then uses that mask to zero the
+    recovered *current* activations. During fixed-cache ONNX export the
+    attention mask contains ``cache + current`` frames, while the activation
+    tensor contains only ``current`` frames. The current-frame padding mask is
+    the correct mask for that operation. Keeping this adapter in the exporter
+    avoids modifying the user's WeNet installation.
+    """
+
+    assert xs.size(0) == 1
+    tmp_masks = torch.ones(
+        1,
+        1,
+        xs.size(1),
+        device=xs.device,
+        dtype=torch.bool,
+    )
+    if encoder.global_cmvn is not None:
+        xs = encoder.global_cmvn(xs)
+    xs, pos_emb, _ = encoder.embed(xs, tmp_masks, offset)
+    elayers, cache_t1 = att_cache.size(0), att_cache.size(2)
+    chunk_size = xs.size(1)
+    attention_key_size = cache_t1 + chunk_size
+    pos_emb = encoder.embed.position_encoding(
+        offset=offset - cache_t1,
+        size=attention_key_size,
+    )
+    if required_cache_size < 0:
+        next_cache_start = 0
+    elif required_cache_size == 0:
+        next_cache_start = attention_key_size
+    else:
+        next_cache_start = max(attention_key_size - required_cache_size, 0)
+
+    r_att_cache = []
+    r_cnn_cache = []
+    mask_pad = torch.ones(
+        1,
+        1,
+        xs.size(1),
+        device=xs.device,
+        dtype=torch.bool,
+    )
+    max_att_len: int = 0
+    recover_activations = []
+    index = 0
+    xs_lens = torch.tensor([xs.size(1)], device=xs.device, dtype=torch.int)
+    xs = encoder.preln(xs)
+
+    for i, layer in enumerate(encoder.encoders):
+        if encoder.reduce_idx is not None:
+            if encoder.time_reduce is not None and i in encoder.reduce_idx:
+                recover_activations.append((xs, att_mask, pos_emb, mask_pad))
+                xs, xs_lens, att_mask, mask_pad = encoder.time_reduction_layer(
+                    xs,
+                    xs_lens,
+                    att_mask,
+                    mask_pad,
+                )
+                pos_emb = pos_emb[:, ::2, :]
+                index += 1
+
+        if encoder.recover_idx is not None:
+            if encoder.time_reduce == "recover" and i in encoder.recover_idx:
+                index -= 1
+                (
+                    recover_tensor,
+                    recover_att_mask,
+                    recover_pos_emb,
+                    recover_mask_pad,
+                ) = recover_activations[index]
+                xs = xs.unsqueeze(2).repeat(1, 1, 2, 1).flatten(1, 2)
+                xs = encoder.time_recover_layer(xs)
+                recovered_t = recover_tensor.size(1)
+                xs = recover_tensor + xs[:, :recovered_t, :].contiguous()
+                att_mask = recover_att_mask
+                pos_emb = recover_pos_emb
+                mask_pad = recover_mask_pad
+                # The attention mask is [B, 1, cache + current]. The padding
+                # mask is [B, 1, current], which is the shape required here.
+                if mask_pad.size(1) != 0:
+                    xs = xs.masked_fill(
+                        ~mask_pad[:, 0, :].unsqueeze(-1),
+                        0.0,
+                    )
+
+        factor = encoder.calculate_downsampling_factor(i)
+        xs, _, new_att_cache, new_cnn_cache = layer(
+            xs,
+            att_mask,
+            pos_emb,
+            att_cache=(
+                att_cache[i : i + 1][:, :, ::factor, :][
+                    :, :, : pos_emb.size(1) - xs.size(1), :
+                ]
+                if elayers > 0
+                else att_cache[:, :, ::factor, :]
+            ),
+            cnn_cache=cnn_cache[i] if cnn_cache.size(0) > 0 else cnn_cache,
+        )
+        cached_att = new_att_cache[:, :, next_cache_start // factor :, :]
+        cached_cnn = new_cnn_cache.unsqueeze(0)
+        cached_att = (
+            cached_att.unsqueeze(3)
+            .repeat(1, 1, 1, factor, 1)
+            .flatten(2, 3)
+        )
+        if i == 0:
+            max_att_len = cached_att.size(2)
+        r_att_cache.append(cached_att[:, :, :max_att_len, :])
+        r_cnn_cache.append(cached_cnn)
+
+    r_att_cache = torch.cat(r_att_cache, dim=0)
+    r_cnn_cache = torch.cat(r_cnn_cache, dim=0)
+    if encoder.final_proj is not None:
+        xs = encoder.final_proj(xs)
+    return xs, r_att_cache, r_cnn_cache
+
+
 class WuwStage1Onnx(torch.nn.Module):
     """A single streaming graph that returns encoder features and CTC scores."""
 
-    def __init__(self, encoder: torch.nn.Module, ctc: torch.nn.Module):
+    def __init__(
+        self,
+        encoder: torch.nn.Module,
+        ctc: torch.nn.Module,
+        *,
+        squeezeformer: bool = False,
+    ):
         super().__init__()
         self.encoder = encoder
         self.ctc = ctc
+        self.squeezeformer = squeezeformer
 
     def forward(
         self,
@@ -60,14 +197,27 @@ class WuwStage1Onnx(torch.nn.Module):
         cnn_cache: torch.Tensor,
         att_mask: torch.Tensor,
     ):
-        encoder_out, next_att_cache, next_cnn_cache = self.encoder.forward_chunk(
-            xs=chunk,
-            offset=offset,
-            required_cache_size=required_cache_size,
-            att_cache=att_cache,
-            cnn_cache=cnn_cache,
-            att_mask=att_mask,
-        )
+        if self.squeezeformer:
+            encoder_out, next_att_cache, next_cnn_cache = (
+                _squeezeformer_forward_chunk(
+                    self.encoder,
+                    chunk,
+                    offset,
+                    required_cache_size,
+                    att_cache,
+                    cnn_cache,
+                    att_mask,
+                )
+            )
+        else:
+            encoder_out, next_att_cache, next_cnn_cache = self.encoder.forward_chunk(
+                xs=chunk,
+                offset=offset,
+                required_cache_size=required_cache_size,
+                att_cache=att_cache,
+                cnn_cache=cnn_cache,
+                att_mask=att_mask,
+            )
         ctc_log_probs = self.ctc.log_softmax(encoder_out)
         return encoder_out, ctc_log_probs, next_att_cache, next_cnn_cache
 
@@ -351,7 +501,17 @@ def _verify_model(
     strict: bool = False,
 ) -> None:
     onnx.checker.check_model(onnx.load(str(path)))
-    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    session_options = ort.SessionOptions()
+    session_options.intra_op_num_threads = max(
+        1,
+        int(os.environ.get("SLURM_CPUS_PER_TASK", "1")),
+    )
+    session_options.inter_op_num_threads = 1
+    session = ort.InferenceSession(
+        str(path),
+        sess_options=session_options,
+        providers=["CPUExecutionProvider"],
+    )
     feed = _runtime_feed(
         session,
         chunk=chunk,
@@ -421,6 +581,11 @@ def main() -> None:
     efficient_onnx_mode = callable(set_global_chunk_size)
     if efficient_onnx_mode:
         set_global_chunk_size(chunk_size=args.chunk_size)
+    configured_encoder = str(configs.get("encoder", "")).strip().lower()
+    squeezeformer_mode = (
+        configured_encoder == "squeezeformer"
+        or torch_model.encoder.__class__.__name__.lower().startswith("squeezeformer")
+    )
 
     encoder_conf = configs["encoder_conf"]
     head = int(encoder_conf["attention_heads"])
@@ -471,7 +636,11 @@ def main() -> None:
     offset = torch.tensor(initial_offset, dtype=torch.int64)
     required_cache_size = torch.tensor(required_cache_size_value, dtype=torch.int64)
 
-    model = WuwStage1Onnx(torch_model.encoder, torch_model.ctc).eval()
+    model = WuwStage1Onnx(
+        torch_model.encoder,
+        torch_model.ctc,
+        squeezeformer=squeezeformer_mode,
+    ).eval()
     output_fp32 = output_dir / f"{args.output_prefix}.onnx"
     output_int8 = output_dir / f"{args.output_prefix}.int8.onnx"
     output_contract = output_dir / f"{args.output_prefix}.contract.json"
@@ -514,6 +683,7 @@ def main() -> None:
         "model_author": "wenet",
         "comment": "streaming encoder feature plus CTC log probabilities",
         "url": os.environ.get("WENET_URL", ""),
+        "encoder_type": configured_encoder or torch_model.encoder.__class__.__name__,
         "encoder_chunk_size": args.chunk_size,
         "input_chunk_frames": decoding_window,
         "input_stride_frames": input_stride,

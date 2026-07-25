@@ -2184,12 +2184,15 @@ class StreamingCtcStage1:
         if spec is None:
             raise RuntimeError("The stage-1 contract does not define an attention mask")
         mask = np.ones((1, 1, spec.cache_frames + spec.chunk_frames), dtype=np.bool_)
-        # We allocate the full fixed-size cache before inference.  Its zeros
-        # are not real history on the first chunk, so WeNet masks them.  After
-        # the first call, forward_chunk has populated the cache and WeNet's
-        # own ONNX simulation uses an all-true mask.
-        if self._chunks_run == 0:
-            mask[:, :, :spec.cache_frames] = False
+        # The cache has a fixed allocated size, but it fills one encoder chunk
+        # at a time. Keep the unused leading cache positions masked until
+        # enough chunks have run to replace all dummy zeros with real history.
+        valid_cache_frames = min(
+            spec.cache_frames,
+            self._chunks_run * spec.chunk_frames,
+        )
+        invalid_cache_frames = spec.cache_frames - valid_cache_frames
+        mask[:, :, :invalid_cache_frames] = False
         return mask
 
     @staticmethod
