@@ -189,16 +189,21 @@ every valid best candidate in a ragged bundle, plus its score, margin, keyword
 winner, crop boundaries, and (for positives) the expected keyword ID. It also
 compares the selected keyword against the strongest non-keyword CTC sequence
 found by prefix beam search on exactly the same candidate frames.
-`[stage1_report]` writes threshold-by-keyword tables before any filtering.
-Each row has one selected stage-1 keyword: the highest-scoring keyword for
-that candidate. Positive tables give each keyword's FR using only that
-keyword's expected examples as its denominator. Stage 1 is treated as a binary
-candidate detector: if any selected keyword passes, the positive clip is a hit
-even when the winning keyword differs from the expected keyword. Negative
-tables give total `FA/h` and total FA rate over all input clips, followed by
-per-winning-keyword false-accept counts and `FA/h`; a negative clip contributes
-to at most one keyword. Positive FR includes examples where no complete CTC
-alignment was found or whose selected candidate is below threshold. The
+`[stage1_report]` writes three separate human-readable score reports before
+any filtering: normalized CTC score, keyword-versus-filler confidence, and
+length-normalized keyword-versus-filler confidence. The configured
+`output_report` is a small index linking those files. Inside each score file,
+each wake word has its own block. Every referenced positive dataset lists its
+thresholds and FR, while every negative dataset lists thresholds, `FA/h`, and
+FA rate. Each feature row has one selected stage-1 keyword: the highest-scoring
+keyword for that candidate. Positive FR uses that keyword's expected examples
+as its denominator. Stage 1 is treated as a binary candidate detector: if any
+selected keyword passes, the positive clip is a hit even when the winning
+keyword differs from the expected keyword. For negatives, a clip contributes
+to at most one keyword, its selected winner; FA rate still uses all input clips
+in the dataset as its denominator. Positive FR includes examples where no
+complete CTC alignment was found or whose selected candidate is below
+threshold. The
 `[train] structure = ctc_wac` step applies each wake word's manual stage-1
 threshold later, immediately before training the WAC model. That means you can
 choose a threshold and retrain stage 2 without rerunning the expensive CTC
@@ -373,7 +378,8 @@ The intended first-run workflow is:
 
 ```bash
 "$PYTHON" "$PIPELINE" run --config "$CONFIG" --to stage1_report
-# Inspect stage1_report/candidates.md, then set each keyword's threshold.
+# Inspect stage1_report/candidates.normalized_confidence.md (or either of the
+# other score-specific reports), then set each keyword's threshold.
 "$PYTHON" "$PIPELINE" run --config "$CONFIG" --from train
 ```
 

@@ -144,6 +144,13 @@ def _output_report(ctx: Any) -> Path:
     return ctx.config.resolve_path(require(ctx.section, "output_report", ctx.step))
 
 
+def _score_report_path(index_path: Path, score_id: str) -> Path:
+    """Derive one human-readable report path from the configured index path."""
+
+    suffix = index_path.suffix or ".md"
+    return index_path.with_name(f"{index_path.stem}.{score_id}{suffix}")
+
+
 def _thresholds(
     ctx: Any,
     *,
@@ -213,14 +220,24 @@ def output_paths(ctx: Any) -> list[Path]:
 
 
 def validate_outputs(ctx: Any) -> bool:
-    output_json, output_report = output_paths(ctx)
-    if not output_json.is_file() or not output_report.is_file():
+    output_json, report_index = output_paths(ctx)
+    if not output_json.is_file() or not report_index.is_file():
         return False
     try:
         payload = read_json(output_json)
-        return payload.get("report_schema") == 6 and "Stage-1 Threshold Tables" in output_report.read_text(
-            encoding="utf-8"
-        )
+        if payload.get("report_schema") != 7:
+            return False
+        score_ids = _payload_score_ids(payload)
+        if not score_ids:
+            return False
+        index_text = report_index.read_text(encoding="utf-8")
+        for score_id in score_ids:
+            report_path = _score_report_path(report_index, score_id)
+            if not report_path.is_file() or report_path.name not in index_text:
+                return False
+            if "Positive clips are binary wake-word hits" not in report_path.read_text(encoding="utf-8"):
+                return False
+        return True
     except Exception:
         return False
 
@@ -553,94 +570,128 @@ def _format_percent(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.2%}"
 
 
-def _markdown(payload: dict[str, Any]) -> str:
+def _payload_score_ids(payload: dict[str, Any]) -> list[str]:
+    """Return active score IDs in their declared order."""
+
+    available = {
+        score_id
+        for block in payload.get("blocks", [])
+        for score_id in block.get("score_tables", {})
+    }
+    return [
+        str(definition["id"])
+        for definition in payload.get("score_definitions", [])
+        if definition.get("id") in available
+    ]
+
+
+def _score_definition(payload: dict[str, Any], score_id: str) -> dict[str, Any]:
+    for definition in payload["score_definitions"]:
+        if definition["id"] == score_id:
+            return definition
+    raise RuntimeError(f"Stage-1 report has no score definition for {score_id}")
+
+
+def _metric_values(rows: list[dict[str, Any]], keyword_id: str, key: str) -> str:
+    values: list[str] = []
+    for row in rows:
+        value = row["keywords"][keyword_id]
+        if key == "false_rejection_rate":
+            values.append(
+                f"{value['false_rejections']} ({_format_percent(value['false_rejection_rate'])})"
+            )
+        elif key == "false_accepts_per_hour":
+            values.append(f"{value['false_accepts_per_hour']:.4f}")
+        elif key == "false_accept_rate":
+            values.append(_format_percent(value["false_accept_rate"]))
+        else:
+            raise RuntimeError(f"Unsupported Stage-1 report metric {key}")
+    return " | ".join(values)
+
+
+def _score_markdown(payload: dict[str, Any], score_id: str) -> str:
+    definition = _score_definition(payload, score_id)
+    blocks = [block for block in payload["blocks"] if score_id in block["score_tables"]]
+    keyword_ids: list[str] = []
+    for block in blocks:
+        for keyword_id in block["keyword_ids"]:
+            if keyword_id not in keyword_ids:
+                keyword_ids.append(keyword_id)
     lines = [
-        "# Stage-1 Threshold Tables",
+        f"# {definition['label']}",
         "",
-        "Each score section has its own configured threshold range.",
+        definition["description"],
+        "",
         (
             "The stage-1 winner is chosen once by the feature bundle's configured candidate decoder. "
-            "Each score below only decides whether that already-selected candidate passes its threshold."
+            "The threshold only decides whether that selected candidate passes."
         ),
         (
-            "For positives, Stage 1 is evaluated as a binary wake-word candidate detector. Each keyword column "
-            "uses that ground-truth keyword's examples, and any selected keyword above the threshold is a hit. "
-            "A passed different keyword is therefore correct, not an FR."
+            "Positive clips are binary wake-word hits: a passed different keyword is still correct and is not "
+            "counted as a false rejection."
         ),
         (
-            "For negatives, `Total FA/h` and `Total FA rate` use all input clips in the block. Each negative "
-            "clip contributes at most one false accept—the selected winner—and the keyword columns show how "
-            "those false accepts are distributed. Neither is a final system metric."
+            "For negatives, each clip contributes to at most one keyword: its selected winner. FA rate uses "
+            "all input clips in that dataset as its denominator."
         ),
     ]
-    for block in payload["blocks"]:
-        keyword_ids = block["keyword_ids"]
-        lines.extend(["", f"## {block['name']}"])
-        if block["candidate_search"] == "contextual_wuw_beam":
-            lines.extend(
-                [
-                    "",
-                    "Contextual BPE beam mode. "
-                    f"{block['no_wuw_hypothesis_rows']} input(s) had no final WUW hypothesis and "
-                    "therefore contribute confidence 0 / no Stage-2 crop.",
-                ]
-            )
-        for score_definition in block["score_definitions"]:
-            score_table = block["score_tables"][score_definition["id"]]
-            lines.extend(["", f"### {score_table['score_label']}", "", score_table["score_description"], ""])
-            if block["label"] == 1:
-                counts = score_table["expected_keyword_rows"]
-                total = score_table["expected_rows"]
+    for keyword_index, keyword_id in enumerate(keyword_ids):
+        if keyword_index:
+            lines.extend(["", "=" * 72, ""])
+        lines.extend(["", f"# {keyword_id}"])
+        for block in blocks:
+            if keyword_id not in block["keyword_ids"]:
+                continue
+            score_table = block["score_tables"][score_id]
+            threshold_rows = score_table["threshold_table"]
+            thresholds = " | ".join(f"{row['threshold']:.6g}" for row in threshold_rows)
+            lines.extend(["", f"## {block['name']}", ""])
+            if block["candidate_search"] == "contextual_wuw_beam":
                 lines.extend(
                     [
-                        "Positive set. Each per-keyword denominator is shown in its column header.",
+                        "Contextual BPE beam mode. "
+                        f"{block['no_wuw_hypothesis_rows']} input(s) had no final WUW hypothesis.",
                         "",
-                        "| Threshold | Any-hit Acc / No-hit FR (n="
-                        + str(total)
-                        + ") | "
-                        + " | ".join(
-                            f"{keyword_id} (Acc / FR; n={counts[keyword_id]})" for keyword_id in keyword_ids
-                        )
-                        + " |",
-                        "| ---: | " + " | ".join("---:" for _ in range(len(keyword_ids) + 1)) + " |",
                     ]
                 )
-                for threshold_row in score_table["threshold_table"]:
-                    overall = threshold_row["overall"]
-                    cells = [
-                        f"{_format_percent(1.0 - overall['false_rejection_rate'])} / "
-                        f"{overall['false_rejections']} ({_format_percent(overall['false_rejection_rate'])})",
+            if block["label"] == 1:
+                expected = score_table["expected_keyword_rows"][keyword_id]
+                lines.extend(
+                    [
+                        f"Positive dataset. Expected `{keyword_id}` examples: {expected}.",
+                        "",
+                        f"Threshold: {thresholds}",
+                        "FR: "
+                        + _metric_values(threshold_rows, keyword_id, "false_rejection_rate"),
                     ]
-                    for keyword_id in keyword_ids:
-                        value = threshold_row["keywords"][keyword_id]
-                        cells.append(
-                            f"{_format_percent(value['accuracy'])} / "
-                            f"{value['false_rejections']} ({_format_percent(value['false_rejection_rate'])})"
-                        )
-                    lines.append(f"| {threshold_row['threshold']:.6g} | " + " | ".join(cells) + " |")
+                )
             else:
                 duration = score_table["input_duration_seconds"] / 3600.0
                 lines.extend(
                     [
-                        f"Negative set. Source duration: {duration:.6f} h.",
+                        f"Negative dataset. Input clips: {score_table['input_rows']}; duration: {duration:.6f} h.",
                         "",
-                        "| Threshold | Total FAs | Total FA/h | Total FA rate | "
-                        + " | ".join(f"{keyword_id} (FAs / FA/h)" for keyword_id in keyword_ids)
-                        + " |",
-                        "| ---: | ---: | ---: | ---: | " + " | ".join("---:" for _ in keyword_ids) + " |",
+                        f"Threshold: {thresholds}",
+                        "FA/h: "
+                        + _metric_values(threshold_rows, keyword_id, "false_accepts_per_hour"),
+                        "FA rate: "
+                        + _metric_values(threshold_rows, keyword_id, "false_accept_rate"),
                     ]
                 )
-                for threshold_row in score_table["threshold_table"]:
-                    overall = threshold_row["overall"]
-                    cells = [
-                        str(overall["false_accepts"]),
-                        f"{overall['false_accepts_per_hour']:.4f}",
-                        _format_percent(overall["false_accept_rate"]),
-                    ]
-                    for keyword_id in keyword_ids:
-                        value = threshold_row["keywords"][keyword_id]
-                        cells.append(f"{value['false_accepts']} / {value['false_accepts_per_hour']:.4f}")
-                    lines.append(f"| {threshold_row['threshold']:.6g} | " + " | ".join(cells) + " |")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _index_markdown(payload: dict[str, Any], index_path: Path) -> str:
+    lines = [
+        "# Stage-1 score reports",
+        "",
+        "Each score has a separate human-readable report:",
+        "",
+    ]
+    for score_id in _payload_score_ids(payload):
+        definition = _score_definition(payload, score_id)
+        report_path = _score_report_path(index_path, score_id)
+        lines.append(f"- [{definition['label']}]({report_path.name})")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -648,7 +699,7 @@ def run(ctx: Any) -> dict[str, Any]:
     score_thresholds = _score_thresholds(ctx)
     blocks = [_block_payload(block, score_thresholds) for block in _blocks(ctx)]
     payload = {
-        "report_schema": 6,
+        "report_schema": 7,
         # Keep the original field temporarily for readers that only consume
         # the existing normalized CTC score.
         "threshold_sweep": _threshold_sweep(score_thresholds["normalized_ctc_score"]),
@@ -661,10 +712,20 @@ def run(ctx: Any) -> dict[str, Any]:
         "blocks": blocks,
     }
     output_json = _output_json(ctx)
-    output_report = _output_report(ctx)
+    report_index = _output_report(ctx)
     write_json(output_json, payload)
-    output_report.parent.mkdir(parents=True, exist_ok=True)
-    output_report.write_text(_markdown(payload), encoding="utf-8")
+    report_index.parent.mkdir(parents=True, exist_ok=True)
+    report_paths: dict[str, str] = {}
+    for score_id in _payload_score_ids(payload):
+        report_path = _score_report_path(report_index, score_id)
+        report_path.write_text(_score_markdown(payload, score_id), encoding="utf-8")
+        report_paths[score_id] = str(report_path)
+    report_index.write_text(_index_markdown(payload, report_index), encoding="utf-8")
     if not validate_outputs(ctx):
         raise RuntimeError(f"Stage-1 report output validation failed for {ctx.step}")
-    return {"output_json": str(output_json), "output_report": str(output_report), "block_count": len(blocks)}
+    return {
+        "output_json": str(output_json),
+        "output_report": str(report_index),
+        "score_reports": report_paths,
+        "block_count": len(blocks),
+    }

@@ -1521,7 +1521,7 @@ normalized_confidence_threshold_step = 0.5
     )
     PipelineRunner(load_ini_config(config)).run()
     payload = json.loads((tmp_path / "experiment" / "report.json").read_text(encoding="utf-8"))
-    assert payload["report_schema"] == 6
+    assert payload["report_schema"] == 7
     positive_tables = payload["blocks"][0]["score_tables"]
     negative_tables = payload["blocks"][1]["score_tables"]
     positive_table = positive_tables["normalized_ctc_score"]["threshold_table"]
@@ -1568,13 +1568,26 @@ normalized_confidence_threshold_step = 0.5
     assert negative_confidence_at_half["keywords"]["wake_b"]["false_accept_share"] == 0.0
     assert positive_confidence_at_half["overall"]["false_rejections"] == 2
     assert positive_confidence_at_half["overall"]["false_rejection_rate"] == 0.5
-    markdown = (tmp_path / "experiment" / "report.md").read_text(encoding="utf-8")
-    assert "Any-hit Acc / No-hit FR" in markdown
-    assert "Total FA/h" in markdown
-    assert "FAs / FA/h" in markdown
-    assert "Keyword-versus-filler confidence" in markdown
-    assert "Length-normalized keyword-versus-filler confidence" in markdown
-    assert "quantile" not in markdown.lower()
+    report_dir = tmp_path / "experiment"
+    index = (report_dir / "report.md").read_text(encoding="utf-8")
+    normalized_ctc = (report_dir / "report.normalized_ctc_score.md").read_text(encoding="utf-8")
+    confidence = (report_dir / "report.confidence.md").read_text(encoding="utf-8")
+    normalized_confidence = (report_dir / "report.normalized_confidence.md").read_text(encoding="utf-8")
+    assert "report.normalized_ctc_score.md" in index
+    assert "report.confidence.md" in index
+    assert "report.normalized_confidence.md" in index
+    assert "# wake_a" in normalized_ctc
+    assert "## feature.positive" in normalized_ctc
+    assert "## feature.negative" in normalized_ctc
+    assert "Threshold: -5 | -4 | -3 | -2 | -1 | 0" in normalized_ctc
+    assert "FR: " in normalized_ctc
+    assert "FA/h: " in normalized_ctc
+    assert "FA rate: " in normalized_ctc
+    assert "=" * 72 in normalized_ctc
+    assert "| Threshold |" not in normalized_ctc
+    assert "Keyword-versus-filler confidence" in confidence
+    assert "Length-normalized keyword-versus-filler confidence" in normalized_confidence
+    assert "quantile" not in normalized_ctc.lower()
 
 
 def test_stage1_report_uses_contextual_scores_and_counts_no_wuw_positive(tmp_path: Path) -> None:
@@ -1640,6 +1653,11 @@ normalized_confidence_threshold_step = 0.5
     at_zero = next(item for item in table if item["threshold"] == 0.0)
     assert at_zero["overall"]["expected_rows"] == 5
     assert at_zero["overall"]["false_rejections"] == 1
-    markdown = (tmp_path / "experiment" / "report.md").read_text(encoding="utf-8")
+    index = (tmp_path / "experiment" / "report.md").read_text(encoding="utf-8")
+    markdown = (tmp_path / "experiment" / "report.normalized_contextual_confidence.md").read_text(
+        encoding="utf-8"
+    )
+    assert "report.normalized_contextual_confidence.md" in index
+    assert "report.contextual_confidence.md" in index
     assert "Normalized contextual WUW confidence" in markdown
     assert "no final WUW hypothesis" in markdown
