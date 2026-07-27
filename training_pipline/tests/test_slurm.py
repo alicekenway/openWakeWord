@@ -19,8 +19,10 @@ from wuw_training.context import StageContext  # noqa: E402
 from wuw_training.slurm import (  # noqa: E402
     WORKER_PROTOCOL,
     SlurmExecutor,
+    _merge_state_path,
     _step_settings,
     _task_path,
+    run_merge_worker,
     run_worker,
 )
 from wuw_training.stages import DistributedStageHandler, StageHandler  # noqa: E402
@@ -55,6 +57,7 @@ def test_slurm_step_settings_validate_task_count_and_owned_options(tmp_path: Pat
     settings = _step_settings(config, "feature.demo")
     assert settings.tasks == 2
     assert settings.sbatch_args == ("--mem=12G", "--partition=gpu")
+    assert settings.merge_sbatch_args == settings.sbatch_args
 
     config = load_ini_config(_slurm_config(tmp_path, args="--array=0-1"))
     with pytest.raises(ConfigurationError, match="must not set --array"):
@@ -71,6 +74,11 @@ def test_batch_script_uses_the_ctc_pipeline_cli_directly(tmp_path: Path) -> None
     assert "-m wuw_training.cli __slurm-worker" in text
     assert "wuw_pipeline.py" not in text
     assert "export PYTHONPATH=" in text
+
+    merge_script = executor._merge_batch_script(work_dir, tmp_path / "config.ini", tmp_path / "spec.json")
+    merge_text = merge_script.read_text(encoding="utf-8")
+    assert "-m wuw_training.cli __slurm-merge" in merge_text
+    assert "SLURM_ARRAY_TASK_ID" not in merge_text
 
 
 def test_feature_shards_are_contiguous_and_cap_tasks_at_record_count(tmp_path: Path) -> None:
@@ -120,7 +128,8 @@ def test_slurm_executor_reuses_completed_shards_after_a_failure(tmp_path: Path, 
         work_dir=tmp_path / "experiment" / ".pipeline_work" / "feature_demo",
         execution_role="slurm_controller",
     )
-    submitted: list[list[int]] = []
+    submitted_arrays: list[list[int]] = []
+    submitted_merges: list[list[int]] = []
 
     def prepare(_ctx: Any, work_dir: Path, task_count: int) -> list[dict[str, Any]]:
         assert task_count == 2
@@ -160,8 +169,31 @@ def test_slurm_executor_reuses_completed_shards_after_a_failure(tmp_path: Path, 
     def fake_submit(**kwargs: Any) -> dict[str, Any]:
         work_dir = Path(str(kwargs["work_dir"]))
         task_ids = list(kwargs["task_ids"])
-        submitted.append(task_ids)
-        successful = [0] if len(submitted) == 1 else task_ids
+        if not kwargs["is_array"]:
+            submitted_merges.append(task_ids)
+            merge_context = StageContext(
+                config=config,
+                step="feature.demo",
+                section={},
+                experiment_dir=context.experiment_dir,
+                work_dir=work_dir,
+                execution_role="slurm_merge_worker",
+            )
+            merge_result = merge(
+                merge_context,
+                [
+                    {"id": index, "output": str(work_dir / "shards" / f"{index}.txt")}
+                    for index in range(2)
+                ],
+            )
+            write_json(
+                _merge_state_path(work_dir, "done"),
+                {"worker_protocol": WORKER_PROTOCOL, "step": "feature.demo", "result": merge_result},
+            )
+            return {"returncode": 0, "job_id": "merge-2"}
+
+        submitted_arrays.append(task_ids)
+        successful = [0] if len(submitted_arrays) == 1 else task_ids
         for task_id in successful:
             output = work_dir / "shards" / f"{task_id}.txt"
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -171,7 +203,7 @@ def test_slurm_executor_reuses_completed_shards_after_a_failure(tmp_path: Path, 
                 {"worker_protocol": WORKER_PROTOCOL, "task_id": task_id, "result": {}},
             )
             _task_path(work_dir, task_id, "failed").unlink(missing_ok=True)
-        if len(submitted) == 1:
+        if len(submitted_arrays) == 1:
             write_json(
                 _task_path(work_dir, 1, "failed"),
                 {"worker_protocol": WORKER_PROTOCOL, "task_id": 1, "error": "synthetic failure"},
@@ -199,7 +231,8 @@ def test_slurm_executor_reuses_completed_shards_after_a_failure(tmp_path: Path, 
         input_signature={"inputs": []},
         force=False,
     )
-    assert submitted == [[0, 1], [1]]
+    assert submitted_arrays == [[0, 1], [1]]
+    assert submitted_merges == [[0]]
     assert Path(str(result["final"])).read_text(encoding="utf-8") == "01"
 
 
@@ -250,3 +283,63 @@ def test_slurm_worker_uses_original_config_directory_and_writes_done_state(
     )
     assert result["result"] == {"output": str(output)}
     assert _task_path(work_dir, 0, "done").is_file()
+
+
+def test_slurm_merge_worker_writes_done_state_and_cleans_shards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _slurm_config(tmp_path)
+    source.write_text(source.read_text(encoding="utf-8") + "\n[feature.demo]\n", encoding="utf-8")
+    config = load_ini_config(source)
+    work_dir = tmp_path / "work"
+    snapshot = work_dir / "config.resolved.ini"
+    config.write_resolved(snapshot)
+    output = tmp_path / "experiment" / "merged.txt"
+    task = {"id": 0, "output": str(work_dir / "shards" / "0.txt")}
+    Path(str(task["output"])).parent.mkdir(parents=True, exist_ok=True)
+    Path(str(task["output"])).write_text("shard", encoding="utf-8")
+    spec = work_dir / "spec.json"
+    write_json(
+        spec,
+        {
+            "worker_protocol": WORKER_PROTOCOL,
+            "kind": "shard",
+            "step": "feature.demo",
+            "experiment_dir": str(tmp_path / "experiment"),
+            "stage_work_dir": str(work_dir),
+            "force": False,
+            "tasks": [task],
+        },
+    )
+
+    def merge(ctx: Any, _tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("merged", encoding="utf-8")
+        return {"output": str(output)}
+
+    cleaned: list[bool] = []
+    distributed = DistributedStageHandler(
+        prepare=lambda _ctx, _work_dir, _task_count: [task],
+        run_shard=lambda _ctx, _task: {},
+        validate_shard=lambda _ctx, _task: Path(str(task["output"])).is_file(),
+        merge=merge,
+        cleanup=lambda _tasks: cleaned.append(True),
+    )
+    handler = StageHandler(
+        validate=lambda _ctx: None,
+        input_paths=lambda _ctx: [],
+        output_paths=lambda _ctx: [output],
+        validate_outputs=lambda _ctx: output.is_file(),
+        run=lambda _ctx: {},
+        distributed=distributed,
+    )
+    monkeypatch.setattr("wuw_training.slurm.handler_for_step", lambda _step: handler)
+
+    result = run_merge_worker(
+        config_path=snapshot,
+        config_root=source.parent,
+        spec_path=spec,
+    )
+    assert result["result"] == {"output": str(output)}
+    assert _merge_state_path(work_dir, "done").is_file()
+    assert cleaned == [True]

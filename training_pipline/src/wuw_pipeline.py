@@ -3634,7 +3634,14 @@ def main() -> None:
     # argparse tree.  This keeps all existing low-level commands compatible
     # while making `run`, `run-step`, `validate`, and `status` the new public
     # orchestration interface.
-    if len(sys.argv) > 1 and sys.argv[1] in {"run", "run-step", "validate", "status", "__slurm-worker"}:
+    if len(sys.argv) > 1 and sys.argv[1] in {
+        "run",
+        "run-step",
+        "validate",
+        "status",
+        "__slurm-worker",
+        "__slurm-merge",
+    }:
         from wuw_training.cli import main as ini_main
 
         raise SystemExit(ini_main(sys.argv[1:]))

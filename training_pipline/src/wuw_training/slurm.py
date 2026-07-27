@@ -1,10 +1,10 @@
 """Slurm execution backend for the INI training pipeline.
 
-The controller stays on the submission host.  It prepares deterministic
-manifests, submits one array for a shardable stage, waits for every array
-element, and performs the final merge/checkpoint locally.  Workers only write
-their own shard data and an atomic task state file, so a failed array can be
-resumed without repeating successful elements.
+The controller prepares deterministic manifests and submits one extraction
+array for each shardable stage. Once the array finishes, a separate Slurm
+merge job combines and validates its shards. Workers only write their own
+shard data and atomic state files, so a failed array or merge can be resumed
+without repeating successful extraction work.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +73,7 @@ class SlurmSettings:
     squeue_command: tuple[str, ...]
     python_executable: str
     setup_commands: str
+    merge_max_parallel: int
 
     @classmethod
     def from_config(cls, config: IniConfig) -> "SlurmSettings":
@@ -81,11 +83,19 @@ class SlurmSettings:
         squeue = config.get("slurm", "squeue_command", required=False, fallback="squeue") or "squeue"
         python = config.get("slurm", "python_executable", required=False, fallback=sys.executable) or sys.executable
         setup = config.get("slurm", "setup_commands", required=False, fallback="") or ""
+        raw_merge_parallel = config.get("slurm", "merge_max_parallel", required=False, fallback="1") or "1"
+        try:
+            merge_max_parallel = int(raw_merge_parallel)
+        except ValueError as exc:
+            raise ConfigurationError("[slurm] merge_max_parallel must be an integer") from exc
+        if merge_max_parallel < 1:
+            raise ConfigurationError("[slurm] merge_max_parallel must be >= 1")
         return cls(
             sbatch_command=tuple(_command_words(sbatch, "[slurm] sbatch_command")),
             squeue_command=tuple(_command_words(squeue, "[slurm] squeue_command")),
             python_executable=python,
             setup_commands=setup,
+            merge_max_parallel=merge_max_parallel,
         )
 
 
@@ -94,6 +104,7 @@ class SlurmStepSettings:
     section_name: str
     tasks: int
     sbatch_args: tuple[str, ...]
+    merge_sbatch_args: tuple[str, ...]
 
 
 def _step_settings(config: IniConfig, step: str) -> SlurmStepSettings:
@@ -114,21 +125,36 @@ def _step_settings(config: IniConfig, step: str) -> SlurmStepSettings:
         raise ConfigurationError(f"[{section_name}] tasks must be >= 1")
     if prefix not in SHARDED_PREFIXES and tasks != 1:
         raise ConfigurationError(f"[{section_name}] tasks must be omitted or 1 for the {step} stage")
-    raw_args = section.get("sbatch_args", "")
-    try:
-        args = tuple(shlex.split(raw_args))
-    except ValueError as exc:
-        raise ConfigurationError(f"[{section_name}] sbatch_args is not valid shell-style text: {exc}") from exc
-    for token in args:
-        if _option_name(token) in RESERVED_SBATCH_OPTIONS:
+    def parse_sbatch_args(option: str, fallback: str | None = None) -> tuple[str, ...]:
+        raw_args = section.get(option, fallback if fallback is not None else "")
+        try:
+            args = tuple(shlex.split(raw_args))
+        except ValueError as exc:
             raise ConfigurationError(
-                f"[{section_name}] sbatch_args must not set {_option_name(token)}; the pipeline controls it"
-            )
-    return SlurmStepSettings(section_name=section_name, tasks=tasks, sbatch_args=args)
+                f"[{section_name}] {option} is not valid shell-style text: {exc}"
+            ) from exc
+        for token in args:
+            if _option_name(token) in RESERVED_SBATCH_OPTIONS:
+                raise ConfigurationError(
+                    f"[{section_name}] {option} must not set {_option_name(token)}; the pipeline controls it"
+                )
+        return args
+
+    raw_sbatch_args = section.get("sbatch_args", "")
+    return SlurmStepSettings(
+        section_name=section_name,
+        tasks=tasks,
+        sbatch_args=parse_sbatch_args("sbatch_args"),
+        merge_sbatch_args=parse_sbatch_args("merge_sbatch_args", raw_sbatch_args),
+    )
 
 
 def _task_path(work_dir: Path, task_id: int, suffix: str) -> Path:
     return work_dir / "tasks" / f"{task_id:05d}.{suffix}.json"
+
+
+def _merge_state_path(work_dir: Path, suffix: str) -> Path:
+    return work_dir / f"merge.{suffix}.json"
 
 
 def _read_task_state(path: Path) -> dict[str, Any] | None:
@@ -143,6 +169,7 @@ class SlurmExecutor:
     def __init__(self, config: IniConfig):
         self.config = config
         self.settings = SlurmSettings.from_config(config)
+        self._merge_slots = threading.BoundedSemaphore(self.settings.merge_max_parallel)
 
     def validate(self, steps: Iterable[Any]) -> None:
         for item in steps:
@@ -260,24 +287,56 @@ class SlurmExecutor:
         script.chmod(0o700)
         return script
 
+    def _merge_batch_script(self, work_dir: Path, snapshot: Path, spec: Path) -> Path:
+        """Create the single-job entrypoint used to merge completed shards."""
+
+        module_root = Path(__file__).resolve().parents[1]
+        static_args = [
+            self.settings.python_executable,
+            "-m",
+            "wuw_training.cli",
+            "__slurm-merge",
+            "--config",
+            str(snapshot),
+            "--config-root",
+            str(self.config.root),
+            "--spec",
+            str(spec),
+        ]
+        command = " ".join(shlex.quote(value) for value in static_args)
+        script = work_dir / "run_merge.sh"
+        lines = [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            f"export PYTHONPATH={shlex.quote(str(module_root))}${{PYTHONPATH:+:${{PYTHONPATH}}}}",
+        ]
+        if self.settings.setup_commands.strip():
+            lines.append(self.settings.setup_commands.rstrip())
+        lines.append(f"exec {command}")
+        script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        script.chmod(0o700)
+        return script
+
     def _submit_and_wait(
         self,
         *,
         work_dir: Path,
-        step: str,
+        job_name: str,
         step_settings: SlurmStepSettings,
         script: Path,
         task_ids: list[int],
         is_array: bool,
+        submission_path: Path,
+        use_merge_args: bool = False,
     ) -> dict[str, Any]:
         logs = work_dir / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         command = [
             *self.settings.sbatch_command,
-            *step_settings.sbatch_args,
+            *(step_settings.merge_sbatch_args if use_merge_args else step_settings.sbatch_args),
             "--parsable",
             "--wait",
-            f"--job-name=wuw-{step.replace('.', '-')}",
+            f"--job-name={job_name}",
             f"--output={logs}/%x_%A_%a.out",
             f"--error={logs}/%x_%A_%a.err",
         ]
@@ -301,7 +360,7 @@ class SlurmExecutor:
             "stdout": first_line,
             "stderr": "",
         }
-        write_json(work_dir / "submission.json", submission)
+        write_json(submission_path, submission)
         remaining_stdout, stderr = process.communicate()
         submission.update(
             {
@@ -310,11 +369,11 @@ class SlurmExecutor:
                 "stderr": stderr,
             }
         )
-        write_json(work_dir / "submission.json", submission)
+        write_json(submission_path, submission)
         return submission
 
-    def _has_active_submission(self, work_dir: Path) -> bool:
-        submission = _read_task_state(work_dir / "submission.json")
+    def _has_active_submission(self, submission_path: Path) -> bool:
+        submission = _read_task_state(submission_path)
         if not submission or submission.get("returncode") is not None:
             return False
         job_id = submission.get("job_id")
@@ -326,6 +385,33 @@ class SlurmExecutor:
         except OSError:
             return False
         return result.returncode == 0 and bool(result.stdout.strip())
+
+    def _completed_merge_state(
+        self,
+        work_dir: Path,
+        ctx: StageContext,
+        handler: StageHandler,
+    ) -> dict[str, Any] | None:
+        state = _read_task_state(_merge_state_path(work_dir, "done"))
+        if state is None or state.get("worker_protocol") != WORKER_PROTOCOL:
+            return None
+        result = state.get("result")
+        if not isinstance(result, dict):
+            return None
+        try:
+            return dict(result) if handler.validate_outputs(ctx) else None
+        except Exception:
+            return None
+
+    def _merge_failure_message(self, work_dir: Path, submission: dict[str, Any]) -> str:
+        failed = _read_task_state(_merge_state_path(work_dir, "failed"))
+        detail = failed.get("error", "merge worker did not write a completion marker") if failed else (
+            "merge worker did not write a completion marker"
+        )
+        return (
+            f"Slurm merge failed ({detail}). Job {submission.get('job_id') or 'unknown'} "
+            f"logs are in {work_dir / 'logs'}"
+        )
 
     def _failure_message(self, work_dir: Path, tasks: list[dict[str, Any]], submission: dict[str, Any]) -> str:
         details: list[str] = []
@@ -377,6 +463,8 @@ class SlurmExecutor:
                 _task_path(work_dir, int(task["id"]), "failed").unlink(missing_ok=True)
             if sharded and handler.distributed is not None:
                 handler.distributed.cleanup(tasks)
+                _merge_state_path(work_dir, "done").unlink(missing_ok=True)
+                _merge_state_path(work_dir, "failed").unlink(missing_ok=True)
         spec = self._write_spec(
             work_dir=work_dir,
             snapshot=snapshot,
@@ -387,12 +475,26 @@ class SlurmExecutor:
             tasks=tasks,
             force=force,
         )
+        if sharded:
+            assert handler.distributed is not None
+            merged = self._completed_merge_state(work_dir, ctx, handler)
+            if merged is not None:
+                merged["slurm"] = {
+                    "requested_tasks": step_settings.tasks,
+                    "actual_tasks": len(tasks),
+                    "work_dir": str(work_dir),
+                    "array_job_id": (_read_task_state(work_dir / "submission.json") or {}).get("job_id"),
+                    "merge_job_id": (_read_task_state(work_dir / "merge_submission.json") or {}).get("job_id"),
+                }
+                return merged
+
         pending = [
             task for task in tasks if not self._task_is_complete(work_dir, ctx, handler, task, kind=kind)
         ]
         if pending:
-            if self._has_active_submission(work_dir):
-                existing = _read_task_state(work_dir / "submission.json") or {}
+            array_submission_path = work_dir / "submission.json"
+            if self._has_active_submission(array_submission_path):
+                existing = _read_task_state(array_submission_path) or {}
                 raise RuntimeError(
                     f"Slurm stage {name} already has active job {existing.get('job_id')}; "
                     "wait for it to finish before starting another controller"
@@ -400,23 +502,46 @@ class SlurmExecutor:
             script = self._batch_script(work_dir, snapshot, spec)
             submission = self._submit_and_wait(
                 work_dir=work_dir,
-                step=name,
+                job_name=f"wuw-{name.replace('.', '-')}",
                 step_settings=step_settings,
                 script=script,
                 task_ids=[int(task["id"]) for task in pending],
                 is_array=sharded,
+                submission_path=array_submission_path,
             )
             failed = [task for task in tasks if not self._task_is_complete(work_dir, ctx, handler, task, kind=kind)]
             if submission["returncode"] != 0 or failed:
                 raise RuntimeError(self._failure_message(work_dir, failed or tasks, submission))
         if sharded:
             assert handler.distributed is not None
-            result = handler.distributed.merge(ctx, tasks)
-            handler.distributed.cleanup(tasks)
+            merge_submission_path = work_dir / "merge_submission.json"
+            if self._has_active_submission(merge_submission_path):
+                existing = _read_task_state(merge_submission_path) or {}
+                raise RuntimeError(
+                    f"Slurm merge for {name} already has active job {existing.get('job_id')}; "
+                    "wait for it to finish before starting another controller"
+                )
+            merge_script = self._merge_batch_script(work_dir, snapshot, spec)
+            with self._merge_slots:
+                merge_submission = self._submit_and_wait(
+                    work_dir=work_dir,
+                    job_name=f"wuw-merge-{name.replace('.', '-')}",
+                    step_settings=step_settings,
+                    script=merge_script,
+                    task_ids=[0],
+                    is_array=False,
+                    submission_path=merge_submission_path,
+                    use_merge_args=True,
+                )
+            result = self._completed_merge_state(work_dir, ctx, handler)
+            if merge_submission["returncode"] != 0 or result is None:
+                raise RuntimeError(self._merge_failure_message(work_dir, merge_submission))
             result["slurm"] = {
                 "requested_tasks": step_settings.tasks,
                 "actual_tasks": len(tasks),
                 "work_dir": str(work_dir),
+                "array_job_id": (_read_task_state(work_dir / "submission.json") or {}).get("job_id"),
+                "merge_job_id": merge_submission.get("job_id"),
             }
             return result
         state = _read_task_state(_task_path(work_dir, 0, "done"))
@@ -495,6 +620,73 @@ def run_worker(
                 "worker_protocol": WORKER_PROTOCOL,
                 "step": step,
                 "task_id": task_id,
+                "error": repr(exc),
+                "traceback": traceback.format_exc(),
+            },
+        )
+        raise
+
+
+def run_merge_worker(
+    *,
+    config_path: str | Path,
+    config_root: str | Path,
+    spec_path: str | Path,
+) -> dict[str, Any]:
+    """Merge one completed shard stage inside its own Slurm job."""
+
+    spec = read_json(Path(spec_path))
+    if not isinstance(spec, dict) or spec.get("worker_protocol") != WORKER_PROTOCOL:
+        raise RuntimeError(f"Unsupported Slurm merge specification: {spec_path}")
+    if spec.get("kind") != "shard":
+        raise RuntimeError("Slurm merge worker requires a shard-stage specification")
+    tasks = spec.get("tasks")
+    if not isinstance(tasks, list):
+        raise RuntimeError("Slurm merge specification has no task list")
+    config = load_ini_config(config_path, base_dir=config_root)
+    step = str(spec["step"])
+    handler = handler_for_step(step)
+    if handler.distributed is None:
+        raise RuntimeError(f"Stage {step} does not implement Slurm sharding")
+    work_dir = Path(str(spec["stage_work_dir"])).resolve()
+    context = StageContext(
+        config=config,
+        step=step,
+        section=config.section(step),
+        experiment_dir=Path(str(spec["experiment_dir"])).resolve(),
+        work_dir=work_dir,
+        force=bool(spec.get("force", False)),
+        execution_role="slurm_merge_worker",
+    )
+    done_path = _merge_state_path(work_dir, "done")
+    failed_path = _merge_state_path(work_dir, "failed")
+    try:
+        handler.validate(context)
+        incomplete = [
+            int(task.get("id", -1))
+            for task in tasks
+            if not isinstance(task, dict) or not handler.distributed.validate_shard(context, task)
+        ]
+        if incomplete:
+            raise RuntimeError(f"Cannot merge {step}: incomplete shard task(s) {incomplete[:10]}")
+        result = handler.distributed.merge(context, tasks)
+        if not handler.validate_outputs(context):
+            raise RuntimeError(f"Slurm merge output validation failed for {step}")
+        handler.distributed.cleanup(tasks)
+        state = {
+            "worker_protocol": WORKER_PROTOCOL,
+            "step": step,
+            "result": result,
+        }
+        write_json(done_path, state)
+        failed_path.unlink(missing_ok=True)
+        return state
+    except Exception as exc:
+        write_json(
+            failed_path,
+            {
+                "worker_protocol": WORKER_PROTOCOL,
+                "step": step,
                 "error": repr(exc),
                 "traceback": traceback.format_exc(),
             },

@@ -42,8 +42,11 @@ but are deprecated for new work.
 
 Set `[main] execution_mode = slurm` to submit the same INI pipeline to Slurm.
 The submission host prepares each stage, waits for it to finish, and only then
-starts the next one. `augment.*`, `feature.*`, and `testing.*` use a Slurm job
-array; `train`, `export`, and `summary` use one Slurm job.
+starts the next one. `augment.*`, `feature.*`, and `testing.*` first use a
+Slurm job array, then submit one separate Slurm job to merge and validate the
+array's completed shards. `train`, `export`, and `summary` use one Slurm job.
+The merge is submitted only after `sbatch --wait` confirms that the array has
+finished; it does not use a Slurm dependency chain.
 
 Each listed stage needs a matching resource section. `sbatch_args` is passed
 as arguments to `sbatch`, so normal settings such as `--mem`, `--gres`, and
@@ -57,12 +60,17 @@ execution_mode = slurm
 sbatch_command = sbatch
 squeue_command = squeue
 python_executable = /path/to/openwake/bin/python
+# Limit simultaneous merges from bracketed parallel stages. One is safest for
+# large feature bundles on shared storage.
+merge_max_parallel = 1
 setup_commands =
     module load cuda
 
 [slurm.feature.positive_train]
 tasks = 16
 sbatch_args = --partition=gpu --mem=24G --gres=gpu:1 --cpus-per-task=4
+# Optional. If omitted, the merge inherits sbatch_args above.
+merge_sbatch_args = --partition=cpu --mem=32G --cpus-per-task=2
 
 [slurm.train]
 sbatch_args = --partition=gpu --mem=48G --gres=gpu:1
@@ -72,9 +80,10 @@ The controller writes generated scripts, logs, and per-task state beneath
 `<experiment_dir>/.pipeline_work/<stage>/slurm/`. If one array task fails, it
 waits for all sibling tasks, reports every failed/missing task, and stops the
 pipeline. On the next run, completed shard outputs are reused and only failed
-or missing tasks are submitted. Once a stage merges successfully, its large
-temporary shard outputs are removed while final artifacts, task metadata, and
-logs remain.
+or missing tasks are submitted. If a merge fails, the completed shards remain
+and the next run retries only that merge. Once a stage merges successfully,
+its large temporary shard outputs are removed while final artifacts, task
+metadata, and logs remain.
 
 If `tasks` is greater than the number of input records, the pipeline submits
 one task per record instead and records both requested and actual counts in
