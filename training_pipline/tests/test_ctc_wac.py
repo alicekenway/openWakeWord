@@ -945,6 +945,29 @@ def test_masked_wac_pooling_ignores_tail_padding() -> None:
     assert torch.allclose(first, second, rtol=1e-6, atol=1e-6)
 
 
+def test_keyword_loader_accepts_optional_stage2_threshold(tmp_path: Path) -> None:
+    path = tmp_path / "keywords.json"
+    path.write_text(
+        json.dumps(
+            {
+                "keywords": [
+                    {
+                        "id": "wake",
+                        "display_text": "wake",
+                        "token_ids": [1, 2],
+                        "threshold": 0.2,
+                        "stage2_threshold": 0.85,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    keyword = load_keywords(path)[0]
+    assert keyword.threshold == pytest.approx(0.2)
+    assert keyword.stage2_threshold == pytest.approx(0.85)
+
+
 def test_conv_wac_pooling_ignores_tail_padding_and_winner_when_disabled() -> None:
     model = make_ctc_wac_model(
         feature_dim=3,

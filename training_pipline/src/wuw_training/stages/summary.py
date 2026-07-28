@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -104,6 +106,18 @@ def validate_outputs(ctx: Any) -> bool:
 
 
 def _events(windows: list[dict[str, Any]], threshold: float, debounce_seconds: float) -> int:
+    return _events_matching(
+        windows,
+        lambda window: float(window["score"]) >= threshold,
+        debounce_seconds,
+    )
+
+
+def _events_matching(
+    windows: list[dict[str, Any]],
+    accepted: Any,
+    debounce_seconds: float,
+) -> int:
     def event_time(value: dict[str, Any]) -> float:
         try:
             return float(value["end_time"])
@@ -114,11 +128,14 @@ def _events(windows: list[dict[str, Any]], threshold: float, debounce_seconds: f
     count = 0
     for window in sorted(windows, key=event_time):
         try:
-            score = float(window["score"])
             event_time = float(window["end_time"])
         except (KeyError, TypeError, ValueError):
             continue
-        if score >= threshold and event_time - previous >= debounce_seconds:
+        try:
+            passes = bool(accepted(window))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if passes and event_time - previous >= debounce_seconds:
             count += 1
             previous = event_time
     return count
@@ -159,6 +176,82 @@ def _crop_counts(
         except (KeyError, TypeError, ValueError):
             continue
     return evaluated, accepted
+
+
+def _keyword_threshold_metrics(
+    records: list[dict[str, Any]],
+    expected_label: int,
+    debounce_seconds: float,
+    errors: int,
+) -> dict[str, Any]:
+    def accepted(window: dict[str, Any]) -> bool:
+        threshold = window.get("stage2_threshold")
+        return threshold is not None and float(window["score"]) >= float(threshold)
+
+    evaluated = 0
+    crops_evaluated = 0
+    seconds = 0.0
+    false_rejects = 0
+    false_accept_clips = 0
+    false_accept_crops = 0
+    false_accept_events = 0
+    for record in records:
+        record_windows = _record_windows(record)
+        if record_windows is None:
+            continue
+        windows, kind = record_windows
+        events = _events_matching(windows, accepted, debounce_seconds)
+        if kind == "ctc_wac":
+            crop_count = max(0, int(record.get("audio_window_count", 1)))
+            accepted_indices = {
+                int(window.get("audio_window_index") or 0)
+                for window in windows
+                if accepted(window)
+            }
+            accepted_crop_count = min(crop_count, len(accepted_indices))
+        else:
+            crop_count = len(windows)
+            accepted_crop_count = sum(int(accepted(window)) for window in windows)
+        evaluated += 1
+        crops_evaluated += crop_count
+        seconds += float(record.get("duration_seconds") or 0.0)
+        if expected_label == 1:
+            false_rejects += int(events == 0)
+        else:
+            false_accept_clips += int(events > 0)
+            false_accept_crops += accepted_crop_count
+            false_accept_events += events
+    result: dict[str, Any] = {
+        "clips_evaluated": evaluated,
+        "crops_evaluated": crops_evaluated,
+        "evaluated_seconds": round(seconds, 6),
+        "evaluated_hours": round(seconds / 3600.0, 6),
+        "error_count": errors,
+    }
+    if expected_label == 1:
+        result.update(
+            {
+                "false_rejects": false_rejects,
+                "false_reject_rate": (false_rejects / evaluated) if evaluated else None,
+                "recall": ((evaluated - false_rejects) / evaluated) if evaluated else None,
+            }
+        )
+    else:
+        result.update(
+            {
+                "false_accept_clips": false_accept_clips,
+                "false_accept_crops": false_accept_crops,
+                "false_accept_events": false_accept_events,
+                "false_accepts_per_hour": (
+                    false_accept_events / (seconds / 3600.0) if seconds else None
+                ),
+                "false_accept_rate": (
+                    false_accept_crops / crops_evaluated if crops_evaluated else None
+                ),
+                "false_accept_rate_denominator": "evaluated_crops",
+            }
+        )
+    return result
 
 
 def _metrics(records: list[dict[str, Any]], expected_label: int, threshold: float, debounce_seconds: float, errors: int) -> dict[str, Any]:
@@ -249,6 +342,29 @@ def _markdown_report(payload: dict[str, Any]) -> str:
 
     def metric(value: Any) -> str:
         return "n/a" if value is None else f"{float(value):.6f}"
+
+    selected = payload.get("keyword_threshold_operating_point")
+    if isinstance(selected, dict):
+        lines.extend(
+            [
+                "",
+                "## Per-keyword Stage-2 operating point",
+                "",
+                f"- Thresholds: `{json.dumps(selected['thresholds'], sort_keys=True)}`",
+                "",
+            ]
+        )
+        for test_name, values in selected["sets"].items():
+            if "recall" in values:
+                lines.append(
+                    f"- `{test_name}`: FR `{metric(values['false_reject_rate'])}`, "
+                    f"recall `{metric(values['recall'])}`"
+                )
+            else:
+                lines.append(
+                    f"- `{test_name}`: FA/hour `{metric(values['false_accepts_per_hour'])}`, "
+                    f"FA rate `{metric(values['false_accept_rate'])}`"
+                )
 
     for test_name in payload["tests"]:
         values = [
@@ -348,6 +464,41 @@ def run(ctx: Any) -> dict[str, Any]:
             }
         )
 
+    configured_thresholds: dict[str, float] = {}
+    keyword_thresholds_complete = True
+    saw_ctc_candidate = False
+    for _expected_label, records, _error_count in loaded.values():
+        for record in records:
+            for candidate in record.get("stage1_candidates", []):
+                saw_ctc_candidate = True
+                keyword_id = str(candidate.get("keyword_id", ""))
+                raw_threshold = candidate.get("stage2_threshold")
+                if not keyword_id or raw_threshold is None:
+                    keyword_thresholds_complete = False
+                    continue
+                threshold = float(raw_threshold)
+                previous = configured_thresholds.setdefault(keyword_id, threshold)
+                if not math.isclose(previous, threshold):
+                    raise ConfigurationError(
+                        f"[{ctx.step}] inconsistent stage2_threshold values for {keyword_id!r}"
+                    )
+    selected_operating_point = None
+    if saw_ctc_candidate and keyword_thresholds_complete:
+        selected_sets: dict[str, Any] = {}
+        selected_negatives: list[dict[str, Any]] = []
+        for test_step, (expected_label, records, error_count) in loaded.items():
+            metrics = _keyword_threshold_metrics(records, expected_label, debounce, error_count)
+            selected_sets[test_step] = metrics
+            if expected_label == 0:
+                selected_negatives.append(metrics)
+        selected_operating_point = {
+            "thresholds": configured_thresholds,
+            "sets": selected_sets,
+            "combined_negative": (
+                _combined_negative(selected_negatives) if selected_negatives else None
+            ),
+        }
+
     payload = {
         "tests": _test_steps(ctx),
         "debounce_seconds": debounce,
@@ -357,6 +508,7 @@ def run(ctx: Any) -> dict[str, Any]:
             "false_reject_rate": "false_reject_clips / positive_clips_evaluated",
         },
         "thresholds": threshold_rows,
+        "keyword_threshold_operating_point": selected_operating_point,
     }
     write_json(_output_json(ctx), payload)
     _output_report(ctx).parent.mkdir(parents=True, exist_ok=True)

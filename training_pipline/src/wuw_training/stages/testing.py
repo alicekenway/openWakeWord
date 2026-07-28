@@ -541,6 +541,7 @@ def _ctc_wac_record(
                 "stage1_filler_token_ids": list(comparison.filler_token_ids) if comparison is not None else None,
                 "margin": float(margin[0]),
                 "stage2_score": float(np.asarray(probability).reshape(-1)[0]),
+                "stage2_threshold": keywords[winner_index].stage2_threshold,
                 # Keep the former key for existing report readers. It is the
                 # Stage-2 classifier probability, never a Stage-1 score.
                 "score": float(np.asarray(probability).reshape(-1)[0]),

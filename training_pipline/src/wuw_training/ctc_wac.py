@@ -52,6 +52,7 @@ class Keyword:
     display_text: str
     token_ids: tuple[int, ...]
     threshold: float
+    stage2_threshold: float | None = None
 
 
 @dataclass(frozen=True)
@@ -368,15 +369,25 @@ def load_keywords(path: Path, *, require_threshold: bool = True) -> list[Keyword
         try:
             token_ids = tuple(int(item) for item in token_values)
             threshold = float(value["threshold"]) if "threshold" in value else 0.0
+            stage2_threshold = (
+                float(value["stage2_threshold"]) if "stage2_threshold" in value else None
+            )
         except (TypeError, ValueError) as exc:
             raise ConfigurationError(
                 f"Keyword config {path}: keywords[{index}] needs integer token_ids and numeric threshold"
             ) from exc
         if require_threshold and "threshold" not in value:
             raise ConfigurationError(f"Keyword config {path}: keywords[{index}].threshold is required")
-        if any(item < 0 for item in token_ids) or not math.isfinite(threshold):
+        if (
+            any(item < 0 for item in token_ids)
+            or not math.isfinite(threshold)
+            or (
+                stage2_threshold is not None
+                and (not math.isfinite(stage2_threshold) or not 0.0 <= stage2_threshold <= 1.0)
+            )
+        ):
             raise ConfigurationError(f"Keyword config {path}: invalid tokens or threshold at keywords[{index}]")
-        parsed.append(Keyword(key_id, display_text, token_ids, threshold))
+        parsed.append(Keyword(key_id, display_text, token_ids, threshold, stage2_threshold))
     return parsed
 
 
@@ -521,7 +532,23 @@ def _expected_keyword_id(
 
 
 def keyword_fingerprint(keywords: Sequence[Keyword]) -> str:
-    return hash_payload([asdict(item) for item in keywords])
+    """Fingerprint fields that affect Stage-1 filtering and Stage-2 training.
+
+    The final Stage-2 operating threshold is deliberately excluded so users
+    can tune it from cached test details without invalidating a trained model.
+    """
+
+    return hash_payload(
+        [
+            {
+                "id": item.id,
+                "display_text": item.display_text,
+                "token_ids": list(item.token_ids),
+                "threshold": item.threshold,
+            }
+            for item in keywords
+        ]
+    )
 
 
 def keyword_token_fingerprint(keywords: Sequence[Keyword]) -> str:
