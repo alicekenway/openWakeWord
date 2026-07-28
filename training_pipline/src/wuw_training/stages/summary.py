@@ -66,6 +66,44 @@ def _output_report(ctx: Any) -> Path:
     return ctx.config.resolve_path(require(ctx.section, "output_report", ctx.step))
 
 
+def _configured_keyword_thresholds(ctx: Any) -> tuple[Path, dict[str, float]] | None:
+    raw_path = ctx.section.get("keyword_thresholds")
+    if raw_path is None:
+        return None
+    path = ctx.config.resolve_path(raw_path)
+    if not path.is_file():
+        raise ConfigurationError(f"[{ctx.step}] keyword_thresholds does not exist: {path}")
+    payload = read_json(path)
+    values = payload.get("keywords") if isinstance(payload, dict) else None
+    if not isinstance(values, list) or not values:
+        raise ConfigurationError(
+            f"[{ctx.step}] keyword_thresholds must contain a non-empty keywords list"
+        )
+    thresholds: dict[str, float] = {}
+    for index, value in enumerate(values):
+        if not isinstance(value, dict) or not isinstance(value.get("id"), str):
+            raise ConfigurationError(
+                f"[{ctx.step}] keyword_thresholds keywords[{index}] needs an id"
+            )
+        try:
+            threshold = float(value["stage2_threshold"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ConfigurationError(
+                f"[{ctx.step}] keyword_thresholds keywords[{index}] needs stage2_threshold"
+            ) from exc
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ConfigurationError(
+                f"[{ctx.step}] keyword_thresholds keywords[{index}].stage2_threshold must be in [0, 1]"
+            )
+        keyword_id = str(value["id"])
+        if keyword_id in thresholds:
+            raise ConfigurationError(
+                f"[{ctx.step}] duplicate keyword threshold id {keyword_id!r}"
+            )
+        thresholds[keyword_id] = threshold
+    return path, thresholds
+
+
 def validate(ctx: Any) -> None:
     _thresholds(ctx)
     if number(ctx.section, "debounce_seconds", ctx.step, 1.0) < 0:
@@ -80,6 +118,7 @@ def validate(ctx: Any) -> None:
             raise ConfigurationError(f"[{test_step}] expected_label must be 0 or 1")
     _output_json(ctx)
     _output_report(ctx)
+    _configured_keyword_thresholds(ctx)
 
 
 def input_paths(ctx: Any) -> list[Path]:
@@ -87,6 +126,9 @@ def input_paths(ctx: Any) -> list[Path]:
     for step in _test_steps(ctx):
         _summary, details = _test_paths(ctx, step)
         paths.append(details)
+    configured = _configured_keyword_thresholds(ctx)
+    if configured is not None:
+        paths.append(configured[0])
     return paths
 
 
@@ -183,9 +225,14 @@ def _keyword_threshold_metrics(
     expected_label: int,
     debounce_seconds: float,
     errors: int,
+    thresholds: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     def accepted(window: dict[str, Any]) -> bool:
-        threshold = window.get("stage2_threshold")
+        threshold = (
+            thresholds.get(str(window.get("keyword_id", "")))
+            if thresholds is not None
+            else window.get("stage2_threshold")
+        )
         return threshold is not None and float(window["score"]) >= float(threshold)
 
     evaluated = 0
@@ -464,30 +511,39 @@ def run(ctx: Any) -> dict[str, Any]:
             }
         )
 
-    configured_thresholds: dict[str, float] = {}
-    keyword_thresholds_complete = True
-    saw_ctc_candidate = False
-    for _expected_label, records, _error_count in loaded.values():
-        for record in records:
-            for candidate in record.get("stage1_candidates", []):
-                saw_ctc_candidate = True
-                keyword_id = str(candidate.get("keyword_id", ""))
-                raw_threshold = candidate.get("stage2_threshold")
-                if not keyword_id or raw_threshold is None:
-                    keyword_thresholds_complete = False
-                    continue
-                threshold = float(raw_threshold)
-                previous = configured_thresholds.setdefault(keyword_id, threshold)
-                if not math.isclose(previous, threshold):
-                    raise ConfigurationError(
-                        f"[{ctx.step}] inconsistent stage2_threshold values for {keyword_id!r}"
-                    )
+    configured = _configured_keyword_thresholds(ctx)
+    configured_thresholds: dict[str, float] = dict(configured[1]) if configured else {}
+    keyword_thresholds_complete = configured is not None
+    saw_ctc_candidate = configured is not None
+    if configured is None:
+        keyword_thresholds_complete = True
+        for _expected_label, records, _error_count in loaded.values():
+            for record in records:
+                for candidate in record.get("stage1_candidates", []):
+                    saw_ctc_candidate = True
+                    keyword_id = str(candidate.get("keyword_id", ""))
+                    raw_threshold = candidate.get("stage2_threshold")
+                    if not keyword_id or raw_threshold is None:
+                        keyword_thresholds_complete = False
+                        continue
+                    threshold = float(raw_threshold)
+                    previous = configured_thresholds.setdefault(keyword_id, threshold)
+                    if not math.isclose(previous, threshold):
+                        raise ConfigurationError(
+                            f"[{ctx.step}] inconsistent stage2_threshold values for {keyword_id!r}"
+                        )
     selected_operating_point = None
     if saw_ctc_candidate and keyword_thresholds_complete:
         selected_sets: dict[str, Any] = {}
         selected_negatives: list[dict[str, Any]] = []
         for test_step, (expected_label, records, error_count) in loaded.items():
-            metrics = _keyword_threshold_metrics(records, expected_label, debounce, error_count)
+            metrics = _keyword_threshold_metrics(
+                records,
+                expected_label,
+                debounce,
+                error_count,
+                configured_thresholds,
+            )
             selected_sets[test_step] = metrics
             if expected_label == 0:
                 selected_negatives.append(metrics)
