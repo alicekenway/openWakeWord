@@ -42,12 +42,6 @@ try:
 except Exception:
     pass
 
-import openwakeword  # noqa: E402
-from openwakeword.train import Model as TrainModel  # noqa: E402
-from openwakeword.data import mmap_batch_generator  # noqa: E402
-from openwakeword.utils import AudioFeatures, download_models  # noqa: E402
-
-
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
 DEFAULT_SR = 16000
 DEFAULT_IO_WORKERS = max(1, min(8, os.cpu_count() or 2))
@@ -925,6 +919,8 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
 
 
 def command_download_models(args: argparse.Namespace) -> None:
+    from openwakeword.utils import download_models
+
     target = Path(args.output_dir).resolve()
     models = [] if args.models == ["all"] else args.models
     download_models(model_names=models, target_directory=str(target))
@@ -1421,6 +1417,8 @@ def resolve_feature_device(requested_device: str) -> str:
 
 
 def command_generate_features(args: argparse.Namespace) -> None:
+    from openwakeword.utils import AudioFeatures
+
     default_placement = validate_placement(args.placement)
     feature_items = feature_items_from_feature_inputs(args.audio_manifest, args.audio_dir, default_placement)
     if args.limit:
@@ -2091,6 +2089,9 @@ def make_false_positive_loader(feature_files: list[Path]) -> torch.utils.data.Da
 
 
 def command_train_model(args: argparse.Namespace) -> None:
+    from openwakeword.data import mmap_batch_generator
+    from openwakeword.train import Model as TrainModel
+
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     onnx_model = output_dir / f"{args.model_name}.onnx"
@@ -2628,6 +2629,8 @@ def evaluate_manifest_set(
 
 
 def command_evaluate(args: argparse.Namespace) -> None:
+    import openwakeword
+
     config = load_evaluation_config(args)
     if not getattr(args, "overwrite", False) and Path(config["output_json"]).exists():
         print(f"Skipping evaluation; complete output already exists: {config['output_json']}")
