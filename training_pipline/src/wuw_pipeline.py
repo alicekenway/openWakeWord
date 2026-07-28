@@ -415,7 +415,7 @@ def load_audio_float(path: Path, sr: int = DEFAULT_SR) -> torch.Tensor:
 
 def fixed_length(
     audio: torch.Tensor,
-    target_samples: int,
+    target_samples: int | None,
     rng: random.Random,
     placement: str,
     end_jitter_seconds: float = 0.2,
@@ -576,6 +576,7 @@ def _ctc_context_signal(
     rng: random.Random,
     sample_rate: int,
     leading_context_range_samples: tuple[int, int] | None = None,
+    full_audio: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Build the source signal for one CTC context window.
 
@@ -586,15 +587,19 @@ def _ctc_context_signal(
     source.  Mixing it with a same-length background bed turns that leading
     context into real audio instead of a deterministic zero prefix.
 
-    Long audio is filtered or cropped by the requested start/end/random policy.
-    A retained long crop fills the maximum window and receives no extra
-    leading context.
+    Long audio is filtered or cropped by the requested start/end/random
+    policy.  Explicit full mode preserves every source sample and samples
+    leading context directly from ``leading_context_range_samples``; the CTC
+    base window and window count are not involved.
     """
 
     source = load_audio_float(path, sr=sample_rate)
     if source.numel() < 1:
         raise ValueError(f"Audio has no samples: {path}")
-    if source.numel() > target_samples:
+    if not full_audio:
+        if target_samples is None:
+            raise ValueError("Non-full CTC augmentation requires target_samples")
+    if not full_audio and source.numel() > target_samples:
         if long_audio_mode == "filter":
             raise ValueError("long source reached CTC context worker despite filter mode")
         if long_audio_mode == "start":
@@ -606,20 +611,96 @@ def _ctc_context_signal(
         else:
             raise ValueError(f"Unknown CTC long_audio_mode {long_audio_mode!r}")
         source = source[start:start + target_samples]
-    available_context = max(0, target_samples - int(source.numel()))
-    if leading_context_range_samples is None:
-        leading_context_samples = available_context
+    if full_audio:
+        if leading_context_range_samples is None:
+            leading_context_samples = 0
+        else:
+            requested_minimum, requested_maximum = leading_context_range_samples
+            if requested_minimum < 0 or requested_maximum < requested_minimum:
+                raise ValueError("CTC leading context sample range must satisfy 0 <= min <= max")
+            leading_context_samples = rng.randint(
+                int(requested_minimum),
+                int(requested_maximum),
+            )
     else:
-        requested_minimum, requested_maximum = leading_context_range_samples
-        if requested_minimum < 0 or requested_maximum < requested_minimum:
-            raise ValueError("CTC leading context sample range must satisfy 0 <= min <= max")
-        effective_maximum = min(int(requested_maximum), available_context)
-        effective_minimum = min(int(requested_minimum), effective_maximum)
-        leading_context_samples = rng.randint(effective_minimum, effective_maximum)
+        available_context = max(0, target_samples - int(source.numel()))
+        if leading_context_range_samples is None:
+            leading_context_samples = available_context
+        else:
+            requested_minimum, requested_maximum = leading_context_range_samples
+            if requested_minimum < 0 or requested_maximum < requested_minimum:
+                raise ValueError("CTC leading context sample range must satisfy 0 <= min <= max")
+            effective_maximum = min(int(requested_maximum), available_context)
+            effective_minimum = min(int(requested_minimum), effective_maximum)
+            leading_context_samples = rng.randint(effective_minimum, effective_maximum)
 
     signal = torch.zeros(leading_context_samples + int(source.numel()), dtype=torch.float32)
     signal[leading_context_samples:] = source
     return signal, source, leading_context_samples
+
+
+def _mix_in_augmentation_windows(
+    audio: torch.Tensor,
+    *,
+    active_source: torch.Tensor,
+    leading_context_samples: int,
+    window_samples: int,
+    noise_paths: list[str],
+    rng: random.Random,
+    sample_rate: int,
+    snr_low: float,
+    snr_high: float,
+    artificial_prob: float,
+    random_gain_db: float,
+) -> tuple[torch.Tensor, int]:
+    """Mix a complete foreground with independently sampled noise windows.
+
+    A full ``window_samples`` background segment is sampled for every window.
+    The final segment consumes only the prefix it needs.  This keeps short
+    foreground behavior compatible with variable leading context: for example,
+    a two-second source plus one second of leading context consumes the first
+    three seconds of a sampled 30-second background window.
+    """
+
+    if audio.numel() < 1:
+        raise ValueError("Cannot augment empty audio")
+    if window_samples < 1:
+        raise ValueError("augmentation window must contain at least one sample")
+
+    chunks: list[torch.Tensor] = []
+    window_count = 0
+    for start in range(0, int(audio.numel()), window_samples):
+        end = min(start + window_samples, int(audio.numel()))
+        chunk = audio[start:end]
+        noise_src = Path(rng.choice(noise_paths))
+        noise = _ctc_background_window(
+            noise_src,
+            target_samples=window_samples,
+            rng=rng,
+            sample_rate=sample_rate,
+        )[: end - start]
+
+        # For a short source with leading context, use the real source RMS so
+        # silence in the prefix does not make the background nearly silent.
+        if leading_context_samples > 0:
+            reference_start = max(start, leading_context_samples)
+            reference = audio[reference_start:end]
+            if reference.numel() < 1:
+                reference = active_source
+        else:
+            reference = chunk
+
+        snr = rng.uniform(snr_low, snr_high)
+        mixed = mix_with_noise(chunk, noise, snr, signal_reference=reference)
+        if rng.random() < artificial_prob:
+            mixed = add_artificial_noise(mixed, rng, snr_low, snr_high)
+        if random_gain_db:
+            gain_db = rng.uniform(-abs(random_gain_db), abs(random_gain_db))
+            mixed = mixed * (10 ** (gain_db / 20.0))
+        chunks.append(mixed)
+        window_count += 1
+
+    return torch.cat(chunks), window_count
 
 
 def _ctc_background_window(
@@ -744,10 +825,12 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
     out_name = f"{round_ndx:02d}_{ndx:08d}_{stable_id(str(src), ndx)}.wav"
     out_path = Path(cfg["output_dir"]) / out_name
     placement = validate_placement(record.get("placement", cfg["placement"]))
-    ctc_metadata: dict[str, int] = {}
+    ctc_metadata: dict[str, Any] = {}
     try:
         if not out_path.exists() or cfg["overwrite"]:
             if cfg.get("ctc_context", False):
+                full_mode = cfg.get("long_audio_mode") == "full"
+                full_mode_window_samples = cfg.get("full_mode_window_samples")
                 audio, active_source, leading_context_samples = _ctc_context_signal(
                     src,
                     target_samples=cfg["target_samples"],
@@ -755,6 +838,7 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
                     rng=rng,
                     sample_rate=cfg["sample_rate"],
                     leading_context_range_samples=cfg.get("leading_context_range_samples"),
+                    full_audio=full_mode,
                 )
                 ctc_metadata = {
                     "ctc_source_samples": int(active_source.numel()),
@@ -762,6 +846,7 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
                     "ctc_window_samples": int(audio.numel()),
                 }
             else:
+                full_mode_window_samples = None
                 audio = load_fixed_length_audio(
                     src,
                     cfg["target_samples"],
@@ -770,29 +855,53 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
                     sr=cfg["sample_rate"],
                 )
                 active_source = None
-            noise_src = Path(rng.choice(cfg["noise_paths"]))
-            if cfg.get("ctc_context", False):
-                noise = _ctc_background_window(
-                    noise_src,
-                    target_samples=int(audio.numel()),
+            if full_mode_window_samples is not None:
+                mixed, mixed_window_count = _mix_in_augmentation_windows(
+                    audio,
+                    active_source=active_source,
+                    leading_context_samples=leading_context_samples,
+                    window_samples=int(full_mode_window_samples),
+                    noise_paths=cfg["noise_paths"],
                     rng=rng,
                     sample_rate=cfg["sample_rate"],
+                    snr_low=cfg["snr_low"],
+                    snr_high=cfg["snr_high"],
+                    artificial_prob=cfg["artificial_prob"],
+                    random_gain_db=cfg["random_gain_db"],
+                )
+                ctc_metadata.update(
+                    {
+                        "full_mode_window_samples": int(full_mode_window_samples),
+                        "full_mode_window_seconds": (
+                            int(full_mode_window_samples) / int(cfg["sample_rate"])
+                        ),
+                        "full_mode_window_count": int(mixed_window_count),
+                    }
                 )
             else:
-                noise = load_fixed_length_audio(
-                    noise_src,
-                    cfg["target_samples"],
-                    rng,
-                    "random",
-                    sr=cfg["sample_rate"],
-                )
-            snr = rng.uniform(cfg["snr_low"], cfg["snr_high"])
-            mixed = mix_with_noise(audio, noise, snr, signal_reference=active_source)
-            if rng.random() < cfg["artificial_prob"]:
-                mixed = add_artificial_noise(mixed, rng, cfg["snr_low"], cfg["snr_high"])
-            if cfg["random_gain_db"]:
-                gain_db = rng.uniform(-abs(cfg["random_gain_db"]), abs(cfg["random_gain_db"]))
-                mixed = mixed * (10 ** (gain_db / 20.0))
+                noise_src = Path(rng.choice(cfg["noise_paths"]))
+                if cfg.get("ctc_context", False):
+                    noise = _ctc_background_window(
+                        noise_src,
+                        target_samples=int(audio.numel()),
+                        rng=rng,
+                        sample_rate=cfg["sample_rate"],
+                    )
+                else:
+                    noise = load_fixed_length_audio(
+                        noise_src,
+                        cfg["target_samples"],
+                        rng,
+                        "random",
+                        sr=cfg["sample_rate"],
+                    )
+                snr = rng.uniform(cfg["snr_low"], cfg["snr_high"])
+                mixed = mix_with_noise(audio, noise, snr, signal_reference=active_source)
+                if rng.random() < cfg["artificial_prob"]:
+                    mixed = add_artificial_noise(mixed, rng, cfg["snr_low"], cfg["snr_high"])
+                if cfg["random_gain_db"]:
+                    gain_db = rng.uniform(-abs(cfg["random_gain_db"]), abs(cfg["random_gain_db"]))
+                    mixed = mixed * (10 ** (gain_db / 20.0))
             save_wav(out_path, mixed, sr=cfg["sample_rate"])
         new_record = replace_audio_path(record, out_path.resolve())
         new_record.update(
@@ -805,6 +914,11 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
                 **ctc_metadata,
             }
         )
+        if "ctc_window_samples" in ctc_metadata:
+            new_record["duration"] = round(
+                int(ctc_metadata["ctc_window_samples"]) / int(cfg["sample_rate"]),
+                3,
+            )
         return {"record": new_record, "error": None}
     except Exception as exc:
         return {"record": None, "error": {"path": str(src), "error": repr(exc)}}
@@ -1004,15 +1118,21 @@ def command_augment_audio(args: argparse.Namespace) -> None:
 
     ctc_context = bool(getattr(args, "ctc_context", False))
     long_audio_mode = str(getattr(args, "long_audio_mode", "random")).strip().lower()
-    if ctc_context and long_audio_mode not in {"filter", "start", "end", "random"}:
-        raise ValueError("CTC --long-audio-mode must be one of: filter, start, end, random")
-    window_count = int(getattr(args, "window_count", 1) or 1)
-    if window_count < 1:
-        raise ValueError("CTC --window-count must be >= 1")
-    base_window_samples = int(round(args.clip_seconds * args.sample_rate))
-    target_samples = base_window_samples * window_count
-    if target_samples < 1:
-        raise ValueError("clip_seconds must produce at least one audio sample")
+    if ctc_context and long_audio_mode not in {"filter", "start", "end", "random", "full"}:
+        raise ValueError("CTC --long-audio-mode must be one of: filter, start, end, random, full")
+    full_mode = ctc_context and long_audio_mode == "full"
+    if full_mode:
+        window_count = None
+        base_window_samples = None
+        target_samples = None
+    else:
+        window_count = int(getattr(args, "window_count", 1) or 1)
+        if window_count < 1:
+            raise ValueError("CTC --window-count must be >= 1")
+        base_window_samples = int(round(args.clip_seconds * args.sample_rate))
+        target_samples = base_window_samples * window_count
+        if target_samples < 1:
+            raise ValueError("clip_seconds must produce at least one audio sample")
     leading_context_range_samples: tuple[int, int] | None = None
     leading_context_seconds_range = getattr(args, "leading_context_seconds_range", None)
     if ctc_context and leading_context_seconds_range is not None:
@@ -1028,10 +1148,24 @@ def command_augment_audio(args: argparse.Namespace) -> None:
             int(round(context_minimum * args.sample_rate)),
             int(round(context_maximum * args.sample_rate)),
         )
+    full_mode_window_seconds = getattr(args, "full_mode_window_seconds", None)
+    full_mode_window_samples: int | None = None
+    if full_mode:
+        if full_mode_window_seconds is None:
+            raise ValueError("--long-audio-mode full requires --full-mode-window-seconds")
+        full_mode_window_seconds = float(full_mode_window_seconds)
+        if full_mode_window_seconds <= 0:
+            raise ValueError("--full-mode-window-seconds must be > 0")
+        full_mode_window_samples = int(round(full_mode_window_seconds * args.sample_rate))
+        if full_mode_window_samples < 1:
+            raise ValueError("--full-mode-window-seconds must produce at least one audio sample")
+    elif full_mode_window_seconds is not None:
+        raise ValueError("--full-mode-window-seconds is only valid with --long-audio-mode full")
     eligible_records: list[tuple[int, dict[str, Any]]] = []
     filtered_long_records: list[dict[str, Any]] = []
     for index, record in enumerate(input_records):
         if ctc_context and long_audio_mode == "filter":
+            assert target_samples is not None
             samples = _resampled_num_samples(Path(str(record["path"])), args.sample_rate)
             if samples > target_samples:
                 filtered_long_records.append(
@@ -1062,6 +1196,8 @@ def command_augment_audio(args: argparse.Namespace) -> None:
                 "leading_context_range_samples": list(leading_context_range_samples)
                 if leading_context_range_samples is not None
                 else None,
+                "full_mode_window_samples": full_mode_window_samples,
+                "full_mode_window_seconds": full_mode_window_seconds,
             }
         )
     if not getattr(args, "overwrite", False) and augmented_manifest_complete(output_manifest, total, expected_summary):
@@ -1104,6 +1240,8 @@ def command_augment_audio(args: argparse.Namespace) -> None:
                 "leading_context_range_samples": list(leading_context_range_samples)
                 if leading_context_range_samples is not None
                 else None,
+                "full_mode_window_samples": full_mode_window_samples,
+                "full_mode_window_seconds": full_mode_window_seconds,
                 "input_signature": input_signature,
                 "workers": max(1, args.workers),
                 "index_offset": int(getattr(args, "index_offset", 0) or 0),
@@ -1123,14 +1261,16 @@ def command_augment_audio(args: argparse.Namespace) -> None:
         raise ValueError("No noise files found from --noise-manifest or --noise-dir")
 
     if ctc_context:
+        required_noise_samples = full_mode_window_samples if full_mode else target_samples
+        assert required_noise_samples is not None
         eligible_noise_paths = [
-            path for path in noise_paths if _resampled_num_samples(path, args.sample_rate) >= target_samples
+            path for path in noise_paths if _resampled_num_samples(path, args.sample_rate) >= required_noise_samples
         ]
         if not eligible_noise_paths:
             raise ValueError(
-                f"No background recording is at least {args.clip_seconds:.6g} seconds after resampling; "
-                f"CTC context augmentation requires a full {target_samples / args.sample_rate:.6g}-second "
-                "maximum-window background bed"
+                "No background recording is at least "
+                f"{required_noise_samples / args.sample_rate:.6g} seconds after resampling; "
+                "CTC context augmentation requires a full background sampling window"
             )
         noise_paths = eligible_noise_paths
     augmented: list[dict[str, Any]] = []
@@ -1149,6 +1289,7 @@ def command_augment_audio(args: argparse.Namespace) -> None:
         "ctc_context": ctc_context,
         "long_audio_mode": long_audio_mode if ctc_context else None,
         "leading_context_range_samples": leading_context_range_samples,
+        "full_mode_window_samples": full_mode_window_samples,
         "seed": args.seed,
         "overwrite": args.overwrite or force_output_overwrite,
     }
@@ -1202,6 +1343,8 @@ def command_augment_audio(args: argparse.Namespace) -> None:
             "leading_context_range_samples": list(leading_context_range_samples)
             if leading_context_range_samples is not None
             else None,
+            "full_mode_window_samples": full_mode_window_samples,
+            "full_mode_window_seconds": full_mode_window_seconds,
             "input_signature": input_signature,
             "workers": workers,
             "index_offset": index_offset,
@@ -3474,9 +3617,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--long-audio-mode",
-        choices=["filter", "start", "end", "random"],
+        choices=["filter", "start", "end", "random", "full"],
         default="random",
-        help="CTC context policy for source audio longer than --clip-seconds times --window-count",
+        help=(
+            "CTC source policy; full preserves the complete recording and does not use "
+            "--clip-seconds or --window-count"
+        ),
     )
     p.add_argument(
         "--window-count",
@@ -3490,6 +3636,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         metavar=("MIN", "MAX"),
         help="Sample variable leading background context in this seconds range instead of zero-padding to the maximum",
+    )
+    p.add_argument(
+        "--full-mode-window-seconds",
+        type=float,
+        help=(
+            "Required with --long-audio-mode full: independently sample and mix background windows "
+            "of this duration; the final short window uses only the needed background prefix"
+        ),
     )
     p.add_argument("--workers", type=int, default=DEFAULT_IO_WORKERS)
     p.add_argument("--overwrite", action="store_true")

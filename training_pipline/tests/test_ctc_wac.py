@@ -55,6 +55,7 @@ from wuw_training.stages.train import FeatureBlock  # noqa: E402
 from wuw_training.stages.feature import _merge_ctc_wac_features  # noqa: E402
 from wuw_training.stages.testing import _ctc_proposal_score_floor, _ctc_wac_record  # noqa: E402
 import wuw_training.ctc_wac as ctc_wac_module  # noqa: E402
+import wuw_training.stages.summary as summary_module  # noqa: E402
 import wuw_training.stages.testing as testing_module  # noqa: E402
 
 
@@ -736,6 +737,123 @@ def test_ctc_background_window_decodes_only_the_requested_segment(
         0 <= call["frame_offset"] <= source_total_frames - expected_source_frames
         for call in load_calls
     )
+
+
+def test_whole_audio_context_preserves_long_foreground(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pytest.importorskip("torchaudio")
+    legacy = get_legacy_module()
+    source = torch.arange(12, dtype=torch.float32)
+    monkeypatch.setattr(legacy, "load_audio_float", lambda *_args, **_kwargs: source)
+
+    preserved, active, leading = legacy._ctc_context_signal(
+        tmp_path / "long.wav",
+        target_samples=None,
+        long_audio_mode="full",
+        rng=random.Random(3),
+        sample_rate=16_000,
+        leading_context_range_samples=(3, 3),
+        full_audio=True,
+    )
+
+    assert preserved.numel() == source.numel() + 3
+    assert torch.equal(preserved[3:], source)
+    assert torch.equal(active, source)
+    assert leading == 3
+
+
+def test_augmentation_windows_sample_full_noise_and_trim_final_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pytest.importorskip("torchaudio")
+    legacy = get_legacy_module()
+    requested_noise_lengths: list[int] = []
+    mixed_lengths: list[tuple[int, int]] = []
+
+    def fake_background(
+        _path: Path,
+        *,
+        target_samples: int,
+        rng: random.Random,
+        sample_rate: int,
+    ) -> torch.Tensor:
+        requested_noise_lengths.append(target_samples)
+        return torch.ones(target_samples, dtype=torch.float32)
+
+    def fake_mix(
+        signal: torch.Tensor,
+        noise: torch.Tensor,
+        _snr_db: float,
+        *,
+        signal_reference: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        mixed_lengths.append((int(signal.numel()), int(noise.numel())))
+        return signal
+
+    monkeypatch.setattr(legacy, "_ctc_background_window", fake_background)
+    monkeypatch.setattr(legacy, "mix_with_noise", fake_mix)
+
+    audio = torch.arange(65, dtype=torch.float32)
+    mixed, count = legacy._mix_in_augmentation_windows(
+        audio,
+        active_source=audio,
+        leading_context_samples=0,
+        window_samples=30,
+        noise_paths=[str(tmp_path / "background.wav")],
+        rng=random.Random(5),
+        sample_rate=16_000,
+        snr_low=10.0,
+        snr_high=30.0,
+        artificial_prob=0.0,
+        random_gain_db=0.0,
+    )
+
+    assert torch.equal(mixed, audio)
+    assert count == 3
+    assert requested_noise_lengths == [30, 30, 30]
+    assert mixed_lengths == [(30, 30), (30, 30), (5, 5)]
+
+
+def test_inference_performance_summary_uses_each_inference_window() -> None:
+    records = [
+        {
+            "inference_performance": [
+                {
+                    "real_time_factor": 0.2,
+                    "cpu_utilization_percent": 80.0,
+                    "peak_rss_mb": 400.0,
+                },
+                {
+                    "real_time_factor": 0.4,
+                    "cpu_utilization_percent": 120.0,
+                    "peak_rss_mb": 440.0,
+                },
+            ]
+        },
+        {
+            "inference_performance": [
+                {
+                    "real_time_factor": 0.3,
+                    "cpu_utilization_percent": 100.0,
+                    "peak_rss_mb": 420.0,
+                }
+            ]
+        },
+    ]
+
+    result = summary_module._inference_performance_metrics(records)
+
+    assert result["inference_count"] == 3
+    assert result["real_time_factor"] == {"mean": pytest.approx(0.3), "max": 0.4}
+    assert result["cpu_utilization_percent"] == {
+        "mean": pytest.approx(100.0),
+        "max": 120.0,
+    }
+    assert result["peak_rss_mb"] == {
+        "mean": pytest.approx(420.0),
+        "max": 440.0,
+    }
 
 
 def test_feature_bundle_crops_variable_length_ctc_candidates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

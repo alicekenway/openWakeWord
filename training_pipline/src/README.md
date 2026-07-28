@@ -331,6 +331,23 @@ only sources longer than the maximum; `start`, `end`, and `random` crop such
 sources to the maximum and add no context. The supplied examples filter long
 positives and randomly crop long negatives.
 
+For whole-recording augmentation, select the explicit full mode:
+
+```ini
+ctc_context = yes
+long_audio_mode = full
+full_mode_window_seconds = 30
+leading_context_seconds_range = [0, 2.0]
+```
+
+Full mode preserves every source sample. It independently samples and mixes a
+background segment for each `full_mode_window_seconds` block; the final block
+uses only the needed prefix of its sampled background. The augmentation
+`window_seconds` and `window_count` settings are not used in full mode.
+Leading context is sampled directly from its configured range and is not
+capped by a CTC search window. `full_mode_window_seconds` is required for full
+mode and rejected for every other long-audio mode.
+
 Use the same `window_seconds` and `window_count` in every CTC feature and test
 section. Feature generation scores the continuous `[T, V]` output with that
 bounded horizon and records the best candidate's score, margin, and exact
@@ -351,6 +368,14 @@ events across overlaps. `window_seconds` and `window_count` still control the
 CTC path-search horizon inside each audio window; they do not themselves
 enable audio slicing. Recalibrate stage-1 and final thresholds after changing
 either horizon because the negative maximum-score distribution may change.
+
+Testing records inference performance in each `eval_details.jsonl` row. For
+sliding CTC-WAC evaluation, `inference_performance` contains one measurement
+per audio window. Each measurement includes inference wall time, CPU time,
+real-time factor, process CPU utilization, and sampled peak process RSS.
+Threshold summaries report the mean and maximum RTF, CPU utilization, and peak
+RSS for every test block. CPU utilization is process CPU time divided by wall
+time and can exceed 100% when ONNX Runtime uses more than one CPU core.
 
 ### Optional CTC token-alignment debug log
 

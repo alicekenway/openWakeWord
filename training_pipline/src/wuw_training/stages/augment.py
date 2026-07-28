@@ -61,6 +61,37 @@ def _leading_context_seconds_range(ctx: Any) -> tuple[float, float] | None:
     return minimum, maximum
 
 
+def _full_mode_window_seconds(ctx: Any) -> float | None:
+    """Background sampling window used exclusively by full-audio mode."""
+
+    raw = ctx.section.get("full_mode_window_seconds")
+    mode = _long_audio_mode(ctx)
+    if mode == "full":
+        if raw is None:
+            raise ConfigurationError(
+                f"[{ctx.step}] long_audio_mode = full requires full_mode_window_seconds"
+            )
+        value = number(ctx.section, "full_mode_window_seconds", ctx.step)
+        if value <= 0:
+            raise ConfigurationError(f"[{ctx.step}] full_mode_window_seconds must be > 0")
+        return value
+    if raw is not None:
+        raise ConfigurationError(
+            f"[{ctx.step}] full_mode_window_seconds is only valid when long_audio_mode = full"
+        )
+    return None
+
+
+def _legacy_clip_seconds(ctx: Any) -> float:
+    """The legacy CLI ignores this placeholder in explicit full mode."""
+
+    return 0.0 if _long_audio_mode(ctx) == "full" else _window_seconds(ctx)
+
+
+def _legacy_window_count(ctx: Any) -> int:
+    return 1 if _long_audio_mode(ctx) == "full" else _window_count(ctx)
+
+
 def _noise_dirs(ctx: Any) -> list[Path]:
     raw = ctx.section.get("noise_dir")
     if not raw:
@@ -125,15 +156,18 @@ def validate(ctx: Any) -> None:
         raise ConfigurationError(f"[{ctx.step}] artificial_probability must be between 0 and 1")
     placement(ctx.section, ctx.step)
     if _ctc_context(ctx):
-        if _window_seconds(ctx) <= 0:
-            raise ConfigurationError(f"[{ctx.step}] window_seconds must be > 0")
-        if _window_count(ctx) < 1:
-            raise ConfigurationError(f"[{ctx.step}] window_count must be >= 1")
-        _leading_context_seconds_range(ctx)
-        if _long_audio_mode(ctx) not in {"filter", "start", "end", "random"}:
+        mode = _long_audio_mode(ctx)
+        if mode not in {"filter", "start", "end", "random", "full"}:
             raise ConfigurationError(
-                f"[{ctx.step}] long_audio_mode must be filter, start, end, or random"
+                f"[{ctx.step}] long_audio_mode must be filter, start, end, random, or full"
             )
+        _leading_context_seconds_range(ctx)
+        _full_mode_window_seconds(ctx)
+        if mode != "full":
+            if _window_seconds(ctx) <= 0:
+                raise ConfigurationError(f"[{ctx.step}] window_seconds must be > 0")
+            if _window_count(ctx) < 1:
+                raise ConfigurationError(f"[{ctx.step}] window_count must be >= 1")
     _output_dir(ctx)
     _output_manifest(ctx)
 
@@ -192,7 +226,7 @@ def run(ctx: Any) -> dict[str, Any]:
             snr_high=number(ctx.section, "snr_high", ctx.step, 15.0),
             artificial_prob=number(ctx.section, "artificial_probability", ctx.step, 0.0),
             random_gain_db=number(ctx.section, "random_gain_db", ctx.step, 0.0),
-            clip_seconds=_window_seconds(ctx),
+            clip_seconds=_legacy_clip_seconds(ctx),
             sample_rate=integer(ctx.config.section("main"), "sample_rate", "main", 16000),
             placement=placement(ctx.section, ctx.step),
             seed=integer(ctx.config.section("main"), "seed", "main", 1337),
@@ -200,8 +234,9 @@ def run(ctx: Any) -> dict[str, Any]:
             workers=integer(ctx.section, "workers", ctx.step, 1),
             ctc_context=_ctc_context(ctx),
             long_audio_mode=_long_audio_mode(ctx),
-            window_count=_window_count(ctx),
+            window_count=_legacy_window_count(ctx),
             leading_context_seconds_range=_leading_context_seconds_range(ctx),
+            full_mode_window_seconds=_full_mode_window_seconds(ctx),
         )
     )
     if not validate_outputs(ctx):
@@ -277,7 +312,7 @@ def run_slurm_shard(ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
             snr_high=number(ctx.section, "snr_high", ctx.step, 15.0),
             artificial_prob=number(ctx.section, "artificial_probability", ctx.step, 0.0),
             random_gain_db=number(ctx.section, "random_gain_db", ctx.step, 0.0),
-            clip_seconds=_window_seconds(ctx),
+            clip_seconds=_legacy_clip_seconds(ctx),
             sample_rate=integer(ctx.config.section("main"), "sample_rate", "main", 16000),
             placement=placement(ctx.section, ctx.step),
             seed=integer(ctx.config.section("main"), "seed", "main", 1337),
@@ -286,8 +321,9 @@ def run_slurm_shard(ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
             index_offset=int(task["start"]),
             ctc_context=_ctc_context(ctx),
             long_audio_mode=_long_audio_mode(ctx),
-            window_count=_window_count(ctx),
+            window_count=_legacy_window_count(ctx),
             leading_context_seconds_range=_leading_context_seconds_range(ctx),
+            full_mode_window_seconds=_full_mode_window_seconds(ctx),
         )
     )
     summary = read_json(Path(str(task["output_manifest"])).with_suffix(".summary.json"))
@@ -346,25 +382,49 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
         "placement": placement(ctx.section, ctx.step),
         "ctc_context": _ctc_context(ctx),
         "long_audio_mode": _long_audio_mode(ctx) if _ctc_context(ctx) else None,
-        "target_samples": int(
-            round(
-                _window_seconds(ctx)
-                * _window_count(ctx)
-                * integer(ctx.config.section("main"), "sample_rate", "main", 16000)
+        "target_samples": (
+            None
+            if _long_audio_mode(ctx) == "full"
+            else int(
+                round(
+                    _window_seconds(ctx)
+                    * _window_count(ctx)
+                    * integer(ctx.config.section("main"), "sample_rate", "main", 16000)
+                )
             )
         ),
-        "window_count": _window_count(ctx) if _ctc_context(ctx) else None,
-        "base_window_samples": int(
-            round(_window_seconds(ctx) * integer(ctx.config.section("main"), "sample_rate", "main", 16000))
-        )
-        if _ctc_context(ctx)
-        else None,
+        "window_count": (
+            None
+            if not _ctc_context(ctx) or _long_audio_mode(ctx) == "full"
+            else _window_count(ctx)
+        ),
+        "base_window_samples": (
+            None
+            if not _ctc_context(ctx) or _long_audio_mode(ctx) == "full"
+            else int(
+                round(
+                    _window_seconds(ctx)
+                    * integer(ctx.config.section("main"), "sample_rate", "main", 16000)
+                )
+            )
+        ),
         "leading_context_range_samples": (
             [
                 int(round(value * integer(ctx.config.section("main"), "sample_rate", "main", 16000)))
                 for value in _leading_context_seconds_range(ctx)
             ]
             if _ctc_context(ctx) and _leading_context_seconds_range(ctx) is not None
+            else None
+        ),
+        "full_mode_window_seconds": _full_mode_window_seconds(ctx),
+        "full_mode_window_samples": (
+            int(
+                round(
+                    _full_mode_window_seconds(ctx)
+                    * integer(ctx.config.section("main"), "sample_rate", "main", 16000)
+                )
+            )
+            if _full_mode_window_seconds(ctx) is not None
             else None
         ),
         "placement_counts": legacy.placement_counts(value for _path, value in items),

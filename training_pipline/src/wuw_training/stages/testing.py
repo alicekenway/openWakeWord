@@ -6,6 +6,7 @@ import json
 import math
 import os
 import tempfile
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -30,6 +31,124 @@ from ..ctc_wac import (
 )
 from ..legacy import get_legacy_module
 from .common import integer, number, optional_integer, optional_number, require, stage_work_path
+
+
+def _process_rss_mb() -> float:
+    """Return current resident memory without adding a psutil dependency."""
+
+    try:
+        with Path("/proc/self/status").open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except (OSError, IndexError, ValueError):
+        pass
+    return 0.0
+
+
+class _PeakRssSampler:
+    """One lightweight process-wide sampler reused by sequential inferences."""
+
+    def __init__(self, interval_seconds: float = 0.01) -> None:
+        self.interval_seconds = interval_seconds
+        self._lock = threading.Lock()
+        self._active = False
+        self._peak_mb = 0.0
+        self._thread: threading.Thread | None = None
+
+    def _ensure_thread(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._sample_forever,
+            name="wuw-peak-rss",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _sample_forever(self) -> None:
+        while True:
+            time.sleep(self.interval_seconds)
+            with self._lock:
+                active = self._active
+            if not active:
+                continue
+            value = _process_rss_mb()
+            with self._lock:
+                if self._active:
+                    self._peak_mb = max(self._peak_mb, value)
+
+    def begin(self) -> None:
+        self._ensure_thread()
+        value = _process_rss_mb()
+        with self._lock:
+            self._peak_mb = value
+            self._active = True
+
+    def finish(self) -> float:
+        value = _process_rss_mb()
+        with self._lock:
+            self._peak_mb = max(self._peak_mb, value)
+            self._active = False
+            return self._peak_mb
+
+
+_PEAK_RSS_SAMPLER = _PeakRssSampler()
+
+
+def _begin_inference_measurement() -> tuple[float, float]:
+    _PEAK_RSS_SAMPLER.begin()
+    return time.perf_counter(), time.process_time()
+
+
+def _finish_inference_measurement(
+    started: tuple[float, float],
+    *,
+    audio_seconds: float,
+    audio_window_index: int | None,
+) -> dict[str, Any]:
+    wall_seconds = max(0.0, time.perf_counter() - started[0])
+    cpu_seconds = max(0.0, time.process_time() - started[1])
+    peak_rss_mb = _PEAK_RSS_SAMPLER.finish()
+    return {
+        "audio_window_index": audio_window_index,
+        "audio_seconds": float(audio_seconds),
+        "wall_seconds": wall_seconds,
+        "cpu_seconds": cpu_seconds,
+        "real_time_factor": (
+            wall_seconds / float(audio_seconds) if audio_seconds > 0 else None
+        ),
+        # This is process CPU time / wall time. It is normalized to one CPU
+        # core and can exceed 100% when ONNX Runtime uses multiple threads.
+        "cpu_utilization_percent": (
+            cpu_seconds / wall_seconds * 100.0 if wall_seconds > 0 else None
+        ),
+        "peak_rss_mb": peak_rss_mb,
+    }
+
+
+def _performance_summary(measurements: list[dict[str, Any]]) -> dict[str, Any]:
+    def values(name: str) -> list[float]:
+        result: list[float] = []
+        for item in measurements:
+            try:
+                value = float(item[name])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                result.append(value)
+        return result
+
+    result: dict[str, Any] = {"inference_count": len(measurements)}
+    for field, prefix in (
+        ("real_time_factor", "inference_rtf"),
+        ("cpu_utilization_percent", "inference_cpu_utilization_percent"),
+        ("peak_rss_mb", "inference_peak_rss_mb"),
+    ):
+        samples = values(field)
+        result[f"{prefix}_mean"] = sum(samples) / len(samples) if samples else None
+        result[f"{prefix}_max"] = max(samples) if samples else None
+    return result
 
 
 def _inputs(ctx: Any):
@@ -360,6 +479,7 @@ def _ctc_wac_record(
         if not starts or starts[-1] != last_start:
             starts.append(last_start)
         candidates: list[dict[str, Any]] = []
+        inference_performance: list[dict[str, Any]] = []
         for window_index, start_sample in enumerate(starts):
             segment = audio[start_sample:min(start_sample + window_samples, audio.size)]
             detail = _ctc_wac_record(
@@ -381,6 +501,7 @@ def _ctc_wac_record(
                 _audio_window_index=window_index,
             )
             candidates.extend(detail["stage1_candidates"])
+            inference_performance.extend(detail.get("inference_performance", []))
         candidates.sort(key=lambda value: (float(value["end_time"]), float(value["start_time"])))
         elapsed = time.perf_counter() - started
         expected_keyword = record.get("keyword_id", record.get("wakeword_id"))
@@ -400,7 +521,10 @@ def _ctc_wac_record(
             "best_window": max(candidates, key=lambda value: value["score"], default=None),
             "processing_seconds": elapsed,
             "real_time_factor": elapsed / duration if duration else None,
+            "inference_performance": inference_performance,
+            **_performance_summary(inference_performance),
         }
+    inference_started = _begin_inference_measurement()
     fbank = audio_to_fbank(audio, stage1.contract)
     encoder, ctc = stage1.infer_fbank(fbank)
     if encoder.shape[1] != feature_dim:
@@ -547,6 +671,12 @@ def _ctc_wac_record(
                 "score": float(np.asarray(probability).reshape(-1)[0]),
             }
         )
+    inference_measurement = _finish_inference_measurement(
+        inference_started,
+        audio_seconds=duration,
+        audio_window_index=_audio_window_index,
+    )
+    inference_performance = [inference_measurement]
     elapsed = time.perf_counter() - started
     expected_keyword = record.get("keyword_id", record.get("wakeword_id"))
     return {
@@ -563,6 +693,8 @@ def _ctc_wac_record(
         "best_window": max(candidates, key=lambda value: value["score"], default=None),
         "processing_seconds": elapsed,
         "real_time_factor": elapsed / duration if duration else None,
+        "inference_performance": inference_performance,
+        **_performance_summary(inference_performance),
     }
 
 
@@ -596,6 +728,7 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
     evaluated = 0
     evaluated_seconds = 0.0
     inference_seconds = 0.0
+    inference_performance: list[dict[str, Any]] = []
     stage1_candidate_clips = 0
     stage1_candidate_events = 0
     audio_windows_evaluated = 0
@@ -633,12 +766,14 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
                 evaluated += 1
                 evaluated_seconds += duration
                 inference_seconds += float(detail["processing_seconds"])
+                inference_performance.extend(detail.get("inference_performance", []))
                 stage1_candidate_clips += int(bool(candidates))
                 stage1_candidate_events += len(candidates)
                 audio_windows_evaluated += int(detail.get("audio_window_count", 1))
                 for candidate in candidates:
                     per_keyword[str(candidate["keyword_id"])] = per_keyword.get(str(candidate["keyword_id"]), 0) + 1
             except Exception as exc:
+                _PEAK_RSS_SAMPLER.finish()
                 error = {
                     "set": ctx.step,
                     "index": index,
@@ -680,6 +815,7 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
             "ctc_proposal_score_floor": ctc_proposal_score_floor,
             "audio_window_seconds": audio_window_seconds,
             "audio_window_stride_seconds": audio_window_stride_seconds,
+            **_performance_summary(inference_performance),
         },
     )
     if not validate_outputs(ctx):
@@ -724,6 +860,7 @@ def run(ctx: Any) -> dict[str, Any]:
     evaluated = 0
     evaluated_seconds = 0.0
     audio_windows_evaluated = 0
+    inference_performance: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     details = _details_path(ctx)
     details.parent.mkdir(parents=True, exist_ok=True)
@@ -736,6 +873,7 @@ def run(ctx: Any) -> dict[str, Any]:
             if expected_label == 0 and negative_limit_seconds is not None and evaluated_seconds >= negative_limit_seconds:
                 break
             try:
+                inference_started = _begin_inference_measurement()
                 detail = legacy.evaluate_one_record_scores(
                     model,
                     model_path.stem,
@@ -745,15 +883,24 @@ def run(ctx: Any) -> dict[str, Any]:
                     expected_label,
                     score_config,
                 )
+                windows = detail.get("sliding_windows", [])
+                duration = float(detail.get("duration_seconds") or 0.0)
+                measurement = _finish_inference_measurement(
+                    inference_started,
+                    audio_seconds=duration,
+                    audio_window_index=None,
+                )
+                detail["inference_performance"] = [measurement]
+                detail.update(_performance_summary([measurement]))
                 # Preserve the deliberate field order in the detail record, including
                 # utterance text immediately before the best scoring window.
                 temporary_handle.write(json.dumps(detail, default=legacy.json_default) + "\n")
-                windows = detail.get("sliding_windows", [])
-                duration = float(detail.get("duration_seconds") or 0.0)
                 evaluated += 1
                 evaluated_seconds += duration
                 audio_windows_evaluated += len(windows)
+                inference_performance.append(measurement)
             except Exception as exc:
+                _PEAK_RSS_SAMPLER.finish()
                 error = {
                     "set": ctx.step,
                     "index": index,
@@ -779,7 +926,10 @@ def run(ctx: Any) -> dict[str, Any]:
         evaluated=evaluated,
         evaluated_seconds=evaluated_seconds,
         errors=errors,
-        extra={"audio_windows_evaluated": audio_windows_evaluated},
+        extra={
+            "audio_windows_evaluated": audio_windows_evaluated,
+            **_performance_summary(inference_performance),
+        },
     )
     if not validate_outputs(ctx):
         raise RuntimeError(f"Testing output validation failed for {ctx.step}")
@@ -888,6 +1038,7 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
     selected: list[dict[str, Any]] = []
     is_ctc_wac = _structure(ctx) == "ctc_wac"
     inference_seconds = 0.0
+    inference_performance: list[dict[str, Any]] = []
     stage1_candidate_clips = 0
     stage1_candidate_events = 0
     audio_windows_evaluated = 0
@@ -909,6 +1060,7 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
             if is_ctc_wac:
                 candidates = list(entry.get("stage1_candidates", []))
                 inference_seconds += float(entry.get("processing_seconds", 0.0))
+                inference_performance.extend(entry.get("inference_performance", []))
                 stage1_candidate_clips += int(bool(candidates))
                 stage1_candidate_events += len(candidates)
                 audio_windows_evaluated += int(entry.get("audio_window_count", 1))
@@ -928,7 +1080,10 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
 
     details = _details_path(ctx)
     write_jsonl(details, selected)
-    extra: dict[str, Any] = {"audio_windows_evaluated": audio_windows_evaluated}
+    extra: dict[str, Any] = {
+        "audio_windows_evaluated": audio_windows_evaluated,
+        **_performance_summary(inference_performance),
+    }
     if is_ctc_wac:
         contract = Stage1Contract.from_json(_stage1_contract(ctx))
         audio_window_seconds, audio_window_stride_seconds = _ctc_audio_window_options(ctx)

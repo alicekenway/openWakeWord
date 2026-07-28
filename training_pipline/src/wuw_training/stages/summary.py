@@ -193,6 +193,35 @@ def _record_windows(record: dict[str, Any]) -> tuple[list[dict[str, Any]], str] 
     return None
 
 
+def _inference_performance_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
+    measurements: list[dict[str, Any]] = []
+    for record in records:
+        values = record.get("inference_performance")
+        if isinstance(values, list):
+            measurements.extend(value for value in values if isinstance(value, dict))
+
+    def summary(field: str) -> dict[str, float | None]:
+        samples: list[float] = []
+        for measurement in measurements:
+            try:
+                value = float(measurement[field])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                samples.append(value)
+        return {
+            "mean": sum(samples) / len(samples) if samples else None,
+            "max": max(samples) if samples else None,
+        }
+
+    return {
+        "inference_count": len(measurements),
+        "real_time_factor": summary("real_time_factor"),
+        "cpu_utilization_percent": summary("cpu_utilization_percent"),
+        "peak_rss_mb": summary("peak_rss_mb"),
+    }
+
+
 def _crop_counts(
     record: dict[str, Any],
     windows: list[dict[str, Any]],
@@ -433,6 +462,35 @@ def _markdown_report(payload: dict[str, Any]) -> str:
                 "",
             ]
         )
+        performance = payload.get("performance_by_test", {}).get(test_name, {})
+        if int(performance.get("inference_count", 0)) > 0:
+            lines.extend(
+                [
+                    "### Inference performance",
+                    "",
+                    f"- Measured inferences: `{performance['inference_count']}`",
+                    "",
+                    "| Metric | Mean | Max |",
+                    "| --- | ---: | ---: |",
+                    f"| Real-time factor | {metric(performance['real_time_factor']['mean'])} | "
+                    f"{metric(performance['real_time_factor']['max'])} |",
+                    f"| Peak RSS (MiB) | {metric(performance['peak_rss_mb']['mean'])} | "
+                    f"{metric(performance['peak_rss_mb']['max'])} |",
+                    f"| CPU utilization (%) | "
+                    f"{metric(performance['cpu_utilization_percent']['mean'])} | "
+                    f"{metric(performance['cpu_utilization_percent']['max'])} |",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "### Inference performance",
+                    "",
+                    "No inference performance measurements are present in this test artifact.",
+                    "",
+                ]
+            )
         if "recall" in first:
             lines.extend(
                 [
@@ -558,10 +616,22 @@ def run(ctx: Any) -> dict[str, Any]:
     payload = {
         "tests": _test_steps(ctx),
         "debounce_seconds": debounce,
+        "performance_by_test": {
+            test_step: _inference_performance_metrics(records)
+            for test_step, (_expected_label, records, _error_count) in loaded.items()
+        },
         "metric_definitions": {
             "false_accept_rate": "false_accept_crops / crops_evaluated",
             "false_accepts_per_hour": "debounced false_accept_events / evaluated_hours",
             "false_reject_rate": "false_reject_clips / positive_clips_evaluated",
+            "real_time_factor": "inference wall seconds / inference audio seconds",
+            "cpu_utilization_percent": (
+                "process CPU seconds / inference wall seconds * 100; may exceed 100 "
+                "when inference uses multiple CPU cores"
+            ),
+            "peak_rss_mb": (
+                "maximum process resident-set size sampled during one inference, in MiB"
+            ),
         },
         "thresholds": threshold_rows,
         "keyword_threshold_operating_point": selected_operating_point,
