@@ -3082,6 +3082,8 @@ class CtcWacFeatureBlock:
     margin: np.ndarray
     winner_onehot_values: np.ndarray
     stage1_gate_score: str
+    ctc_score_floor: float | None
+    margin_floor: float | None
     retained_indices: np.ndarray
 
     @classmethod
@@ -3091,6 +3093,8 @@ class CtcWacFeatureBlock:
         keywords: Sequence[Keyword],
         *,
         stage1_gate_score: str = "normalized_ctc_score",
+        ctc_score_floor: float | None = None,
+        margin_floor: float | None = None,
     ) -> "CtcWacFeatureBlock":
         if not feature_bundle_valid(block.path):
             raise ConfigurationError(
@@ -3122,6 +3126,17 @@ class CtcWacFeatureBlock:
             raise ConfigurationError(
                 f"[{block.name}] unknown stage-1 gate score {stage1_gate_score!r}; choose one of {choices}"
             ) from exc
+        retained = retained_stage1_indices(scores, keywords, gate_scores=gate_values)
+        if ctc_score_floor is not None:
+            retained = retained[
+                np.asarray(top[retained], dtype=np.float32).reshape(-1)
+                >= float(ctc_score_floor)
+            ]
+        if margin_floor is not None:
+            retained = retained[
+                np.asarray(margin[retained], dtype=np.float32).reshape(-1)
+                >= float(margin_floor)
+            ]
         return cls(
             name=block.name,
             label=int(block.label),
@@ -3135,7 +3150,9 @@ class CtcWacFeatureBlock:
             margin=margin,
             winner_onehot_values=onehot,
             stage1_gate_score=stage1_gate_score,
-            retained_indices=retained_stage1_indices(scores, keywords, gate_scores=gate_values),
+            ctc_score_floor=ctc_score_floor,
+            margin_floor=margin_floor,
+            retained_indices=retained,
         )
 
     @property
@@ -3190,12 +3207,14 @@ class CtcWacFeatureBlock:
             np.full(selected.shape[0], self.label, dtype=np.float32),
         )
 
-    def filtering_summary(self) -> dict[str, int | str]:
+    def filtering_summary(self) -> dict[str, int | float | str | None]:
         return {
             "input_rows": self.input_count,
             "retained_rows": self.retained_count,
             "dropped_rows": self.input_count - self.retained_count,
             "stage1_gate_score": self.stage1_gate_score,
+            "ctc_score_floor": self.ctc_score_floor,
+            "margin_floor": self.margin_floor,
             "min_retained_frames": int(np.min(self.lengths[self.retained_indices])) if self.retained_count else 0,
             "max_retained_frames": int(np.max(self.lengths[self.retained_indices])) if self.retained_count else 0,
         }
@@ -3213,6 +3232,9 @@ class CtcWacClassifier(torch.nn.Module):
         frame_layers: int = 3,
         head_hidden: int = 128,
         dropout: float = 0.1,
+        temporal_model: str = "mlp",
+        temporal_kernel_size: int = 5,
+        use_winner_onehot: bool = True,
         score_mean: float = 0.0,
         score_std: float = 1.0,
         margin_mean: float = 0.0,
@@ -3223,17 +3245,46 @@ class CtcWacClassifier(torch.nn.Module):
             raise ValueError("CtcWacClassifier dimensions must all be positive")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("CtcWacClassifier dropout must be in [0, 1)")
+        if temporal_model not in {"mlp", "conv"}:
+            raise ValueError("temporal_model must be mlp or conv")
+        if temporal_kernel_size < 1 or temporal_kernel_size % 2 == 0:
+            raise ValueError("temporal_kernel_size must be a positive odd integer")
         self.feature_dim = int(feature_dim)
         self.keyword_count = int(keyword_count)
+        self.temporal_model = str(temporal_model)
+        self.use_winner_onehot = bool(use_winner_onehot)
         self.frame_norm = torch.nn.LayerNorm(feature_dim)
-        frame_layers_list: list[torch.nn.Module] = []
-        input_dim = feature_dim
-        for _ in range(frame_layers):
-            frame_layers_list.extend(
-                [torch.nn.Linear(input_dim, frame_hidden), torch.nn.ReLU(), torch.nn.Dropout(dropout)]
+        if self.temporal_model == "mlp":
+            frame_layers_list: list[torch.nn.Module] = []
+            input_dim = feature_dim
+            for _ in range(frame_layers):
+                frame_layers_list.extend(
+                    [torch.nn.Linear(input_dim, frame_hidden), torch.nn.ReLU(), torch.nn.Dropout(dropout)]
+                )
+                input_dim = frame_hidden
+            self.frame_net = torch.nn.Sequential(*frame_layers_list)
+            self.input_projection = torch.nn.Identity()
+            self.temporal_convs = torch.nn.ModuleList()
+            self.temporal_norms = torch.nn.ModuleList()
+            self.temporal_dropout = torch.nn.Identity()
+        else:
+            self.frame_net = torch.nn.Identity()
+            self.input_projection = torch.nn.Linear(feature_dim, frame_hidden)
+            self.temporal_convs = torch.nn.ModuleList(
+                [
+                    torch.nn.Conv1d(
+                        frame_hidden,
+                        frame_hidden,
+                        kernel_size=temporal_kernel_size,
+                        padding=temporal_kernel_size // 2,
+                    )
+                    for _ in range(frame_layers)
+                ]
             )
-            input_dim = frame_hidden
-        self.frame_net = torch.nn.Sequential(*frame_layers_list)
+            self.temporal_norms = torch.nn.ModuleList(
+                [torch.nn.LayerNorm(frame_hidden) for _ in range(frame_layers)]
+            )
+            self.temporal_dropout = torch.nn.Dropout(dropout)
         context_dim = frame_hidden + 2 + keyword_count
         self.context_norm = torch.nn.LayerNorm(context_dim)
         self.decoder = torch.nn.Sequential(
@@ -3265,12 +3316,29 @@ class CtcWacClassifier(torch.nn.Module):
                 raise ValueError("frame_mask must have shape [batch, frames]")
             if winner_onehot_values.ndim != 2 or winner_onehot_values.shape[-1] != self.keyword_count:
                 raise ValueError("winner_onehot has the wrong keyword dimension")
-        frame_values = self.frame_net(self.frame_norm(encoder_features))
-        mask = frame_mask.to(dtype=frame_values.dtype).unsqueeze(-1)
+        mask = frame_mask.to(dtype=encoder_features.dtype).unsqueeze(-1)
+        normalized_frames = self.frame_norm(encoder_features)
+        if self.temporal_model == "mlp":
+            frame_values = self.frame_net(normalized_frames)
+        else:
+            frame_values = torch.relu(self.input_projection(normalized_frames))
+            frame_values = frame_values * mask
+            for convolution, normalization in zip(self.temporal_convs, self.temporal_norms):
+                residual = frame_values
+                convolved = convolution(frame_values.transpose(1, 2)).transpose(1, 2)
+                frame_values = residual + self.temporal_dropout(
+                    torch.relu(normalization(convolved))
+                )
+                frame_values = frame_values * mask
         pooled = (frame_values * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
         normalized_score = (top_score.reshape(-1, 1) - self.score_mean) / self.score_std
         normalized_margin = (margin.reshape(-1, 1) - self.margin_mean) / self.margin_std
-        context = torch.cat([pooled, normalized_score, normalized_margin, winner_onehot_values], dim=1)
+        winner_context = (
+            winner_onehot_values
+            if self.use_winner_onehot
+            else winner_onehot_values * 0.0
+        )
+        context = torch.cat([pooled, normalized_score, normalized_margin, winner_context], dim=1)
         return self.decoder(self.context_norm(context))
 
     def forward(
@@ -3294,19 +3362,38 @@ def ctc_wac_model_config(section: dict[str, str], *, section_name: str) -> dict[
         "frame_layers": 3,
         "head_hidden": 128,
         "dropout": 0.1,
+        "temporal_model": "mlp",
+        "temporal_kernel_size": 5,
+        "use_winner_onehot": True,
     }
     result: dict[str, Any] = {}
     for key, default in defaults.items():
         raw = section.get(f"wac.{key}", section.get(key if key == "dropout" else f"wac_{key}"))
         value: Any = default if raw is None else raw
         try:
-            result[key] = float(value) if key == "dropout" else int(value)
+            if key == "dropout":
+                result[key] = float(value)
+            elif key == "temporal_model":
+                result[key] = str(value).strip().lower()
+            elif key == "use_winner_onehot":
+                normalized = str(value).strip().lower()
+                if normalized not in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
+                    raise ValueError(value)
+                result[key] = normalized in {"1", "true", "yes", "on"}
+            else:
+                result[key] = int(value)
         except (TypeError, ValueError) as exc:
             raise ConfigurationError(f"[{section_name}] wac.{key} is invalid") from exc
     if min(result["frame_hidden"], result["frame_layers"], result["head_hidden"]) < 1:
         raise ConfigurationError(f"[{section_name}] WAC hidden sizes and layer count must be >= 1")
     if not 0.0 <= result["dropout"] < 1.0:
         raise ConfigurationError(f"[{section_name}] wac.dropout must be in [0, 1)")
+    if result["temporal_model"] not in {"mlp", "conv"}:
+        raise ConfigurationError(f"[{section_name}] wac.temporal_model must be mlp or conv")
+    if result["temporal_kernel_size"] < 1 or result["temporal_kernel_size"] % 2 == 0:
+        raise ConfigurationError(
+            f"[{section_name}] wac.temporal_kernel_size must be a positive odd integer"
+        )
     return result
 
 
@@ -3327,6 +3414,9 @@ def make_ctc_wac_model(
         frame_layers=int(model_config["frame_layers"]),
         head_hidden=int(model_config["head_hidden"]),
         dropout=float(model_config["dropout"]),
+        temporal_model=str(model_config.get("temporal_model", "mlp")),
+        temporal_kernel_size=int(model_config.get("temporal_kernel_size", 5)),
+        use_winner_onehot=bool(model_config.get("use_winner_onehot", True)),
         score_mean=score_mean,
         score_std=score_std,
         margin_mean=margin_mean,

@@ -28,7 +28,7 @@ from ..ctc_wac import (
     load_keywords,
     make_ctc_wac_model,
 )
-from .common import boolean, csv_option, integer, number, optional_integer, require
+from .common import boolean, csv_option, integer, number, optional_integer, optional_number, require
 
 
 @dataclass(frozen=True)
@@ -1038,13 +1038,28 @@ class CtcWacBatchSampler:
         seed: int,
         *,
         bucket_width_frames: int = 8,
+        balance_winners: bool = False,
     ):
         self.groups = groups
         self.rng = np.random.default_rng(seed)
         self.bucket_width_frames = int(bucket_width_frames)
+        self.balance_winners = bool(balance_winners)
         if self.bucket_width_frames < 1:
             raise ValueError("bucket_width_frames must be >= 1")
         self.buckets = [block.retained_bucket_indices(self.bucket_width_frames) for block, _count in groups]
+        self.winner_buckets: list[dict[int, dict[int, np.ndarray]]] = []
+        for (block, _count), buckets in zip(groups, self.buckets):
+            per_winner: dict[int, dict[int, np.ndarray]] = {}
+            for bucket, indices in buckets.items():
+                winner_ids = np.argmax(
+                    np.asarray(block.winner_onehot_values[indices], dtype=np.float32),
+                    axis=1,
+                )
+                for winner_id in np.unique(winner_ids).tolist():
+                    per_winner.setdefault(int(winner_id), {})[bucket] = indices[
+                        winner_ids == int(winner_id)
+                    ]
+            self.winner_buckets.append(per_winner)
         self.available_buckets = sorted({key for values in self.buckets for key in values})
         if not self.available_buckets:
             raise RuntimeError("No retained stage-1 candidates are available for CTC-WAC batching")
@@ -1063,12 +1078,30 @@ class CtcWacBatchSampler:
         winner_parts: list[np.ndarray] = []
         label_parts: list[np.ndarray] = []
         requested_bucket = int(self.rng.choice(self.available_buckets))
-        for (block, count), buckets in zip(self.groups, self.buckets):
+        for group_index, ((block, count), buckets) in enumerate(zip(self.groups, self.buckets)):
             if block.retained_count < 1:
                 raise RuntimeError(f"No retained stage-1 candidates remain in {block.name}")
-            indices_for_bucket = self._nearest_bucket(buckets, requested_bucket)
-            positions = self.rng.integers(0, indices_for_bucket.shape[0], size=count)
-            indices = indices_for_bucket[positions]
+            if self.balance_winners:
+                per_winner = self.winner_buckets[group_index]
+                available_winners = np.asarray(sorted(per_winner), dtype=np.int64)
+                selected_winners = self.rng.choice(
+                    available_winners,
+                    size=count,
+                    replace=True,
+                )
+                sampled: list[int] = []
+                for winner_id in selected_winners.tolist():
+                    indices_for_bucket = self._nearest_bucket(
+                        per_winner[int(winner_id)],
+                        requested_bucket,
+                    )
+                    position = int(self.rng.integers(0, indices_for_bucket.shape[0]))
+                    sampled.append(int(indices_for_bucket[position]))
+                indices = np.asarray(sampled, dtype=np.int64)
+            else:
+                indices_for_bucket = self._nearest_bucket(buckets, requested_bucket)
+                positions = self.rng.integers(0, indices_for_bucket.shape[0], size=count)
+                indices = indices_for_bucket[positions]
             feature_rows.extend(block.candidate(int(index)) for index in indices.tolist())
             score_parts.append(np.asarray(block.top_score[indices], dtype=np.float32))
             margin_parts.append(np.asarray(block.margin[indices], dtype=np.float32))
@@ -1231,6 +1264,7 @@ class CtcWacTrainer:
             [(block, _batch_count(ctx, block.name)) for block in train_blocks],
             seed,
             bucket_width_frames=integer(ctx.section, "length_bucket_width_frames", ctx.step, 8),
+            balance_winners=boolean(ctx.section, "balance_winners", ctx.step, False),
         )
         self.seed = seed
         self.phase_index = 0
@@ -1521,6 +1555,7 @@ class CtcWacTrainer:
             "feature_dim": self.feature_dim,
             "max_candidate_frames": self.max_candidate_frames,
             "length_bucket_width_frames": integer(self.ctx.section, "length_bucket_width_frames", self.ctx.step, 8),
+            "balance_winners": boolean(self.ctx.section, "balance_winners", self.ctx.step, False),
             "keyword_count": len(self.keywords),
             "keyword_ids": [item.id for item in self.keywords],
             "keywords_fingerprint": keyword_fingerprint(self.keywords),
@@ -1572,14 +1607,32 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
     keywords_path = _ctc_wac_keywords_path(ctx)
     keywords = load_keywords(keywords_path)
     stage1_gate_score = _ctc_wac_stage1_gate_score(ctx)
+    ctc_score_floor = optional_number(
+        ctx.section, "ctc_proposal_score_floor", ctx.step
+    )
+    margin_floor = optional_number(
+        ctx.section, "ctc_proposal_margin_floor", ctx.step
+    )
     train_feature_blocks = _blocks(ctx, "train")
     validation_feature_blocks = _validation_blocks(ctx)
     train_blocks = [
-        CtcWacFeatureBlock.from_feature_block(block, keywords, stage1_gate_score=stage1_gate_score)
+        CtcWacFeatureBlock.from_feature_block(
+            block,
+            keywords,
+            stage1_gate_score=stage1_gate_score,
+            ctc_score_floor=ctc_score_floor,
+            margin_floor=margin_floor,
+        )
         for block in train_feature_blocks
     ]
     validation_blocks = [
-        CtcWacFeatureBlock.from_feature_block(block, keywords, stage1_gate_score=stage1_gate_score)
+        CtcWacFeatureBlock.from_feature_block(
+            block,
+            keywords,
+            stage1_gate_score=stage1_gate_score,
+            ctc_score_floor=ctc_score_floor,
+            margin_floor=margin_floor,
+        )
         for block in validation_feature_blocks
     ]
     for group_name, blocks in (("train", train_blocks), ("dev", validation_blocks)):

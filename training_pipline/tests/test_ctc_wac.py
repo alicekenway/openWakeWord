@@ -945,6 +945,56 @@ def test_masked_wac_pooling_ignores_tail_padding() -> None:
     assert torch.allclose(first, second, rtol=1e-6, atol=1e-6)
 
 
+def test_conv_wac_pooling_ignores_tail_padding_and_winner_when_disabled() -> None:
+    model = make_ctc_wac_model(
+        feature_dim=3,
+        keyword_count=2,
+        model_config={
+            "frame_hidden": 4,
+            "frame_layers": 2,
+            "head_hidden": 4,
+            "dropout": 0.0,
+            "temporal_model": "conv",
+            "temporal_kernel_size": 3,
+            "use_winner_onehot": False,
+        },
+    ).eval()
+    features = torch.zeros((1, 6, 3), dtype=torch.float32)
+    mask = torch.tensor([[1.0, 1.0, 1.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
+    scalar = torch.zeros((1, 1), dtype=torch.float32)
+    first_winner = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    second_winner = torch.tensor([[0.0, 1.0]], dtype=torch.float32)
+    with torch.inference_mode():
+        first = model(features, mask, scalar, scalar, first_winner)
+        features[:, 3:] = 1000.0
+        second = model(features, mask, scalar, scalar, second_winner)
+    assert torch.allclose(first, second, rtol=1e-6, atol=1e-6)
+
+
+def test_ctc_wac_train_loader_applies_ctc_and_margin_floors(tmp_path: Path) -> None:
+    keywords_path = _keyword_file(tmp_path)
+    bundle_path = tmp_path / "bundle.npy"
+    _write_bundle(bundle_path, label=0, keywords_path=keywords_path, seed=7)
+    block = FeatureBlock(
+        name="feature.negative",
+        path=bundle_path,
+        label=0,
+        split="train",
+        shape=(4, 5),
+        rows=4,
+    )
+    loaded = CtcWacFeatureBlock.from_feature_block(
+        block,
+        load_keywords(keywords_path),
+        ctc_score_floor=-1.15,
+        margin_floor=2.0,
+    )
+    assert loaded.retained_indices.tolist() == [0, 1]
+    summary = loaded.filtering_summary()
+    assert summary["ctc_score_floor"] == -1.15
+    assert summary["margin_floor"] == 2.0
+
+
 def test_slurm_merge_rebuilds_ragged_offsets(tmp_path: Path) -> None:
     keywords_path = _keyword_file(tmp_path)
     first = tmp_path / "shard_a.npy"
