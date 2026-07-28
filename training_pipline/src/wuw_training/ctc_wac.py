@@ -3234,6 +3234,7 @@ class CtcWacClassifier(torch.nn.Module):
         dropout: float = 0.1,
         temporal_model: str = "mlp",
         temporal_kernel_size: int = 5,
+        pooling: str = "mean",
         use_winner_onehot: bool = True,
         score_mean: float = 0.0,
         score_std: float = 1.0,
@@ -3247,11 +3248,14 @@ class CtcWacClassifier(torch.nn.Module):
             raise ValueError("CtcWacClassifier dropout must be in [0, 1)")
         if temporal_model not in {"mlp", "conv"}:
             raise ValueError("temporal_model must be mlp or conv")
+        if pooling not in {"mean", "mean_max", "attention"}:
+            raise ValueError("pooling must be mean, mean_max, or attention")
         if temporal_kernel_size < 1 or temporal_kernel_size % 2 == 0:
             raise ValueError("temporal_kernel_size must be a positive odd integer")
         self.feature_dim = int(feature_dim)
         self.keyword_count = int(keyword_count)
         self.temporal_model = str(temporal_model)
+        self.pooling = str(pooling)
         self.use_winner_onehot = bool(use_winner_onehot)
         self.frame_norm = torch.nn.LayerNorm(feature_dim)
         if self.temporal_model == "mlp":
@@ -3285,7 +3289,13 @@ class CtcWacClassifier(torch.nn.Module):
                 [torch.nn.LayerNorm(frame_hidden) for _ in range(frame_layers)]
             )
             self.temporal_dropout = torch.nn.Dropout(dropout)
-        context_dim = frame_hidden + 2 + keyword_count
+        self.pool_attention = (
+            torch.nn.Linear(frame_hidden, 1, bias=False)
+            if self.pooling == "attention"
+            else torch.nn.Identity()
+        )
+        pooled_dim = frame_hidden * 2 if self.pooling == "mean_max" else frame_hidden
+        context_dim = pooled_dim + 2 + keyword_count
         self.context_norm = torch.nn.LayerNorm(context_dim)
         self.decoder = torch.nn.Sequential(
             torch.nn.Linear(context_dim, head_hidden),
@@ -3330,7 +3340,20 @@ class CtcWacClassifier(torch.nn.Module):
                     torch.relu(normalization(convolved))
                 )
                 frame_values = frame_values * mask
-        pooled = (frame_values * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        mean_pooled = (frame_values * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        if self.pooling == "mean":
+            pooled = mean_pooled
+        elif self.pooling == "mean_max":
+            masked_for_max = frame_values.masked_fill(mask <= 0, -1.0e4)
+            max_pooled = masked_for_max.max(dim=1).values
+            pooled = torch.cat([mean_pooled, max_pooled], dim=1)
+        else:
+            attention_logits = self.pool_attention(frame_values).masked_fill(mask <= 0, -1.0e4)
+            attention_weights = torch.softmax(attention_logits, dim=1) * mask
+            attention_weights = attention_weights / attention_weights.sum(dim=1, keepdim=True).clamp_min(
+                1.0e-6
+            )
+            pooled = (frame_values * attention_weights).sum(dim=1)
         normalized_score = (top_score.reshape(-1, 1) - self.score_mean) / self.score_std
         normalized_margin = (margin.reshape(-1, 1) - self.margin_mean) / self.margin_std
         winner_context = (
@@ -3364,6 +3387,7 @@ def ctc_wac_model_config(section: dict[str, str], *, section_name: str) -> dict[
         "dropout": 0.1,
         "temporal_model": "mlp",
         "temporal_kernel_size": 5,
+        "pooling": "mean",
         "use_winner_onehot": True,
     }
     result: dict[str, Any] = {}
@@ -3373,7 +3397,7 @@ def ctc_wac_model_config(section: dict[str, str], *, section_name: str) -> dict[
         try:
             if key == "dropout":
                 result[key] = float(value)
-            elif key == "temporal_model":
+            elif key in {"temporal_model", "pooling"}:
                 result[key] = str(value).strip().lower()
             elif key == "use_winner_onehot":
                 normalized = str(value).strip().lower()
@@ -3390,6 +3414,10 @@ def ctc_wac_model_config(section: dict[str, str], *, section_name: str) -> dict[
         raise ConfigurationError(f"[{section_name}] wac.dropout must be in [0, 1)")
     if result["temporal_model"] not in {"mlp", "conv"}:
         raise ConfigurationError(f"[{section_name}] wac.temporal_model must be mlp or conv")
+    if result["pooling"] not in {"mean", "mean_max", "attention"}:
+        raise ConfigurationError(
+            f"[{section_name}] wac.pooling must be mean, mean_max, or attention"
+        )
     if result["temporal_kernel_size"] < 1 or result["temporal_kernel_size"] % 2 == 0:
         raise ConfigurationError(
             f"[{section_name}] wac.temporal_kernel_size must be a positive odd integer"
@@ -3416,6 +3444,7 @@ def make_ctc_wac_model(
         dropout=float(model_config["dropout"]),
         temporal_model=str(model_config.get("temporal_model", "mlp")),
         temporal_kernel_size=int(model_config.get("temporal_kernel_size", 5)),
+        pooling=str(model_config.get("pooling", "mean")),
         use_winner_onehot=bool(model_config.get("use_winner_onehot", True)),
         score_mean=score_mean,
         score_std=score_std,

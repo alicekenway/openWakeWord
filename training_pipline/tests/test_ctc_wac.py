@@ -971,6 +971,34 @@ def test_conv_wac_pooling_ignores_tail_padding_and_winner_when_disabled() -> Non
     assert torch.allclose(first, second, rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.parametrize("pooling", ["mean_max", "attention"])
+def test_alternative_wac_pooling_ignores_tail_padding(pooling: str) -> None:
+    model = make_ctc_wac_model(
+        feature_dim=3,
+        keyword_count=2,
+        model_config={
+            "frame_hidden": 4,
+            "frame_layers": 1,
+            "head_hidden": 4,
+            "dropout": 0.0,
+            "pooling": pooling,
+        },
+    ).eval()
+    features = torch.randn((2, 5, 3), dtype=torch.float32)
+    mask = torch.tensor(
+        [[1.0, 1.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+    scalar = torch.zeros((2, 1), dtype=torch.float32)
+    winner = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+    with torch.inference_mode():
+        first = model(features, mask, scalar, scalar, winner)
+        features[:, 3:] = 1000.0
+        features[0, 2] = 1000.0
+        second = model(features, mask, scalar, scalar, winner)
+    assert torch.allclose(first, second, rtol=1e-6, atol=1e-6)
+
+
 def test_ctc_wac_train_loader_applies_ctc_and_margin_floors(tmp_path: Path) -> None:
     keywords_path = _keyword_file(tmp_path)
     bundle_path = tmp_path / "bundle.npy"
