@@ -21,8 +21,8 @@ for dataset in sorted(x for x in root.iterdir() if x.is_dir()):
             elif ids:wrong+=1;confusion[(expected,ids[0])]+=1
     rtfs=[x["rtf"] for x in rows if "rtf" in x]
     metrics={"expected_label":label,"records":len(rows),"errors":errors,"detected":detected,"event_count":event_count,"audio_hours":audio_hours,"events_per_hour":event_count/max(audio_hours,1e-12),"rtf_mean":sum(rtfs)/max(1,len(rtfs)),"rtf_max":max(rtfs,default=0)}
-    if label:metrics.update(correct=correct,wrong_keyword=wrong,false_reject=len(rows)-errors-correct,"false_reject_rate":(len(rows)-errors-correct)/max(1,len(rows)-errors),confusions=[{"expected":x[0],"detected":x[1],"count":n} for x,n in confusion.most_common()])
-    else:metrics.update(false_accept=detected,"false_accept_rate":detected/max(1,len(rows)-errors))
+    if label:metrics.update(correct=correct,wrong_keyword=wrong,false_reject=len(rows)-errors-correct,false_reject_rate=(len(rows)-errors-correct)/max(1,len(rows)-errors),confusions=[{"expected":x[0],"detected":x[1],"count":n} for x,n in confusion.most_common()])
+    else:metrics.update(false_accept=detected,false_accept_rate=detected/max(1,len(rows)-errors))
     summary["datasets"][dataset.name]=metrics;summary["total_records"]+=len(rows);summary["total_errors"]+=errors
     with (out/f"{dataset.name}.jsonl").open("w") as f:
         for row in rows:f.write(json.dumps(row,separators=(",",":"))+"\n")
