@@ -30,7 +30,8 @@ from ..ctc_wac import (
     winner_onehot,
 )
 from ..legacy import get_legacy_module
-from .common import integer, number, optional_integer, optional_number, require, stage_work_path
+from ..vad import VAD_SAMPLE_RATE, VadScorer
+from .common import boolean, integer, number, optional_integer, optional_number, require, stage_work_path
 
 
 def _process_rss_mb() -> float:
@@ -184,6 +185,28 @@ def _structure(ctx: Any) -> str:
     return value
 
 
+def _vad_enabled(ctx: Any) -> bool:
+    return boolean(ctx.section, "vad_enabled", ctx.step, False)
+
+
+def _vad_model(ctx: Any) -> Path:
+    return ctx.config.resolve_path(require(ctx.section, "vad_model", ctx.step))
+
+
+def _vad_options(ctx: Any) -> tuple[bool, float, float, int]:
+    enabled = _vad_enabled(ctx)
+    threshold = number(ctx.section, "vad_threshold", ctx.step, 0.5)
+    padding_ms = number(ctx.section, "vad_padding_ms", ctx.step, 100.0)
+    threads = integer(ctx.section, "vad_threads", ctx.step, 1)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ConfigurationError(f"[{ctx.step}] vad_threshold must be a finite number in [0, 1]")
+    if not math.isfinite(padding_ms) or padding_ms < 0.0:
+        raise ConfigurationError(f"[{ctx.step}] vad_padding_ms must be a finite number >= 0")
+    if threads < 1:
+        raise ConfigurationError(f"[{ctx.step}] vad_threads must be >= 1")
+    return enabled, threshold, padding_ms, threads
+
+
 def _stage1_model(ctx: Any) -> Path:
     return ctx.config.resolve_path(require(ctx.section, "stage1_model", ctx.step))
 
@@ -295,7 +318,11 @@ def validate(ctx: Any) -> None:
     for item in _inputs(ctx):
         if item.audio_base_dir and not item.audio_base_dir.is_dir():
             raise ConfigurationError(f"[{ctx.step}] audio_base_dir does not exist: {item.audio_base_dir}")
-    if _structure(ctx) == "ctc_wac":
+    structure = _structure(ctx)
+    vad_enabled, _vad_threshold, _vad_padding_ms, _vad_threads = _vad_options(ctx)
+    if vad_enabled and structure != "ctc_wac":
+        raise ConfigurationError(f"[{ctx.step}] VAD gating is currently supported only for structure = ctc_wac")
+    if structure == "ctc_wac":
         for name, path in (
             ("model", _model(ctx)),
             ("stage1_model", _stage1_model(ctx)),
@@ -305,6 +332,14 @@ def validate(ctx: Any) -> None:
             if not path.is_file():
                 raise ConfigurationError(f"[{ctx.step}] {name} does not exist: {path}")
         contract = Stage1Contract.from_json(_stage1_contract(ctx))
+        if vad_enabled:
+            model_path = _vad_model(ctx)
+            if not model_path.is_file():
+                raise ConfigurationError(f"[{ctx.step}] vad_model does not exist: {model_path}")
+            if contract.sample_rate != VAD_SAMPLE_RATE:
+                raise ConfigurationError(
+                    f"[{ctx.step}] VAD requires a {VAD_SAMPLE_RATE} Hz stage-1 contract"
+                )
         load_keywords(_keywords(ctx))
         _ctc_wac_stage1_gate_score(ctx)
         _ctc_proposal_score_floor(ctx)
@@ -334,13 +369,16 @@ def validate(ctx: Any) -> None:
 
 def input_paths(ctx: Any) -> list[Path]:
     if _structure(ctx) == "ctc_wac":
-        return [
+        paths = [
             *(item.path for item in _inputs(ctx)),
             _model(ctx),
             _stage1_model(ctx),
             _stage1_contract(ctx),
             _keywords(ctx),
         ]
+        if _vad_enabled(ctx):
+            paths.append(_vad_model(ctx))
+        return paths
     model_dir = _model_dir(ctx)
     return [
         *(item.path for item in _inputs(ctx)),
@@ -434,6 +472,28 @@ def _ctc_wac_candidate_features(
     return values, mask, crop_start, crop_end
 
 
+def _vad_detail_fields(
+    candidates: list[dict[str, Any]],
+    *,
+    enabled: bool,
+    threshold: float,
+    padding_ms: float,
+) -> dict[str, Any]:
+    passed = sum(bool(candidate.get("vad_passed", True)) for candidate in candidates)
+    return {
+        "vad_enabled": enabled,
+        "vad_threshold": threshold if enabled else None,
+        "vad_padding_ms": padding_ms if enabled else None,
+        "vad_candidate_pass_count": passed,
+        "vad_candidate_reject_count": len(candidates) - passed,
+        "best_vad_passed_window": max(
+            (candidate for candidate in candidates if bool(candidate.get("vad_passed", True))),
+            key=lambda value: value["score"],
+            default=None,
+        ),
+    }
+
+
 def _ctc_wac_record(
     *,
     record: dict[str, Any],
@@ -451,6 +511,9 @@ def _ctc_wac_record(
     competitor_token_prune: int | None = 8,
     audio_window_seconds: float | None = None,
     audio_window_stride_seconds: float | None = None,
+    vad_scorer: VadScorer | None = None,
+    vad_threshold: float = 0.5,
+    vad_padding_ms: float = 100.0,
     _audio_override: np.ndarray | None = None,
     _audio_time_offset_seconds: float = 0.0,
     _audio_window_index: int | None = None,
@@ -496,6 +559,9 @@ def _ctc_wac_record(
                 ctc_proposal_score_floor=ctc_proposal_score_floor,
                 competitor_beam_size=competitor_beam_size,
                 competitor_token_prune=competitor_token_prune,
+                vad_scorer=vad_scorer,
+                vad_threshold=vad_threshold,
+                vad_padding_ms=vad_padding_ms,
                 _audio_override=segment,
                 _audio_time_offset_seconds=start_sample / float(stage1.contract.sample_rate),
                 _audio_window_index=window_index,
@@ -522,9 +588,16 @@ def _ctc_wac_record(
             "processing_seconds": elapsed,
             "real_time_factor": elapsed / duration if duration else None,
             "inference_performance": inference_performance,
+            **_vad_detail_fields(
+                candidates,
+                enabled=vad_scorer is not None,
+                threshold=vad_threshold,
+                padding_ms=vad_padding_ms,
+            ),
             **_performance_summary(inference_performance),
         }
     inference_started = _begin_inference_measurement()
+    vad_scores = vad_scorer.frame_scores(audio) if vad_scorer is not None else None
     fbank = audio_to_fbank(audio, stage1.contract)
     encoder, ctc = stage1.infer_fbank(fbank)
     if encoder.shape[1] != feature_dim:
@@ -639,8 +712,7 @@ def _ctc_wac_record(
             },
         )[0]
         frame_shift = float(getattr(stage1.contract, "encoder_frame_shift_ms", 40.0)) / 1000.0
-        candidates.append(
-            {
+        candidate = {
                 "keyword_id": keywords[winner_index].id,
                 "trigger_frame": index,
                 "finalized_at_eof": finalized_at_eof,
@@ -670,7 +742,34 @@ def _ctc_wac_record(
                 # Stage-2 classifier probability, never a Stage-1 score.
                 "score": float(np.asarray(probability).reshape(-1)[0]),
             }
-        )
+        if vad_scores is None:
+            candidate.update(
+                {
+                    "vad_score": None,
+                    "vad_threshold": None,
+                    "vad_passed": True,
+                    "vad_start_time": None,
+                    "vad_end_time": None,
+                }
+            )
+        else:
+            vad_score, vad_start, vad_end = vad_scorer.interval_score(
+                vad_scores,
+                start_seconds=start_frame * frame_shift,
+                end_seconds=(end_frame + 1) * frame_shift,
+                audio_seconds=duration,
+                padding_ms=vad_padding_ms,
+            )
+            candidate.update(
+                {
+                    "vad_score": vad_score,
+                    "vad_threshold": vad_threshold,
+                    "vad_passed": vad_score >= vad_threshold,
+                    "vad_start_time": float(_audio_time_offset_seconds + vad_start),
+                    "vad_end_time": float(_audio_time_offset_seconds + vad_end),
+                }
+            )
+        candidates.append(candidate)
     inference_measurement = _finish_inference_measurement(
         inference_started,
         audio_seconds=duration,
@@ -694,6 +793,12 @@ def _ctc_wac_record(
         "processing_seconds": elapsed,
         "real_time_factor": elapsed / duration if duration else None,
         "inference_performance": inference_performance,
+        **_vad_detail_fields(
+            candidates,
+            enabled=vad_scorer is not None,
+            threshold=vad_threshold,
+            padding_ms=vad_padding_ms,
+        ),
         **_performance_summary(inference_performance),
     }
 
@@ -713,6 +818,8 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
     stage1_gate_score = _ctc_wac_stage1_gate_score(ctx)
     ctc_proposal_score_floor = _ctc_proposal_score_floor(ctx)
     competitor_beam_size, competitor_token_prune = _ctc_competitor_options(ctx)
+    vad_enabled, vad_threshold, vad_padding_ms, vad_threads = _vad_options(ctx)
+    vad_scorer = VadScorer(_vad_model(ctx), threads=vad_threads) if vad_enabled else None
     stage1 = StreamingCtcStage1(
         _stage1_model(ctx),
         contract,
@@ -732,6 +839,8 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
     stage1_candidate_clips = 0
     stage1_candidate_events = 0
     audio_windows_evaluated = 0
+    vad_candidate_pass_count = 0
+    vad_candidate_reject_count = 0
     per_keyword = {item.id: 0 for item in keywords}
     errors: list[dict[str, Any]] = []
     details = _details_path(ctx)
@@ -759,6 +868,9 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
                     competitor_token_prune=competitor_token_prune,
                     audio_window_seconds=audio_window_seconds,
                     audio_window_stride_seconds=audio_window_stride_seconds,
+                    vad_scorer=vad_scorer,
+                    vad_threshold=vad_threshold,
+                    vad_padding_ms=vad_padding_ms,
                 )
                 temporary_handle.write(json.dumps(detail) + "\n")
                 candidates = list(detail["stage1_candidates"])
@@ -770,6 +882,8 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
                 stage1_candidate_clips += int(bool(candidates))
                 stage1_candidate_events += len(candidates)
                 audio_windows_evaluated += int(detail.get("audio_window_count", 1))
+                vad_candidate_pass_count += int(detail.get("vad_candidate_pass_count", 0))
+                vad_candidate_reject_count += int(detail.get("vad_candidate_reject_count", 0))
                 for candidate in candidates:
                     per_keyword[str(candidate["keyword_id"])] = per_keyword.get(str(candidate["keyword_id"]), 0) + 1
             except Exception as exc:
@@ -815,6 +929,13 @@ def _run_ctc_wac(ctx: Any) -> dict[str, Any]:
             "ctc_proposal_score_floor": ctc_proposal_score_floor,
             "audio_window_seconds": audio_window_seconds,
             "audio_window_stride_seconds": audio_window_stride_seconds,
+            "vad_enabled": vad_enabled,
+            "vad_model": str(_vad_model(ctx)) if vad_enabled else None,
+            "vad_threshold": vad_threshold if vad_enabled else None,
+            "vad_padding_ms": vad_padding_ms if vad_enabled else None,
+            "vad_threads": vad_threads if vad_enabled else None,
+            "vad_candidate_pass_count": vad_candidate_pass_count,
+            "vad_candidate_reject_count": vad_candidate_reject_count,
             **_performance_summary(inference_performance),
         },
     )
@@ -1042,6 +1163,8 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
     stage1_candidate_clips = 0
     stage1_candidate_events = 0
     audio_windows_evaluated = 0
+    vad_candidate_pass_count = 0
+    vad_candidate_reject_count = 0
     per_keyword: dict[str, int] = {}
     if is_ctc_wac:
         per_keyword = {item.id: 0 for item in load_keywords(_keywords(ctx))}
@@ -1064,6 +1187,8 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
                 stage1_candidate_clips += int(bool(candidates))
                 stage1_candidate_events += len(candidates)
                 audio_windows_evaluated += int(entry.get("audio_window_count", 1))
+                vad_candidate_pass_count += int(entry.get("vad_candidate_pass_count", 0))
+                vad_candidate_reject_count += int(entry.get("vad_candidate_reject_count", 0))
                 for candidate in candidates:
                     key = str(candidate["keyword_id"])
                     per_keyword[key] = per_keyword.get(key, 0) + 1
@@ -1087,6 +1212,7 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
     if is_ctc_wac:
         contract = Stage1Contract.from_json(_stage1_contract(ctx))
         audio_window_seconds, audio_window_stride_seconds = _ctc_audio_window_options(ctx)
+        vad_enabled, vad_threshold, vad_padding_ms, vad_threads = _vad_options(ctx)
         extra.update(
             {
                 "stage1_candidate_clips": stage1_candidate_clips,
@@ -1104,6 +1230,13 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
                 "ctc_proposal_score_floor": _ctc_proposal_score_floor(ctx),
                 "audio_window_seconds": audio_window_seconds,
                 "audio_window_stride_seconds": audio_window_stride_seconds,
+                "vad_enabled": vad_enabled,
+                "vad_model": str(_vad_model(ctx)) if vad_enabled else None,
+                "vad_threshold": vad_threshold if vad_enabled else None,
+                "vad_padding_ms": vad_padding_ms if vad_enabled else None,
+                "vad_threads": vad_threads if vad_enabled else None,
+                "vad_candidate_pass_count": vad_candidate_pass_count,
+                "vad_candidate_reject_count": vad_candidate_reject_count,
             }
         )
     summary = _write_inference_summary(

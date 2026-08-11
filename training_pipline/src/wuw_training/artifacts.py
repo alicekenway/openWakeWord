@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 from dataclasses import dataclass
@@ -132,6 +133,7 @@ def file_signature(path: Path) -> dict[str, Any]:
 class ManifestInput:
     path: Path
     audio_base_dir: Path | None
+    weight: float | None = None
 
 
 def _parse_manifest_value(config: IniConfig, section: str, key: str) -> list[str | dict[str, Any]]:
@@ -151,6 +153,7 @@ def parse_manifest_inputs(
     key: str = "input_jsonl",
     base_key: str = "audio_base_dir",
     required: bool = True,
+    allow_weights: bool = False,
 ) -> list[ManifestInput]:
     if not config.parser.has_option(section, key):
         if required:
@@ -170,10 +173,32 @@ def parse_manifest_inputs(
         if isinstance(item, dict) and isinstance(item.get("path"), str):
             base_text = item.get("audio_base_dir")
             base = config.resolve_path(base_text) if base_text else default_base
-            result.append(ManifestInput(config.resolve_path(item["path"]), base))
+            weight: float | None = None
+            if "weight" in item:
+                if not allow_weights:
+                    raise ConfigurationError(
+                        f"[{section}] {key}[{index}].weight is only supported for weighted noise manifests"
+                    )
+                try:
+                    weight = float(item["weight"])
+                except (TypeError, ValueError) as exc:
+                    raise ConfigurationError(
+                        f"[{section}] {key}[{index}].weight must be a finite number greater than 0"
+                    ) from exc
+                if not math.isfinite(weight) or weight <= 0.0:
+                    raise ConfigurationError(
+                        f"[{section}] {key}[{index}].weight must be a finite number greater than 0"
+                    )
+            result.append(ManifestInput(config.resolve_path(item["path"]), base, weight))
             continue
         raise ConfigurationError(
-            f"[{section}] {key}[{index}] must be a JSONL path or {{\"path\": ..., \"audio_base_dir\": ...}}"
+            f"[{section}] {key}[{index}] must be a JSONL path or "
+            '{"path": ..., "audio_base_dir": ..., "weight": ...}'
+        )
+    weighted = [item.weight is not None for item in result]
+    if any(weighted) and not all(weighted):
+        raise ConfigurationError(
+            f"[{section}] {key} must provide weight for every entry when weighted sampling is used"
         )
     return result
 
@@ -223,5 +248,6 @@ def input_signatures(inputs: list[ManifestInput]) -> list[dict[str, Any]]:
     for item in inputs:
         signature = file_signature(item.path)
         signature["audio_base_dir"] = str(item.audio_base_dir) if item.audio_base_dir else None
+        signature["weight"] = item.weight
         signatures.append(signature)
     return signatures

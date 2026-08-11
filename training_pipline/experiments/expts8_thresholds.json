@@ -1,0 +1,182 @@
+{
+  "keywords": [
+    {
+      "id": "hey_siri",
+      "display_text": "Hey Siri",
+      "token_ids": [
+        14,
+        12,
+        32,
+        16,
+        68,
+        15
+      ],
+      "threshold": 0.24
+    },
+    {
+      "id": "open_homepage",
+      "display_text": "Open Homepage",
+      "token_ids": [
+        29,
+        30,
+        56,
+        26,
+        14,
+        29,
+        25,
+        30,
+        12,
+        10
+      ],
+      "threshold": 0.16
+    },
+    {
+      "id": "open_navigation",
+      "display_text": "Open navigation",
+      "token_ids": [
+        29,
+        30,
+        56,
+        26,
+        26,
+        41,
+        37,
+        64,
+        62,
+        12,
+        70,
+        56,
+        26
+      ],
+      "threshold": 0.12
+    },
+    {
+      "id": "volume_up",
+      "display_text": "Volume up",
+      "token_ids": [
+        37,
+        48,
+        24,
+        22,
+        36,
+        25,
+        73,
+        30
+      ],
+      "threshold": 0.08
+    },
+    {
+      "id": "volume_down",
+      "display_text": "Volume down",
+      "token_ids": [
+        37,
+        48,
+        24,
+        22,
+        36,
+        25,
+        9,
+        7,
+        26
+      ],
+      "threshold": 0.14
+    },
+    {
+      "id": "resume_play",
+      "display_text": "Resume play",
+      "token_ids": [
+        68,
+        77,
+        40,
+        36,
+        25,
+        30,
+        24,
+        12
+      ],
+      "threshold": 0.12
+    },
+    {
+      "id": "pause_music",
+      "display_text": "Pause music",
+      "token_ids": [
+        30,
+        53,
+        40,
+        25,
+        22,
+        36,
+        40,
+        64,
+        23
+      ],
+      "threshold": 0.2
+    },
+    {
+      "id": "previous_track",
+      "display_text": "Previous track",
+      "token_ids": [
+        30,
+        68,
+        18,
+        37,
+        16,
+        32,
+        33,
+        68,
+        41,
+        23
+      ],
+      "threshold": 0.04
+    },
+    {
+      "id": "next_track",
+      "display_text": "Next track",
+      "token_ids": [
+        26,
+        59,
+        23,
+        32,
+        33,
+        33,
+        68,
+        41,
+        23
+      ],
+      "threshold": 0.02
+    },
+    {
+      "id": "play_music",
+      "display_text": "Play music",
+      "token_ids": [
+        30,
+        24,
+        12,
+        25,
+        22,
+        36,
+        40,
+        64,
+        23
+      ],
+      "threshold": 0.04
+    },
+    {
+      "id": "close_music",
+      "display_text": "Close music",
+      "token_ids": [
+        23,
+        24,
+        29,
+        32,
+        25,
+        22,
+        36,
+        40,
+        64,
+        23
+      ],
+      "threshold": 0.26
+    }
+  ]
+}

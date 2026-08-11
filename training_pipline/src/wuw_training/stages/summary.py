@@ -147,10 +147,16 @@ def validate_outputs(ctx: Any) -> bool:
         return False
 
 
+def _vad_passed(window: dict[str, Any]) -> bool:
+    """Treat legacy and VAD-disabled candidates as eligible."""
+
+    return bool(window.get("vad_passed", True))
+
+
 def _events(windows: list[dict[str, Any]], threshold: float, debounce_seconds: float) -> int:
     return _events_matching(
         windows,
-        lambda window: float(window["score"]) >= threshold,
+        lambda window: _vad_passed(window) and float(window["score"]) >= threshold,
         debounce_seconds,
     )
 
@@ -235,6 +241,8 @@ def _crop_counts(
             try:
                 if float(window["score"]) < threshold:
                     continue
+                if not _vad_passed(window):
+                    continue
                 accepted_indices.add(int(window.get("audio_window_index") or 0))
             except (KeyError, TypeError, ValueError):
                 continue
@@ -243,7 +251,7 @@ def _crop_counts(
     accepted = 0
     for window in windows:
         try:
-            accepted += int(float(window["score"]) >= threshold)
+            accepted += int(_vad_passed(window) and float(window["score"]) >= threshold)
         except (KeyError, TypeError, ValueError):
             continue
     return evaluated, accepted
@@ -262,7 +270,11 @@ def _keyword_threshold_metrics(
             if thresholds is not None
             else window.get("stage2_threshold")
         )
-        return threshold is not None and float(window["score"]) >= float(threshold)
+        return (
+            threshold is not None
+            and _vad_passed(window)
+            and float(window["score"]) >= float(threshold)
+        )
 
     evaluated = 0
     crops_evaluated = 0
@@ -463,6 +475,19 @@ def _markdown_report(payload: dict[str, Any]) -> str:
             ]
         )
         performance = payload.get("performance_by_test", {}).get(test_name, {})
+        vad = payload.get("vad_by_test", {}).get(test_name, {})
+        if vad.get("enabled"):
+            lines.extend(
+                [
+                    "### VAD gate",
+                    "",
+                    f"- Threshold: `{metric(vad.get('threshold'))}`",
+                    f"- Padding: `{metric(vad.get('padding_ms'))}` ms",
+                    f"- Passed candidates: `{vad.get('candidate_pass_count', 0)}`",
+                    f"- Rejected candidates: `{vad.get('candidate_reject_count', 0)}`",
+                    "",
+                ]
+            )
         if int(performance.get("inference_count", 0)) > 0:
             lines.extend(
                 [
@@ -526,6 +551,7 @@ def _markdown_report(payload: dict[str, Any]) -> str:
 def run(ctx: Any) -> dict[str, Any]:
     debounce = number(ctx.section, "debounce_seconds", ctx.step, 1.0)
     loaded: dict[str, tuple[int, list[dict[str, Any]], int]] = {}
+    test_summaries: dict[str, dict[str, Any]] = {}
     for test_step in _test_steps(ctx):
         test_section = ctx.config.section(test_step)
         expected_label = int(test_section["expected_label"])
@@ -535,6 +561,7 @@ def run(ctx: Any) -> dict[str, Any]:
             test_summary = read_json(summary_path)
         else:
             test_summary = {}
+        test_summaries[test_step] = test_summary
         if "error_count" in test_summary:
             error_count = int(test_summary.get("error_count", 0))
         else:
@@ -618,6 +645,27 @@ def run(ctx: Any) -> dict[str, Any]:
         "debounce_seconds": debounce,
         "performance_by_test": {
             test_step: _inference_performance_metrics(records)
+            for test_step, (_expected_label, records, _error_count) in loaded.items()
+        },
+        "vad_by_test": {
+            test_step: {
+                "enabled": bool(test_summaries[test_step].get("vad_enabled", False)),
+                "threshold": test_summaries[test_step].get("vad_threshold"),
+                "padding_ms": test_summaries[test_step].get("vad_padding_ms"),
+                "threads": test_summaries[test_step].get("vad_threads"),
+                "candidate_pass_count": int(
+                    test_summaries[test_step].get(
+                        "vad_candidate_pass_count",
+                        sum(int(record.get("vad_candidate_pass_count", 0)) for record in records),
+                    )
+                ),
+                "candidate_reject_count": int(
+                    test_summaries[test_step].get(
+                        "vad_candidate_reject_count",
+                        sum(int(record.get("vad_candidate_reject_count", 0)) for record in records),
+                    )
+                ),
+            }
             for test_step, (_expected_label, records, _error_count) in loaded.items()
         },
         "metric_definitions": {

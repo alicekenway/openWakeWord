@@ -8,6 +8,7 @@ from typing import Any
 
 from ..artifacts import input_signatures, normalise_manifest_inputs, read_json, read_jsonl, write_json, write_jsonl
 from ..config import ConfigurationError, parse_json
+from ..fir import fir_paths_from_list, load_fir_bank
 from ..legacy import get_legacy_module
 from .common import boolean, integer, number, placement, require, stage_work_path
 
@@ -122,7 +123,52 @@ def _noise_manifests(ctx: Any):
         key="noise_jsonl",
         base_key="noise_audio_base_dir",
         required=False,
+        allow_weights=True,
     )
+
+
+def _weighted_noise(ctx: Any) -> bool:
+    inputs = _noise_manifests(ctx)
+    return bool(inputs and inputs[0].weight is not None)
+
+
+def _normalise_noise_inputs(
+    noise_inputs: list[Any],
+    work_dir: Path,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Return legacy flat manifests or explicit weighted noise groups."""
+
+    if not noise_inputs:
+        return [], []
+    if noise_inputs[0].weight is None:
+        normalized = work_dir / "noise.jsonl"
+        normalise_manifest_inputs(noise_inputs, normalized)
+        return [str(normalized)], []
+    groups: list[dict[str, Any]] = []
+    for index, item in enumerate(noise_inputs):
+        normalized = work_dir / f"noise_group_{index:03d}.jsonl"
+        normalise_manifest_inputs([item], normalized)
+        groups.append(
+            {
+                "manifest": str(normalized),
+                "source_manifest": str(item.path),
+                "weight": float(item.weight),
+            }
+        )
+    return [], groups
+
+
+def _fir_probability(ctx: Any) -> float:
+    return number(ctx.section, "fir_probability", ctx.step, 0.0)
+
+
+def _background_probability(ctx: Any) -> float:
+    return number(ctx.section, "background_probability", ctx.step, 1.0)
+
+
+def _fir_list(ctx: Any) -> Path | None:
+    raw = ctx.section.get("fir_list")
+    return ctx.config.resolve_path(raw) if raw else None
 
 
 def _output_manifest(ctx: Any) -> Path:
@@ -141,6 +187,10 @@ def validate(ctx: Any) -> None:
     noise_dirs = _noise_dirs(ctx)
     if not noise_inputs and not noise_dirs:
         raise ConfigurationError(f"[{ctx.step}] requires noise_jsonl or noise_dir")
+    if _weighted_noise(ctx) and noise_dirs:
+        raise ConfigurationError(
+            f"[{ctx.step}] weighted noise_jsonl cannot be combined with noise_dir"
+        )
     for item in [*inputs, *noise_inputs]:
         if item.audio_base_dir and not item.audio_base_dir.is_dir():
             raise ConfigurationError(f"[{ctx.step}] audio_base_dir does not exist: {item.audio_base_dir}")
@@ -154,6 +204,22 @@ def validate(ctx: Any) -> None:
     probability = number(ctx.section, "artificial_probability", ctx.step, 0.0)
     if not 0.0 <= probability <= 1.0:
         raise ConfigurationError(f"[{ctx.step}] artificial_probability must be between 0 and 1")
+    background_probability = _background_probability(ctx)
+    if not 0.0 <= background_probability <= 1.0:
+        raise ConfigurationError(
+            f"[{ctx.step}] background_probability must be between 0 and 1"
+        )
+    fir_probability = _fir_probability(ctx)
+    if not 0.0 <= fir_probability <= 1.0:
+        raise ConfigurationError(f"[{ctx.step}] fir_probability must be between 0 and 1")
+    fir_list = _fir_list(ctx)
+    if fir_probability > 0.0 and fir_list is None:
+        raise ConfigurationError(
+            f"[{ctx.step}] fir_list is required when fir_probability is greater than 0"
+        )
+    if fir_list is not None:
+        sample_rate = integer(ctx.config.section("main"), "sample_rate", "main", 16000)
+        load_fir_bank(fir_list, expected_sample_rate=sample_rate)
     placement(ctx.section, ctx.step)
     if _ctc_context(ctx):
         mode = _long_audio_mode(ctx)
@@ -176,6 +242,10 @@ def input_paths(ctx: Any) -> list[Path]:
     paths = [item.path for item in _input_manifests(ctx)]
     paths.extend(item.path for item in _noise_manifests(ctx))
     paths.extend(_noise_dirs(ctx))
+    fir_list = _fir_list(ctx)
+    if fir_list is not None:
+        paths.append(fir_list)
+        paths.extend(fir_paths_from_list(fir_list))
     return paths
 
 
@@ -201,16 +271,12 @@ def run(ctx: Any) -> dict[str, Any]:
     inputs = _input_manifests(ctx)
     noise_inputs = _noise_manifests(ctx)
     normalized_input = stage_work_path(ctx, "input.jsonl")
-    normalized_noise = stage_work_path(ctx, "noise.jsonl")
     _, input_count = normalise_manifest_inputs(
         inputs,
         normalized_input,
         default_placement=placement(ctx.section, ctx.step),
     )
-    noise_manifest_args: list[str] = []
-    if noise_inputs:
-        normalise_manifest_inputs(noise_inputs, normalized_noise)
-        noise_manifest_args.append(str(normalized_noise))
+    noise_manifest_args, noise_groups = _normalise_noise_inputs(noise_inputs, normalized_input.parent)
 
     legacy = get_legacy_module()
     legacy.command_augment_audio(
@@ -218,6 +284,7 @@ def run(ctx: Any) -> dict[str, Any]:
             input_manifest=str(normalized_input),
             input_dir=None,
             noise_manifest=noise_manifest_args,
+            noise_groups=noise_groups,
             noise_dir=[str(path) for path in _noise_dirs(ctx)],
             output_dir=str(_output_dir(ctx)),
             output_manifest=str(_output_manifest(ctx)),
@@ -225,6 +292,9 @@ def run(ctx: Any) -> dict[str, Any]:
             snr_low=number(ctx.section, "snr_low", ctx.step, -5.0),
             snr_high=number(ctx.section, "snr_high", ctx.step, 15.0),
             artificial_prob=number(ctx.section, "artificial_probability", ctx.step, 0.0),
+            background_probability=_background_probability(ctx),
+            fir_list=str(_fir_list(ctx)) if _fir_list(ctx) is not None else None,
+            fir_probability=_fir_probability(ctx),
             random_gain_db=number(ctx.section, "random_gain_db", ctx.step, 0.0),
             clip_seconds=_legacy_clip_seconds(ctx),
             sample_rate=integer(ctx.config.section("main"), "sample_rate", "main", 16000),
@@ -252,7 +322,6 @@ def run(ctx: Any) -> dict[str, Any]:
 
 def prepare_slurm_shards(ctx: Any, work_dir: Path, task_count: int) -> list[dict[str, Any]]:
     normalized_input = work_dir / "input.jsonl"
-    normalized_noise = work_dir / "noise.jsonl"
     inputs = _input_manifests(ctx)
     noise_inputs = _noise_manifests(ctx)
     normalise_manifest_inputs(
@@ -260,8 +329,7 @@ def prepare_slurm_shards(ctx: Any, work_dir: Path, task_count: int) -> list[dict
         normalized_input,
         default_placement=placement(ctx.section, ctx.step),
     )
-    if noise_inputs:
-        normalise_manifest_inputs(noise_inputs, normalized_noise)
+    noise_manifest_args, noise_groups = _normalise_noise_inputs(noise_inputs, work_dir)
     records = read_jsonl(normalized_input)
     actual_count = min(task_count, len(records))
     if actual_count < 1:
@@ -289,7 +357,8 @@ def prepare_slurm_shards(ctx: Any, work_dir: Path, task_count: int) -> list[dict
                 "input_manifest": str(input_manifest),
                 "output_manifest": str(output_manifest),
                 "normalized_manifest": str(normalized_input),
-                "noise_manifest": str(normalized_noise) if noise_inputs else None,
+                "noise_manifests": noise_manifest_args,
+                "noise_groups": noise_groups,
             }
         )
         start = stop
@@ -297,13 +366,13 @@ def prepare_slurm_shards(ctx: Any, work_dir: Path, task_count: int) -> list[dict
 
 
 def run_slurm_shard(ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
-    noise_manifest = task.get("noise_manifest")
     legacy = get_legacy_module()
     legacy.command_augment_audio(
         argparse.Namespace(
             input_manifest=str(task["input_manifest"]),
             input_dir=None,
-            noise_manifest=[str(noise_manifest)] if noise_manifest else [],
+            noise_manifest=list(task.get("noise_manifests", [])),
+            noise_groups=list(task.get("noise_groups", [])),
             noise_dir=[str(path) for path in _noise_dirs(ctx)],
             output_dir=str(_output_dir(ctx)),
             output_manifest=str(task["output_manifest"]),
@@ -311,6 +380,9 @@ def run_slurm_shard(ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
             snr_low=number(ctx.section, "snr_low", ctx.step, -5.0),
             snr_high=number(ctx.section, "snr_high", ctx.step, 15.0),
             artificial_prob=number(ctx.section, "artificial_probability", ctx.step, 0.0),
+            background_probability=_background_probability(ctx),
+            fir_list=str(_fir_list(ctx)) if _fir_list(ctx) is not None else None,
+            fir_probability=_fir_probability(ctx),
             random_gain_db=number(ctx.section, "random_gain_db", ctx.step, 0.0),
             clip_seconds=_legacy_clip_seconds(ctx),
             sample_rate=integer(ctx.config.section("main"), "sample_rate", "main", 16000),
@@ -367,6 +439,18 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
     items = legacy.feature_items_from_feature_inputs(
         [str(normalized)], [], placement(ctx.section, ctx.step)
     )
+    group_counts: dict[str, int] = {}
+    for value in shard_summaries:
+        for name, count in value.get("noise_group_selection_counts", {}).items():
+            group_counts[str(name)] = group_counts.get(str(name), 0) + int(count)
+    background_applied_count = sum(
+        int(value.get("background_applied_count", value.get("output_count", 0)))
+        for value in shard_summaries
+    )
+    weighted_groups = next(
+        (value.get("weighted_noise_groups") for value in shard_summaries if value.get("weighted_noise_groups")),
+        [],
+    )
     summary = {
         "input_count": len(items),
         "output_count": len(merged),
@@ -376,9 +460,27 @@ def merge_slurm_shards(ctx: Any, tasks: list[dict[str, Any]]) -> dict[str, Any]:
         # A filtered-only shard has no reason to enumerate background files,
         # so do not let such a first shard erase the real shared noise count.
         "noise_count": max(int(value.get("noise_count", 0)) for value in shard_summaries),
+        "weighted_noise_groups": weighted_groups,
+        "noise_group_selection_counts": group_counts,
+        "background_probability": _background_probability(ctx),
+        "background_applied_count": background_applied_count,
         "snr_low": number(ctx.section, "snr_low", ctx.step, -5.0),
         "snr_high": number(ctx.section, "snr_high", ctx.step, 15.0),
         "artificial_prob": number(ctx.section, "artificial_probability", ctx.step, 0.0),
+        "fir_list": str(_fir_list(ctx)) if _fir_list(ctx) is not None else None,
+        "fir_probability": _fir_probability(ctx),
+        "fir_count": max(int(value.get("fir_count", 0)) for value in shard_summaries),
+        "fir_applied_count": sum(
+            int(value.get("fir_applied_count", 0)) for value in shard_summaries
+        ),
+        "fir_bank_signature": next(
+            (
+                value.get("fir_bank_signature")
+                for value in shard_summaries
+                if value.get("fir_bank_signature") is not None
+            ),
+            None,
+        ),
         "placement": placement(ctx.section, ctx.step),
         "ctc_context": _ctc_context(ctx),
         "long_audio_mode": _long_audio_mode(ctx) if _ctc_context(ctx) else None,

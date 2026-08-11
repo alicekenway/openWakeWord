@@ -17,7 +17,13 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from wuw_training.artifacts import ManifestInput, normalise_manifest_inputs, write_json, write_jsonl  # noqa: E402
+from wuw_training.artifacts import (  # noqa: E402
+    ManifestInput,
+    normalise_manifest_inputs,
+    parse_manifest_inputs,
+    write_json,
+    write_jsonl,
+)
 from wuw_training.checkpoints import CheckpointManager  # noqa: E402
 from wuw_training.config import ConfigurationError, load_ini_config, parse_step_groups  # noqa: E402
 from wuw_training.legacy import get_legacy_module  # noqa: E402
@@ -149,6 +155,62 @@ output_report = ${{main:experiment_dir}}/REPORT.md
     assert result["steps"]["summary"]["status"] == "done"
     payload = json.loads((tmp_path / "experiment" / "thresholds.json").read_text(encoding="utf-8"))
     assert [item["threshold"] for item in payload["thresholds"]] == [0.2, 0.4]
+
+
+def test_weighted_manifest_inputs_require_complete_positive_weights(tmp_path: Path) -> None:
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    first.write_text('{"path": "one.wav"}\n', encoding="utf-8")
+    second.write_text('{"path": "two.wav"}\n', encoding="utf-8")
+    config_path = tmp_path / "weighted.ini"
+    config_path.write_text(
+        f"""[main]
+experiment_dir = {tmp_path / 'experiment'}
+
+[augment.train]
+noise_jsonl = [{{"path": "{first}", "weight": 1}}, {{"path": "{second}", "weight": 3}}]
+""",
+        encoding="utf-8",
+    )
+    config = load_ini_config(config_path)
+
+    values = parse_manifest_inputs(
+        config,
+        "augment.train",
+        key="noise_jsonl",
+        required=False,
+        allow_weights=True,
+    )
+
+    assert [item.weight for item in values] == [1.0, 3.0]
+
+    config.parser.set(
+        "augment.train",
+        "noise_jsonl",
+        f'[{{"path": "{first}", "weight": 1}}, {{"path": "{second}"}}]',
+    )
+    with pytest.raises(ConfigurationError, match="weight for every entry"):
+        parse_manifest_inputs(
+            config,
+            "augment.train",
+            key="noise_jsonl",
+            required=False,
+            allow_weights=True,
+        )
+
+    config.parser.set(
+        "augment.train",
+        "noise_jsonl",
+        f'[{{"path": "{first}", "weight": 0}}, {{"path": "{second}", "weight": 1}}]',
+    )
+    with pytest.raises(ConfigurationError, match="greater than 0"):
+        parse_manifest_inputs(
+            config,
+            "augment.train",
+            key="noise_jsonl",
+            required=False,
+            allow_weights=True,
+        )
 
 
 def test_step_groups_parse_parallel_brackets() -> None:

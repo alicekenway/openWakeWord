@@ -106,7 +106,21 @@ trusted `setup_commands` when compute nodes need a different environment.
   an output from another step in the same bracket.
 - An `augment.*` block accepts `input_jsonl`, optional `audio_base_dir`, one or
   more `noise_jsonl`/`noise_dir` sources, augmentation settings, and an output
-  WAV directory plus output manifest.
+  WAV directory plus output manifest. Optional WAC-compatible cabin-response
+  augmentation uses `fir_list` plus `fir_probability`. Every listed FIR must
+  already use `[int32 tap count][float32 taps][int32 sample rate]` at the
+  pipeline sample rate; FIR is applied to foreground speech before background
+  mixing and defaults to disabled.
+  `background_probability` controls the per-output chance of mixing sampled
+  background and defaults to `1.0`. FIR selection is independent, so
+  `background_probability = 0.75` with `fir_probability = 0.20` produces about
+  20% fully clean, 5% FIR-only, 60% background-only, and 15% background-plus-FIR
+  examples.
+  `noise_jsonl` also accepts a JSON list of objects with positive `weight`
+  values. In weighted mode the pipeline first samples a manifest by weight,
+  then samples a recording uniformly inside it, so differently sized noise
+  categories can still be balanced. Every entry must have a weight, and
+  weighted manifests cannot be combined with `noise_dir`.
 - A `feature.*` block accepts one JSONL path or a JSON list of paths, emits one
   NPY file, and declares `label` plus `split`. Relative audio paths use
   `audio_base_dir` when present, otherwise the JSONL file's parent directory.
@@ -465,6 +479,15 @@ it. The default `stage1_gate_score = normalized_ctc_score` is retained only
 for compatibility with older keyword files whose thresholds are negative
 normalized CTC log scores. The `[summary] threshold_range` always sweeps the
 final Stage-2 classifier probability, independently of the Stage-1 gate.
+
+CTC-WAC testing can additionally enable a Silero speech-presence gate with
+`vad_enabled = yes`, `vad_model`, `vad_threshold`, `vad_padding_ms`, and
+`vad_threads`. Each candidate keeps its raw Stage-2 score, but summary metrics
+accept it only when the maximum 30 ms VAD score over the candidate plus the
+configured padding reaches the threshold. VAD is disabled by default, runs
+only at test time, requires 16 kHz audio, and treats older detail files without
+VAD fields as passing. It detects speech presence; it does not distinguish a
+wake-word speaker from radio speech or crosstalk.
 
 If you use some other ONNX exporter, you must create its contract manually.
 The example is a template, not a universal WeNet interface. For example, a

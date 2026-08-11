@@ -29,6 +29,8 @@ OPENWAKEWORD_ROOT = Path(__file__).resolve().parents[2]
 if str(OPENWAKEWORD_ROOT) not in sys.path:
     sys.path.insert(0, str(OPENWAKEWORD_ROOT))
 
+from wuw_training.fir import FirFilter, apply_fir, fir_bank_signature, load_fir_bank
+
 # acoustics imports scipy.special.sph_harm at import time. Newer SciPy builds
 # expose sph_harm_y instead, and this pipeline only needs acoustics.generator.
 try:
@@ -640,6 +642,8 @@ def _mix_in_augmentation_windows(
     leading_context_samples: int,
     window_samples: int,
     noise_paths: list[str],
+    noise_groups: list[dict[str, Any]] | None = None,
+    noise_selections: list[dict[str, Any]] | None = None,
     rng: random.Random,
     sample_rate: int,
     snr_low: float,
@@ -666,7 +670,13 @@ def _mix_in_augmentation_windows(
     for start in range(0, int(audio.numel()), window_samples):
         end = min(start + window_samples, int(audio.numel()))
         chunk = audio[start:end]
-        noise_src = Path(rng.choice(noise_paths))
+        noise_src, noise_group = _select_noise_source(
+            rng,
+            noise_paths=noise_paths,
+            noise_groups=noise_groups,
+        )
+        if noise_selections is not None:
+            noise_selections.append({"path": str(noise_src), "group": noise_group})
         noise = _ctc_background_window(
             noise_src,
             target_samples=window_samples,
@@ -811,15 +821,74 @@ def _init_augment_worker(config: dict[str, Any]) -> None:
     _AUGMENT_WORKER_CONFIG = config
 
 
+def _select_noise_source(
+    rng: random.Random,
+    *,
+    noise_paths: list[str],
+    noise_groups: list[dict[str, Any]] | None = None,
+) -> tuple[Path, str | None]:
+    groups = noise_groups or []
+    if not groups:
+        return Path(rng.choice(noise_paths)), None
+    selected = rng.choices(groups, weights=[float(group["weight"]) for group in groups], k=1)[0]
+    return Path(rng.choice(selected["paths"])), str(selected["source_manifest"])
+
+
+def _select_fir_filter(
+    config: dict[str, Any],
+    *,
+    round_index: int,
+    record_index: int,
+) -> FirFilter | None:
+    """Choose FIR augmentation without perturbing existing augmentation RNG."""
+
+    filters = config.get("fir_filters") or []
+    probability = float(config.get("fir_probability", 0.0))
+    if not filters or probability <= 0.0:
+        return None
+    fir_rng = random.Random(
+        f"fir:{int(config['seed'])}:{int(round_index)}:{int(record_index)}"
+    )
+    if fir_rng.random() >= probability:
+        return None
+    return filters[fir_rng.randrange(len(filters))]
+
+
+def _apply_background_noise(
+    config: dict[str, Any],
+    *,
+    round_index: int,
+    record_index: int,
+) -> bool:
+    """Choose background mixing without perturbing the existing mix/FIR RNGs."""
+
+    probability = float(config.get("background_probability", 1.0))
+    if probability >= 1.0:
+        return True
+    if probability <= 0.0:
+        return False
+    gate_rng = random.Random(
+        f"background:{int(config['seed'])}:{int(round_index)}:{int(record_index)}"
+    )
+    return gate_rng.random() < probability
+
+
 def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, Any]:
     round_ndx, ndx, record = item
     cfg = _AUGMENT_WORKER_CONFIG
     rng = random.Random(cfg["seed"] + round_ndx * 1_000_003 + ndx)
+    fir_filter = _select_fir_filter(cfg, round_index=round_ndx, record_index=ndx)
+    background_applied = _apply_background_noise(
+        cfg,
+        round_index=round_ndx,
+        record_index=ndx,
+    )
     src = Path(record["path"])
     out_name = f"{round_ndx:02d}_{ndx:08d}_{stable_id(str(src), ndx)}.wav"
     out_path = Path(cfg["output_dir"]) / out_name
     placement = validate_placement(record.get("placement", cfg["placement"]))
     ctc_metadata: dict[str, Any] = {}
+    noise_selections: list[dict[str, Any]] = []
     try:
         if not out_path.exists() or cfg["overwrite"]:
             if cfg.get("ctc_context", False):
@@ -839,6 +908,13 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
                     "ctc_leading_context_samples": int(leading_context_samples),
                     "ctc_window_samples": int(audio.numel()),
                 }
+                if fir_filter is not None:
+                    active_source = apply_fir(active_source, fir_filter)
+                    audio = torch.zeros(
+                        leading_context_samples + int(active_source.numel()),
+                        dtype=torch.float32,
+                    )
+                    audio[leading_context_samples:] = active_source
             else:
                 full_mode_window_samples = None
                 audio = load_fixed_length_audio(
@@ -849,13 +925,17 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
                     sr=cfg["sample_rate"],
                 )
                 active_source = None
-            if full_mode_window_samples is not None:
+                if fir_filter is not None:
+                    audio = apply_fir(audio, fir_filter)
+            if full_mode_window_samples is not None and background_applied:
                 mixed, mixed_window_count = _mix_in_augmentation_windows(
                     audio,
                     active_source=active_source,
                     leading_context_samples=leading_context_samples,
                     window_samples=int(full_mode_window_samples),
                     noise_paths=cfg["noise_paths"],
+                    noise_groups=cfg.get("noise_groups"),
+                    noise_selections=noise_selections,
                     rng=rng,
                     sample_rate=cfg["sample_rate"],
                     snr_low=cfg["snr_low"],
@@ -872,8 +952,13 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
                         "full_mode_window_count": int(mixed_window_count),
                     }
                 )
-            else:
-                noise_src = Path(rng.choice(cfg["noise_paths"]))
+            elif background_applied:
+                noise_src, noise_group = _select_noise_source(
+                    rng,
+                    noise_paths=cfg["noise_paths"],
+                    noise_groups=cfg.get("noise_groups"),
+                )
+                noise_selections.append({"path": str(noise_src), "group": noise_group})
                 if cfg.get("ctc_context", False):
                     noise = _ctc_background_window(
                         noise_src,
@@ -896,6 +981,19 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
                 if cfg["random_gain_db"]:
                     gain_db = rng.uniform(-abs(cfg["random_gain_db"]), abs(cfg["random_gain_db"]))
                     mixed = mixed * (10 ** (gain_db / 20.0))
+            else:
+                mixed = audio
+                if full_mode_window_samples is not None:
+                    mixed_window_count = math.ceil(audio.numel() / int(full_mode_window_samples))
+                    ctc_metadata.update(
+                        {
+                            "full_mode_window_samples": int(full_mode_window_samples),
+                            "full_mode_window_seconds": (
+                                int(full_mode_window_samples) / int(cfg["sample_rate"])
+                            ),
+                            "full_mode_window_count": int(mixed_window_count),
+                        }
+                    )
             save_wav(out_path, mixed, sr=cfg["sample_rate"])
         new_record = replace_audio_path(record, out_path.resolve())
         new_record.update(
@@ -905,9 +1003,23 @@ def _augment_audio_worker(item: tuple[int, int, dict[str, Any]]) -> dict[str, An
                 "placement": placement,
                 "ctc_context": bool(cfg.get("ctc_context", False)),
                 "long_audio_mode": cfg.get("long_audio_mode") if cfg.get("ctc_context", False) else None,
+                "fir_applied": fir_filter is not None,
+                "background_applied": background_applied,
+                "noise_path": noise_selections[0]["path"] if len(noise_selections) == 1 else None,
+                "noise_group": noise_selections[0]["group"] if len(noise_selections) == 1 else None,
+                "noise_selections": noise_selections if len(noise_selections) > 1 else None,
                 **ctc_metadata,
             }
         )
+        if fir_filter is not None:
+            new_record.update(
+                {
+                    "fir_path": str(fir_filter.path),
+                    "fir_sample_rate": int(fir_filter.sample_rate),
+                    "fir_taps": int(fir_filter.taps),
+                    "fir_peak_dbfs": -10.0,
+                }
+            )
         if "ctc_window_samples" in ctc_metadata:
             new_record["duration"] = round(
                 int(ctc_metadata["ctc_window_samples"]) / int(cfg["sample_rate"]),
@@ -1112,6 +1224,31 @@ def command_augment_audio(args: argparse.Namespace) -> None:
     input_signature = feature_input_signature(input_items)
     input_placement_counts = placement_counts(record["placement"] for record in input_records)
 
+    fir_probability = float(getattr(args, "fir_probability", 0.0) or 0.0)
+    if not 0.0 <= fir_probability <= 1.0:
+        raise ValueError("--fir-probability must be between 0 and 1")
+    fir_list_value = getattr(args, "fir_list", None)
+    if fir_probability > 0.0 and not fir_list_value:
+        raise ValueError("--fir-list is required when --fir-probability is greater than 0")
+    fir_list = Path(str(fir_list_value)).expanduser().resolve() if fir_list_value else None
+    fir_filters = (
+        load_fir_bank(fir_list, expected_sample_rate=int(args.sample_rate))
+        if fir_list is not None
+        else []
+    )
+    fir_signature = fir_bank_signature(fir_list, fir_filters) if fir_list is not None else None
+    background_probability = float(getattr(args, "background_probability", 1.0))
+    if not 0.0 <= background_probability <= 1.0:
+        raise ValueError("--background-probability must be between 0 and 1")
+    raw_noise_groups = list(getattr(args, "noise_groups", None) or [])
+    weighted_noise_config = [
+        {
+            "source_manifest": str(group["source_manifest"]),
+            "weight": float(group["weight"]),
+        }
+        for group in raw_noise_groups
+    ]
+
     ctc_context = bool(getattr(args, "ctc_context", False))
     long_audio_mode = str(getattr(args, "long_audio_mode", "random")).strip().lower()
     if ctc_context and long_audio_mode not in {"filter", "start", "end", "random", "full"}:
@@ -1178,6 +1315,12 @@ def command_augment_audio(args: argparse.Namespace) -> None:
     expected_summary = {
         "input_signature": input_signature,
         "placement_counts": input_placement_counts,
+        "fir_list": str(fir_list) if fir_list is not None else None,
+        "fir_probability": fir_probability,
+        "fir_count": len(fir_filters),
+        "fir_bank_signature": fir_signature,
+        "background_probability": background_probability,
+        "weighted_noise_groups": weighted_noise_config,
     }
     if ctc_context:
         expected_summary.update(
@@ -1226,6 +1369,15 @@ def command_augment_audio(args: argparse.Namespace) -> None:
                 "snr_low": args.snr_low,
                 "snr_high": args.snr_high,
                 "artificial_prob": args.artificial_prob,
+                "fir_list": str(fir_list) if fir_list is not None else None,
+                "fir_probability": fir_probability,
+                "fir_count": len(fir_filters),
+                "fir_applied_count": 0,
+                "fir_bank_signature": fir_signature,
+                "weighted_noise_groups": weighted_noise_config,
+                "noise_group_selection_counts": {},
+                "background_probability": background_probability,
+                "background_applied_count": 0,
                 "placement": default_placement,
                 "placement_counts": input_placement_counts,
                 "ctc_context": True,
@@ -1249,35 +1401,63 @@ def command_augment_audio(args: argparse.Namespace) -> None:
         return
 
     noise_paths: list[Path] = []
+    noise_groups: list[dict[str, Any]] = []
+    for group in raw_noise_groups:
+        paths = manifest_paths(read_jsonl(Path(group["manifest"])))
+        if not paths:
+            raise ValueError(f"Weighted noise manifest is empty: {group['source_manifest']}")
+        noise_groups.append(
+            {
+                "source_manifest": str(group["source_manifest"]),
+                "weight": float(group["weight"]),
+                "paths": [str(path) for path in paths],
+            }
+        )
     for noise_manifest in getattr(args, "noise_manifest", None) or []:
         noise_paths.extend(manifest_paths(read_jsonl(Path(noise_manifest))))
     for noise_dir in getattr(args, "noise_dir", None) or []:
         noise_paths.extend(collect_audio_files(Path(noise_dir)))
-    if not noise_paths:
+    if not noise_paths and not noise_groups:
         raise ValueError("No noise files found from --noise-manifest or --noise-dir")
 
     if ctc_context:
         required_noise_samples = full_mode_window_samples if full_mode else target_samples
         assert required_noise_samples is not None
-        eligible_noise_paths = [
-            path for path in noise_paths if _resampled_num_samples(path, args.sample_rate) >= required_noise_samples
-        ]
-        if not eligible_noise_paths:
-            raise ValueError(
-                "No background recording is at least "
-                f"{required_noise_samples / args.sample_rate:.6g} seconds after resampling; "
-                "CTC context augmentation requires a full background sampling window"
-            )
-        noise_paths = eligible_noise_paths
+        if noise_groups:
+            for group in noise_groups:
+                group["paths"] = [
+                    path for path in group["paths"]
+                    if _resampled_num_samples(Path(path), args.sample_rate) >= required_noise_samples
+                ]
+                if not group["paths"]:
+                    raise ValueError(
+                        f"Weighted noise group {group['source_manifest']} has no recording long enough for "
+                        f"the {required_noise_samples / args.sample_rate:.6g}-second CTC window"
+                    )
+        else:
+            eligible_noise_paths = [
+                path for path in noise_paths if _resampled_num_samples(path, args.sample_rate) >= required_noise_samples
+            ]
+            if not eligible_noise_paths:
+                raise ValueError(
+                    "No background recording is at least "
+                    f"{required_noise_samples / args.sample_rate:.6g} seconds after resampling; "
+                    "CTC context augmentation requires a full background sampling window"
+                )
+            noise_paths = eligible_noise_paths
     augmented: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     worker_config = {
         "output_dir": str(output_dir),
         "noise_paths": [str(path) for path in noise_paths],
+        "noise_groups": noise_groups,
         "target_samples": target_samples,
         "snr_low": args.snr_low,
         "snr_high": args.snr_high,
         "artificial_prob": args.artificial_prob,
+        "fir_filters": fir_filters,
+        "fir_probability": fir_probability,
+        "background_probability": background_probability,
         "random_gain_db": args.random_gain_db,
         "clip_seconds": args.clip_seconds,
         "sample_rate": args.sample_rate,
@@ -1316,6 +1496,19 @@ def command_augment_audio(args: argparse.Namespace) -> None:
                     errors.append(result["error"])
 
     count = write_jsonl(output_manifest, augmented)
+    fir_applied_count = sum(1 for record in augmented if record.get("fir_applied"))
+    background_applied_count = sum(
+        1 for record in augmented if record.get("background_applied", True)
+    )
+    noise_group_selection_counts: dict[str, int] = {}
+    for record in augmented:
+        selections = record.get("noise_selections") or [
+            {"group": record.get("noise_group")} if record.get("noise_group") else {}
+        ]
+        for selection in selections:
+            group = selection.get("group") if isinstance(selection, dict) else None
+            if group:
+                noise_group_selection_counts[str(group)] = noise_group_selection_counts.get(str(group), 0) + 1
     write_json(
         output_manifest.with_suffix(".summary.json"),
         {
@@ -1325,10 +1518,19 @@ def command_augment_audio(args: argparse.Namespace) -> None:
             "filtered_long_audio": filtered_long_records[:50],
             "output_count": count,
             "rounds": args.rounds,
-            "noise_count": len(noise_paths),
+            "noise_count": len(noise_paths) + sum(len(group["paths"]) for group in noise_groups),
+            "weighted_noise_groups": weighted_noise_config,
+            "noise_group_selection_counts": noise_group_selection_counts,
+            "background_probability": background_probability,
+            "background_applied_count": background_applied_count,
             "snr_low": args.snr_low,
             "snr_high": args.snr_high,
             "artificial_prob": args.artificial_prob,
+            "fir_list": str(fir_list) if fir_list is not None else None,
+            "fir_probability": fir_probability,
+            "fir_count": len(fir_filters),
+            "fir_applied_count": fir_applied_count,
+            "fir_bank_signature": fir_signature,
             "placement": default_placement,
             "placement_counts": input_placement_counts,
             "ctc_context": ctc_context,
@@ -2963,6 +3165,8 @@ def command_run_from_splits(args: argparse.Namespace) -> None:
                     snr_low=float(augmentation_cfg.get("snr_low", -5.0)),
                     snr_high=float(augmentation_cfg.get("snr_high", 15.0)),
                     artificial_prob=float(augmentation_cfg.get("artificial_prob", 0.15)),
+                    fir_list=augmentation_cfg.get("fir_list"),
+                    fir_probability=float(augmentation_cfg.get("fir_probability", 0.0)),
                     random_gain_db=float(augmentation_cfg.get("random_gain_db", 3.0)),
                     clip_seconds=clip_seconds,
                     sample_rate=sample_rate,
@@ -3611,6 +3815,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--snr-low", type=float, default=-5.0)
     p.add_argument("--snr-high", type=float, default=15.0)
     p.add_argument("--artificial-prob", type=float, default=0.15)
+    p.add_argument(
+        "--background-probability",
+        type=float,
+        default=1.0,
+        help="Per-output probability of mixing sampled background noise",
+    )
+    p.add_argument(
+        "--fir-list",
+        help="List of WAC-format FIR files already prepared at --sample-rate",
+    )
+    p.add_argument(
+        "--fir-probability",
+        type=float,
+        default=0.0,
+        help="Per-output probability of applying one FIR before background mixing",
+    )
     p.add_argument("--random-gain-db", type=float, default=3.0)
     p.add_argument("--placement", choices=["start", "end", "center", "random"], default="random")
     p.add_argument(

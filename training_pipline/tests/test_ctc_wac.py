@@ -640,13 +640,17 @@ def test_ctc_context_augmentation_uses_variable_real_background_context(
 
     requested_background_lengths: list[int] = []
     saved_lengths: list[int] = []
+
+    def fake_ctc_background_window(
+        _path, *, target_samples, rng, sample_rate
+    ) -> torch.Tensor:
+        requested_background_lengths.append(target_samples)
+        return torch.ones(target_samples, dtype=torch.float32)
+
     monkeypatch.setattr(
         legacy,
         "_ctc_background_window",
-        lambda _path, *, target_samples, rng, sample_rate: (
-            requested_background_lengths.append(target_samples)
-            or torch.ones(target_samples, dtype=torch.float32)
-        ),
+        fake_ctc_background_window,
     )
     monkeypatch.setattr(
         legacy,
