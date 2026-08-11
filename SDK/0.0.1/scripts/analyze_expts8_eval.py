@@ -11,7 +11,7 @@ for dataset in sorted(x for x in root.iterdir() if x.is_dir()):
     rows=[]
     for part in sorted(dataset.glob("part-*.jsonl")):
         rows.extend(json.loads(line) for line in part.open() if line.strip())
-    rows.sort(key=lambda x:x.get("source_index",-1));label=int((dataset/"expected_label").read_text());errors=sum("error" in x for x in rows);detected=sum(bool(x.get("events")) for x in rows);correct=0;wrong=0
+    rows.sort(key=lambda x:x.get("source_index",-1));label=int((dataset/"expected_label").read_text());errors=sum("error" in x for x in rows);detected=sum(bool(x.get("events")) for x in rows);event_count=sum(len(x.get("events",[])) for x in rows);audio_hours=sum(x.get("samples",0) for x in rows)/16000/3600;correct=0;wrong=0
     confusion=Counter()
     if label:
         for row in rows:
@@ -20,7 +20,7 @@ for dataset in sorted(x for x in root.iterdir() if x.is_dir()):
             if expected and expected in ids:correct+=1
             elif ids:wrong+=1;confusion[(expected,ids[0])]+=1
     rtfs=[x["rtf"] for x in rows if "rtf" in x]
-    metrics={"expected_label":label,"records":len(rows),"errors":errors,"detected":detected,"rtf_mean":sum(rtfs)/max(1,len(rtfs)),"rtf_max":max(rtfs,default=0)}
+    metrics={"expected_label":label,"records":len(rows),"errors":errors,"detected":detected,"event_count":event_count,"audio_hours":audio_hours,"events_per_hour":event_count/max(audio_hours,1e-12),"rtf_mean":sum(rtfs)/max(1,len(rtfs)),"rtf_max":max(rtfs,default=0)}
     if label:metrics.update(correct=correct,wrong_keyword=wrong,false_reject=len(rows)-errors-correct,"false_reject_rate":(len(rows)-errors-correct)/max(1,len(rows)-errors),confusions=[{"expected":x[0],"detected":x[1],"count":n} for x,n in confusion.most_common()])
     else:metrics.update(false_accept=detected,"false_accept_rate":detected/max(1,len(rows)-errors))
     summary["datasets"][dataset.name]=metrics;summary["total_records"]+=len(rows);summary["total_errors"]+=errors
