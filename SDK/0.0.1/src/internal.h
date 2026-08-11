@@ -89,6 +89,7 @@ struct Config {
   int post_margin = 0;
   int max_search_frames = 128;
   int64_t debounce_samples = 16000;
+  int64_t max_segment_samples = 16000 * 180;
 };
 
 Config LoadConfig(const std::filesystem::path& model_dir,

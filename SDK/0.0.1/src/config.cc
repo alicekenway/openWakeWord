@@ -187,17 +187,19 @@ Config LoadConfig(const std::filesystem::path& dir, const WuwSdkEngineOptions& o
   if (const Json* v=defaults.find("post_margin_frames")) c.post_margin=Int(*v,"post_margin_frames");
   if (const Json* v=defaults.find("max_search_frames")) c.max_search_frames=Int(*v,"max_search_frames");
   if (const Json* v=defaults.find("debounce_ms")) c.debounce_samples=static_cast<int64_t>(v->number()*c.contract.sample_rate/1000.0);
+  if (const Json* v=defaults.find("max_segment_ms")) c.max_segment_samples=static_cast<int64_t>(v->number()*c.contract.sample_rate/1000.0);
   if (options.threshold_config_path && options.threshold_config_path[0]) ApplyThresholdFile(options.threshold_config_path, &c);
   for (size_t i=0; i<options.stage1_override_count; ++i) {
     const auto& o=options.stage1_overrides[i]; if (!o.keyword_id || o.struct_size < sizeof(WuwSdkKeywordThreshold)) throw Error(WUW_SDK_STATUS_INVALID_ARGUMENT,"invalid stage1 override");
     auto it=std::find_if(c.keywords.begin(),c.keywords.end(),[&](const Keyword& k){return k.id==o.keyword_id;});
-    if (it==c.keywords.end()) throw Error(WUW_SDK_STATUS_INVALID_ARGUMENT,"unknown keyword override: "+std::string(o.keyword_id)); it->threshold=o.threshold;
+    if (it==c.keywords.end()) throw Error(WUW_SDK_STATUS_INVALID_ARGUMENT,"unknown keyword override: "+std::string(o.keyword_id));
+    it->threshold=o.threshold;
   }
   if (!std::isnan(options.stage2_threshold_override)) c.stage2_threshold=options.stage2_threshold_override;
   auto probability=[](float x){return std::isfinite(x)&&x>=0&&x<=1;};
   if (!probability(c.stage2_threshold)) throw Error(WUW_SDK_STATUS_INVALID_ARGUMENT,"stage2 threshold must be in [0,1]");
   for (const auto& k:c.keywords) if (!probability(k.threshold)) throw Error(WUW_SDK_STATUS_INVALID_ARGUMENT,"stage1 threshold must be in [0,1]");
-  if (c.keywords.empty() || c.competitor_beam<1 || c.token_prune<1 || c.max_search_frames<1) throw Error(WUW_SDK_STATUS_INCOMPATIBLE_MODEL,"invalid SDK defaults");
+  if (c.keywords.empty() || c.competitor_beam<1 || c.token_prune<1 || c.max_search_frames<1 || c.max_segment_samples<400) throw Error(WUW_SDK_STATUS_INCOMPATIBLE_MODEL,"invalid SDK defaults");
   return c;
 }
 

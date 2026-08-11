@@ -12,6 +12,7 @@ VAD is intentionally outside this SDK. The owning car application should retain 
 - One `WuwSdkStream` belongs to one logical microphone/audio timeline and must not be called concurrently.
 - `first_sample_index` is the caller's absolute sample index. It lets detections map back to the audio bank.
 - Read events after `accept_pcm16` and after `end_segment`. The queue holds 64 events and returns `RESOURCE_EXHAUSTED` rather than silently dropping one.
+- A bundle-configured maximum segment length (180 seconds in the expts8 bundle) prevents exhausting the encoder's positional range. Normal VAD segments should be far shorter.
 - Threshold precedence is bundle defaults, optional JSON override, then explicit API overrides. Values are validated in `[0,1]` when the engine is created.
 - There is one global stage-2 threshold. Stage-1 thresholds are per keyword.
 - `reset` clears segment state, debounce state, pending events, and statistics.

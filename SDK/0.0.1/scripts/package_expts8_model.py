@@ -18,7 +18,7 @@ def main():
     copies={"stage1.onnx":a.stage1,"stage1_contract.json":a.contract,"stage2.onnx":a.stage2,"keywords.json":a.keywords}
     for name,source in copies.items(): shutil.copy2(source,out/name)
     manifest={"bundle_schema_version":1,"sdk_abi_version":1,"sdk_version":"0.0.1","sample_format":"pcm_s16le","sample_rate":16000,"channels":1,"stage1":"stage1.onnx","stage2":"stage2.onnx"}
-    defaults={"stage2_threshold":a.stage2_threshold,"proposal_floor":-3.0,"competitor_beam":16,"token_prune":8,"pre_margin_frames":3,"post_margin_frames":0,"max_search_frames":128,"debounce_ms":1000}
+    defaults={"stage2_threshold":a.stage2_threshold,"proposal_floor":-3.0,"competitor_beam":16,"token_prune":8,"pre_margin_frames":3,"post_margin_frames":0,"max_search_frames":128,"debounce_ms":1000,"max_segment_ms":180000}
     (out/"manifest.json").write_text(json.dumps(manifest,indent=2)+"\n")
     (out/"sdk_defaults.json").write_text(json.dumps(defaults,indent=2)+"\n")
     names=sorted(set(copies)|{"manifest.json","sdk_defaults.json"})
