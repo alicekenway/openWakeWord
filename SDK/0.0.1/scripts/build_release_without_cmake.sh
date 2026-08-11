@@ -17,6 +17,7 @@ for tool in wuw_inspect wuw_stream_wav wuw_eval_manifest wuw_merge_results; do
 done
 cp -a "$source_dir/include/wuw_sdk" "$output/include/"; cp -a "$model_dir"/. "$output/model/"
 cp "$source_dir/README.md" "$output/README.md"
+[[ -f "$source_dir/SERVER_TEST_REPORT.md" ]] && cp "$source_dir/SERVER_TEST_REPORT.md" "$output/SERVER_TEST_REPORT.md"
 for file in LICENSE ThirdPartyNotices.txt; do [[ -f "$ort_root/$file" ]] && cp "$ort_root/$file" "$output/licenses/ONNXRuntime_$file"; done
 (cd "$output" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 tar -czf "$output.tar.gz" -C "$(dirname "$output")" "$(basename "$output")"
