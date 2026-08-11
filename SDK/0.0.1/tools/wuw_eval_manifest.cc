@@ -15,11 +15,11 @@ int main(int argc,char**argv){
       std::string path=tool::JsonString(line,"path");if(path.empty())path=tool::JsonString(line,"audio_path");if(path.empty())path=tool::JsonString(line,"audio_file");
       std::string id=tool::JsonString(line,"id"),expected=tool::JsonString(line,"expected_keyword_id"),transcript=tool::JsonString(line,"text");
       try{
-        auto pcm=tool::ReadWav(path);stream.Reset();stream.BeginSegment(index,0);
-        for(size_t p=0;p<pcm.size();p+=1600)stream.AcceptPcm16(pcm.data()+p,std::min<size_t>(1600,pcm.size()-p));
+        tool::WavReader wav(path);stream.Reset();stream.BeginSegment(index,0);std::vector<int16_t>pcm(1600);size_t n=0;
+        while((n=wav.Read(pcm.data(),pcm.size()))!=0)stream.AcceptPcm16(pcm.data(),n);
         stream.EndSegment();auto events=stream.ReadEvents();auto stats=stream.Stats();
-        double rtf=stats.processing_time_us/(1000000.0*pcm.size()/16000.0);
-        out<<"{\"source_index\":"<<index<<",\"id\":\""<<tool::Escape(id)<<"\",\"path\":\""<<tool::Escape(path)<<"\",\"text\":\""<<tool::Escape(transcript)<<"\",\"expected_keyword_id\":\""<<tool::Escape(expected)<<"\",\"samples\":"<<pcm.size()<<",\"processing_time_us\":"<<stats.processing_time_us<<",\"rtf\":"<<rtf<<",\"events\":[";
+        double rtf=stats.processing_time_us/(1000000.0*wav.total_samples()/16000.0);
+        out<<"{\"source_index\":"<<index<<",\"id\":\""<<tool::Escape(id)<<"\",\"path\":\""<<tool::Escape(path)<<"\",\"text\":\""<<tool::Escape(transcript)<<"\",\"expected_keyword_id\":\""<<tool::Escape(expected)<<"\",\"samples\":"<<wav.total_samples()<<",\"processing_time_us\":"<<stats.processing_time_us<<",\"rtf\":"<<rtf<<",\"events\":[";
         for(size_t i=0;i<events.size();++i){if(i)out<<',';out<<"{\"keyword_id\":\""<<tool::Escape(events[i].keyword_id)<<"\",\"confidence\":"<<events[i].confidence<<",\"start_sample\":"<<events[i].start_sample_index<<",\"end_sample\":"<<events[i].end_sample_index<<'}';}
         out<<"]}\n";
       }catch(const std::exception&e){out<<"{\"source_index\":"<<index<<",\"path\":\""<<tool::Escape(path)<<"\",\"error\":\""<<tool::Escape(e.what())<<"\"}\n";}
