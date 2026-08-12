@@ -61,7 +61,7 @@ for (const auto& event : stream.ReadEvents()) {
 }
 ```
 
-`tools/wuw_stream_wav` is a runnable example. `tools/wuw_eval_manifest` supports deterministic record selection and records the sliding-window index for every accepted event. `scripts/submit_expts8_eval.sh` creates one sbatch-array task per manifest audio file, evaluates 5.12-second windows with a 2.56-second stride inside each task, waits for and validates the array, and writes `summary.json` plus `FULL_CONDITION_COMPARISON.md`. Its optional fifth argument limits concurrent array tasks (default 50). The report uses the single stage-2 threshold in `sdk_defaults.json`; for negative data, FA rate is accepted windows divided by evaluated windows, while FA/hour uses debounced events over source-audio duration.
+`tools/wuw_stream_wav` is a runnable example. `tools/wuw_eval_manifest` supports deterministic modulo shards and records the sliding-window index for every accepted event. `scripts/submit_expts8_eval.sh` processes test sets sequentially. For each set it creates up to 100 sbatch-array workers and distributes that set's audio files across them, while each audio is evaluated with 5.12-second windows and a 2.56-second stride. It validates every array before moving to the next set and writes `summary.json` plus `FULL_CONDITION_COMPARISON.md`. Its optional fifth argument changes the workers per test set (default 100). The report uses the single stage-2 threshold in `sdk_defaults.json`; for negative data, FA rate is accepted windows divided by evaluated windows, while FA/hour uses debounced events over source-audio duration.
 
 ## Production checks before release
 
