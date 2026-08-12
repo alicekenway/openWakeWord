@@ -9,4 +9,4 @@ while squeue -h -j "$job" | grep -q .; do sleep 20; done
 if sacct -n -X -j "$job" --format=State | grep -Eq 'FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY'; then echo "array job failed" >&2; exit 1; fi
 completed=$(find "$output/shards" -name 'part-*.jsonl' | wc -l)
 if [[ "$completed" -ne "$tasks" ]]; then echo "expected $tasks shard files, found $completed" >&2; exit 1; fi
-python3 "$sdk_dir/scripts/analyze_expts8_eval.py" --shards-root "$output/shards" --keywords "$model/keywords.json" --output "$output/merged"
+python3 "$sdk_dir/scripts/analyze_expts8_eval.py" --shards-root "$output/shards" --keywords "$model/keywords.json" --model-dir "$model" --output "$output/merged"
