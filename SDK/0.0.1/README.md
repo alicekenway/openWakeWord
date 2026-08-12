@@ -63,6 +63,22 @@ for (const auto& event : stream.ReadEvents()) {
 
 `tools/wuw_stream_wav` is a runnable example. `tools/wuw_eval_manifest` supports deterministic modulo shards and records the sliding-window index for every accepted event. `scripts/submit_expts8_eval.sh` processes test sets sequentially. For each set it creates up to 100 sbatch-array workers and distributes that set's audio files across them, while each audio is evaluated with 5.12-second windows and a 2.56-second stride. It validates every array before moving to the next set and writes `summary.json` plus `FULL_CONDITION_COMPARISON.md`. Its optional fifth argument changes the workers per test set (default 100). The report uses the single stage-2 threshold in `sdk_defaults.json`; for negative data, FA rate is accepted windows divided by evaluated windows, while FA/hour uses debounced events over source-audio duration.
 
+The preferred interface is the config-driven runner and `experiments/expts8_full_sdk.ini`:
+
+```bash
+# Safe preview: validates inputs and prints worker distribution; submits nothing.
+python3 scripts/run_sdk_eval.py experiments/expts8_full_sdk.ini plan
+
+# Submit each test set, wait for it, validate its workers, then create the summary.
+python3 scripts/run_sdk_eval.py experiments/expts8_full_sdk.ini run
+
+# Inspect recorded Slurm jobs, or regenerate the summary from completed shards.
+python3 scripts/run_sdk_eval.py experiments/expts8_full_sdk.ini status
+python3 scripts/run_sdk_eval.py experiments/expts8_full_sdk.ini summary
+```
+
+On server `u`, invoke these commands inside `srun`. Always choose a fresh `[sdk] output_dir` for a new run; the runner refuses to mix new results with an existing `shards` directory.
+
 ## Production checks before release
 
 The acceptance suite must cover frontend parity against `torchaudio.compliance.kaldi.fbank`, stage-1 output/cache parity, CTC trace and candidate parity, stage-2 probability parity, chunk-size invariance, malformed bundles/WAVs, multi-stream stress, and long-run memory stability. The provisional one-core targets are RTF <= 0.25, RSS <= 128 MB, and accepted-event latency <= 800 ms after the final wake-word audio reaches the SDK. Metrics must be measured on the actual car CPU/sysroot; a server result is not a substitute for target-hardware sign-off.

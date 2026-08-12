@@ -26,6 +26,8 @@ parser.add_argument("--shards-root", required=True)
 parser.add_argument("--keywords", required=True)
 parser.add_argument("--model-dir", required=True)
 parser.add_argument("--output", required=True)
+parser.add_argument("--output-json")
+parser.add_argument("--output-report")
 args = parser.parse_args()
 
 root = Path(args.shards_root)
@@ -45,6 +47,7 @@ summary = {
     "total_records": 0,
     "total_errors": 0,
 }
+observed_windows = set()
 
 for dataset in sorted(value for value in root.iterdir() if value.is_dir()):
     rows = []
@@ -54,6 +57,7 @@ for dataset in sorted(value for value in root.iterdir() if value.is_dir()):
     label = int((dataset / "expected_label").read_text())
     errors = sum("error" in row for row in rows)
     valid = [row for row in rows if "error" not in row]
+    observed_windows.update((int(row.get("window_samples", 0)), int(row.get("stride_samples", 0))) for row in valid)
     window_count = sum(int(row.get("audio_window_count", 1)) for row in valid)
     audio_hours = sum(float(row.get("duration_seconds", row.get("samples", 0) / 16000.0)) for row in valid) / 3600.0
     event_count = sum(debounced_events(row.get("events", []), debounce_seconds) for row in valid)
@@ -112,12 +116,19 @@ for dataset in sorted(value for value in root.iterdir() if value.is_dir()):
         for row in rows:
             merged.write(json.dumps(row, separators=(",", ":")) + "\n")
 
+observed_windows.discard((0, 0))
+if len(observed_windows) == 1:
+    window_samples, stride_samples = next(iter(observed_windows))
+    window_description = f"{window_samples / 16000.0:.6g} s window, {stride_samples / 16000.0:.6g} s stride"
+else:
+    window_description = "see per-record window_samples and stride_samples"
+summary["sliding_window"] = window_description
 report = [
     "# Wake-Word SDK Fixed-Threshold Summary",
     "",
     f"- Stage-2 threshold: `{threshold:.6g}`",
     f"- Debounce: `{debounce_seconds:.6g}` seconds",
-    "- Negative evaluation: sliding windows (5.12 s window, 2.56 s stride)",
+    f"- Negative evaluation: sliding windows ({window_description})",
     "- FA rate: false-accepted sliding windows / evaluated sliding windows",
     "- FA/hour: debounced false-accept events / evaluated source-audio hours",
 ]
@@ -148,6 +159,10 @@ for name, values in summary["datasets"].items():
             f"| {threshold:.6g} | {values['false_accept_events']} | {values['false_accept_sources']} | {values['false_accept_windows']} | {values['evaluated_windows']} | {metric(values['false_accepts_per_hour'])} | {metric(values['false_accept_rate'])} |",
         ])
 
-(output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-(output / "FULL_CONDITION_COMPARISON.md").write_text("\n".join(report).rstrip() + "\n")
+json_path = Path(args.output_json) if args.output_json else output / "summary.json"
+report_path = Path(args.output_report) if args.output_report else output / "FULL_CONDITION_COMPARISON.md"
+json_path.parent.mkdir(parents=True, exist_ok=True)
+report_path.parent.mkdir(parents=True, exist_ok=True)
+json_path.write_text(json.dumps(summary, indent=2) + "\n")
+report_path.write_text("\n".join(report).rstrip() + "\n")
 print(json.dumps({"records": summary["total_records"], "errors": summary["total_errors"], "datasets": len(summary["datasets"]), "stage2_threshold": threshold}))
