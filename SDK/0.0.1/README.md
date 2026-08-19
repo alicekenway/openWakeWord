@@ -40,11 +40,15 @@ Create the expts8 bundle with `scripts/package_expts8_model.py`. Checksum verifi
 ```bash
 cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
-  -DONNXRuntime_INCLUDE_DIR=/path/to/onnxruntime/include \
-  -DONNXRuntime_LIBRARY=/path/to/onnxruntime/lib/libonnxruntime.so
+  -DWUWSDK_ONNXRUNTIME_ROOT=/path/to/onnxruntime-linux-x64-1.25.1 \
+  -DWUWSDK_REQUIRED_ORT_VERSION=1.25.1
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+Release builds support ONNX Runtime 1.16.3 and 1.25.1. Build a separate SDK
+package for each version; do not replace the ONNX Runtime library underneath an
+already-built `libwuw_sdk.so`.
 
 For a portable build, use ordinary release flags. For a known AVX2 target, add `-DCMAKE_CXX_FLAGS_RELEASE='-O3 -DNDEBUG -mavx2 -mfma'`. Do not ship the AVX2 build to an unknown CPU.
 
