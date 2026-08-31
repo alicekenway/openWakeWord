@@ -196,7 +196,7 @@ def test_trimmed_replacement_respects_base_allowlist_and_exclusions(tmp_path: Pa
     for index, text in enumerate(("Keep command", "Go Homepage", "Silent command")):
         path = trimmed_dir / "wav" / f"00000000_{index:09d}_aaaaaaaaaa.wav"
         trimmed_rows.append(audio_row(path, text, no_speech=index == 2))
-    trimmed_manifest = write_jsonl(trimmed_dir / "metadata.jsonl", trimmed_rows)
+    trimmed_manifest = write_jsonl(trimmed_dir / "metadata.jsonl", list(reversed(trimmed_rows)))
     (trimmed_dir / "metadata.summary.json").write_text(
         json.dumps({"input_jsonl": str(source_manifest)}),
         encoding="utf-8",

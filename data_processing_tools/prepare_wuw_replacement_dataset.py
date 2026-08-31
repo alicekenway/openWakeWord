@@ -111,13 +111,21 @@ def load_trimmed_replacements(
             f"{len(trimmed_rows)} != {len(source_rows)}"
         )
     replacements: dict[str, tuple[dict[str, Any], Path]] = {}
-    for index, (source_row, trimmed_row) in enumerate(zip(source_rows, trimmed_rows)):
-        if trimmed_source_index(trimmed_row, manifest) != index:
-            raise ValueError(f"Trimmed replacement index mismatch at row {index} in {manifest}")
+    seen_indexes: set[int] = set()
+    for trimmed_row in trimmed_rows:
+        index = trimmed_source_index(trimmed_row, manifest)
+        if not 0 <= index < len(source_rows):
+            raise ValueError(f"Trimmed replacement source index {index} is out of range in {manifest}")
+        if index in seen_indexes:
+            raise ValueError(f"Duplicate trimmed replacement source index {index} in {manifest}")
+        seen_indexes.add(index)
+        source_row = source_rows[index]
         source_path = canonicalize(source_row, source_manifest, check_audio=False)["path"]
         if source_path in replacements:
             raise ValueError(f"Duplicate source path in replacement manifest: {source_path}")
         replacements[source_path] = (trimmed_row, manifest)
+    if len(seen_indexes) != len(source_rows):
+        raise ValueError(f"Trimmed replacement source indexes are incomplete in {manifest}")
     return replacements
 
 
