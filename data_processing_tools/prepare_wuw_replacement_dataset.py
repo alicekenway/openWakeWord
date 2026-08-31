@@ -111,7 +111,7 @@ def load_trimmed_replacements(
             f"{len(trimmed_rows)} != {len(source_rows)}"
         )
     replacements: dict[str, tuple[dict[str, Any], Path]] = {}
-    for index, (source_row, trimmed_row) in enumerate(zip(source_rows, trimmed_rows, strict=True)):
+    for index, (source_row, trimmed_row) in enumerate(zip(source_rows, trimmed_rows)):
         if trimmed_source_index(trimmed_row, manifest) != index:
             raise ValueError(f"Trimmed replacement index mismatch at row {index} in {manifest}")
         source_path = canonicalize(source_row, source_manifest, check_audio=False)["path"]
