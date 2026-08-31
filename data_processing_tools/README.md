@@ -129,6 +129,13 @@ and test group counts stay in their regular manifests; all other new
 evaluation groups are written under `full_test_holdout/` for a later full
 evaluation without development-set speaker leakage.
 
+Use `--positive-test-trimmed-jsonl` and `--negative-test-trimmed-jsonl` to
+replace legacy untrimmed test paths. Replacement is an intersection with the
+existing base manifests: a trimmed row is used only when its original path was
+already retained, so previously removed confusing cases cannot be added back.
+Repeat `--exclude-text` for retired phrases such as `Hey Siri` and
+`Go Homepage`. Rows marked `vad_trim.no_speech` are dropped.
+
 ## Common Voice TSV To JSONL
 
 Convert all rows:

@@ -93,6 +93,81 @@ def canonicalize(record: dict[str, Any], manifest: Path, *, check_audio: bool) -
     return {"path": str(resolved), "text": text}
 
 
+def load_trimmed_replacements(
+    manifest: Path,
+) -> dict[str, tuple[dict[str, Any], Path]]:
+    """Map original absolute audio paths to their VAD-trimmed manifest rows."""
+
+    summary_path = manifest.with_name("metadata.summary.json")
+    summary = read_json(summary_path)
+    if not isinstance(summary, dict) or not summary.get("input_jsonl"):
+        raise ValueError(f"{summary_path} must identify the original input_jsonl")
+    source_manifest = Path(str(summary["input_jsonl"])).expanduser().resolve()
+    source_rows = read_jsonl(source_manifest)
+    trimmed_rows = read_jsonl(manifest)
+    if len(source_rows) != len(trimmed_rows):
+        raise ValueError(
+            f"Trimmed replacement row count differs from its source: "
+            f"{len(trimmed_rows)} != {len(source_rows)}"
+        )
+    replacements: dict[str, tuple[dict[str, Any], Path]] = {}
+    for index, (source_row, trimmed_row) in enumerate(zip(source_rows, trimmed_rows, strict=True)):
+        if trimmed_source_index(trimmed_row, manifest) != index:
+            raise ValueError(f"Trimmed replacement index mismatch at row {index} in {manifest}")
+        source_path = canonicalize(source_row, source_manifest, check_audio=False)["path"]
+        if source_path in replacements:
+            raise ValueError(f"Duplicate source path in replacement manifest: {source_path}")
+        replacements[source_path] = (trimmed_row, manifest)
+    return replacements
+
+
+def prepare_base_rows(
+    manifest: Path,
+    *,
+    excluded_texts: set[str],
+    replacement_manifest: Path | None,
+    check_audio: bool,
+) -> tuple[list[dict[str, Any]], Counter[str], int]:
+    replacements: dict[str, tuple[dict[str, Any], Path]] = {}
+    if replacement_manifest is not None:
+        replacements = load_trimmed_replacements(replacement_manifest)
+    output: list[dict[str, Any]] = []
+    removed: Counter[str] = Counter()
+    dropped_no_speech = 0
+    used_replacements: set[str] = set()
+    for row in read_jsonl(manifest):
+        canonical = canonicalize(row, manifest, check_audio=False)
+        replacement = replacements.get(canonical["path"])
+        if replacement is not None:
+            replacement_row, trimmed_manifest = replacement
+            used_replacements.add(canonical["path"])
+            candidate = canonicalize(replacement_row, trimmed_manifest, check_audio=check_audio)
+            if no_speech(replacement_row, trimmed_manifest):
+                dropped_no_speech += 1
+                continue
+        else:
+            candidate = canonical
+        text_key = normalized_text(candidate["text"])
+        if text_key in excluded_texts:
+            removed[candidate["text"]] += 1
+            continue
+        output.append(candidate)
+    if replacements:
+        unused_nonexcluded = [
+            row
+            for source_path, (row, _trimmed_manifest) in replacements.items()
+            if source_path not in used_replacements
+            and normalized_text(str(row.get("text", ""))) not in excluded_texts
+        ]
+        if unused_nonexcluded:
+            examples = sorted({str(row.get("text", "")) for row in unused_nonexcluded})[:5]
+            raise ValueError(
+                f"{manifest} does not contain {len(unused_nonexcluded)} non-excluded rows from "
+                f"{replacement_manifest}; examples: {examples}"
+            )
+    return output, removed, dropped_no_speech
+
+
 def no_speech(record: dict[str, Any], manifest: Path) -> bool:
     details = record.get("vad_trim")
     if not isinstance(details, dict) or not isinstance(details.get("no_speech"), bool):
@@ -306,7 +381,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-failed-json", required=True, type=Path)
     parser.add_argument("--variants-json", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--old-wakeword", default="Hey Siri")
+    parser.add_argument("--old-wakeword", default="Hey Siri", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--exclude-text",
+        action="append",
+        default=None,
+        help="Exact phrase to remove case-insensitively; repeat for multiple phrases",
+    )
+    parser.add_argument("--positive-test-trimmed-jsonl", type=Path)
+    parser.add_argument("--negative-test-trimmed-jsonl", type=Path)
     parser.add_argument("--validation-group-count", type=int, default=10)
     parser.add_argument("--test-group-count", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1337)
@@ -359,28 +442,48 @@ def main() -> int:
         for group_id in ordered_groups
     }
     check_audio = not args.skip_audio_check
+    excluded_values = args.exclude_text if args.exclude_text is not None else [args.old_wakeword]
+    excluded_texts = {normalized_text(value) for value in excluded_values}
+    if "" in excluded_texts:
+        raise ValueError("--exclude-text values must not be empty")
 
     old_positive: dict[str, list[dict[str, Any]]] = {}
-    removed_old: dict[str, int] = {}
-    old_key = normalized_text(args.old_wakeword)
+    removed_old_positive: dict[str, dict[str, int]] = {}
+    dropped_old_positive_no_speech: dict[str, int] = {}
     for split in SPLITS:
         manifest = base / "positive_wuw_audio" / f"{split}.jsonl"
-        retained: list[dict[str, Any]] = []
-        removed = 0
-        for row in read_jsonl(manifest):
-            if normalized_text(str(row.get("text", ""))) == old_key:
-                removed += 1
-            else:
-                retained.append(canonicalize(row, manifest, check_audio=False))
+        retained, removed, dropped = prepare_base_rows(
+            manifest,
+            excluded_texts=excluded_texts,
+            replacement_manifest=(
+                args.positive_test_trimmed_jsonl.expanduser().resolve()
+                if split == "test" and args.positive_test_trimmed_jsonl is not None
+                else None
+            ),
+            check_audio=check_audio,
+        )
         old_positive[split] = retained
-        removed_old[split] = removed
+        removed_old_positive[split] = dict(sorted(removed.items()))
+        dropped_old_positive_no_speech[split] = dropped
 
     old_negative: dict[str, list[dict[str, Any]]] = {}
+    removed_old_negative: dict[str, dict[str, int]] = {}
+    dropped_old_negative_no_speech: dict[str, int] = {}
     for split in SPLITS:
         manifest = base / "negative_non_wuw_audio" / f"{split}.jsonl"
-        old_negative[split] = [
-            canonicalize(row, manifest, check_audio=False) for row in read_jsonl(manifest)
-        ]
+        retained, removed, dropped = prepare_base_rows(
+            manifest,
+            excluded_texts=excluded_texts,
+            replacement_manifest=(
+                args.negative_test_trimmed_jsonl.expanduser().resolve()
+                if split == "test" and args.negative_test_trimmed_jsonl is not None
+                else None
+            ),
+            check_audio=check_audio,
+        )
+        old_negative[split] = retained
+        removed_old_negative[split] = dict(sorted(removed.items()))
+        dropped_old_negative_no_speech[split] = dropped
 
     new_positive_train, dropped_positive_train, train_variant_counts = prepare_new_positive(
         args.positive_train_jsonl,
@@ -428,11 +531,12 @@ def main() -> int:
         "negative including full-test holdout",
     )
     if any(
-        normalized_text(str(row.get("text", ""))) == old_key
-        for rows in positive.values()
+        normalized_text(str(row.get("text", ""))) in excluded_texts
+        for rows_by_split in (positive, negative)
+        for rows in rows_by_split.values()
         for row in rows
     ):
-        raise RuntimeError(f"Legacy wake word {args.old_wakeword!r} remains after filtering")
+        raise RuntimeError("An excluded phrase remains after filtering")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=output.parent))
@@ -458,9 +562,24 @@ def main() -> int:
             "schema_version": 1,
             "base_input_dir": str(base),
             "output_dir": str(output),
-            "old_wakeword_removed": args.old_wakeword,
-            "removed_old_positive_rows": removed_old,
+            "excluded_texts": excluded_values,
+            "removed_old_positive_rows": removed_old_positive,
+            "removed_old_negative_rows": removed_old_negative,
+            "trimmed_test_replacements": {
+                "positive_wuw_audio": (
+                    str(args.positive_test_trimmed_jsonl.expanduser().resolve())
+                    if args.positive_test_trimmed_jsonl is not None
+                    else None
+                ),
+                "negative_non_wuw_audio": (
+                    str(args.negative_test_trimmed_jsonl.expanduser().resolve())
+                    if args.negative_test_trimmed_jsonl is not None
+                    else None
+                ),
+            },
             "no_speech_rows_removed": {
+                "base_positive_test_replacement": dropped_old_positive_no_speech["test"],
+                "base_negative_test_replacement": dropped_old_negative_no_speech["test"],
                 "positive_train": dropped_positive_train,
                 "negative_train": dropped_negative_train,
                 "positive_eval": dropped_positive_eval,

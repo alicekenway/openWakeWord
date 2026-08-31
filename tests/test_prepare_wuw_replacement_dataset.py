@@ -145,7 +145,11 @@ def test_builds_group_safe_replacement_dataset(tmp_path: Path, monkeypatch) -> N
 
     assert tool.main() == 0
     summary = json.loads((output / "preparation_summary.json").read_text(encoding="utf-8"))
-    assert summary["removed_old_positive_rows"] == {"train": 1, "val": 1, "test": 1}
+    assert summary["removed_old_positive_rows"] == {
+        "train": {"Hey Siri": 1},
+        "val": {"Hey Siri": 1},
+        "test": {"Hey Siri": 1},
+    }
     assert summary["validation_group_count"] == 1
     assert summary["test_group_count"] == 1
     assert summary["full_test_holdout_group_count"] == 2
@@ -170,3 +174,55 @@ def test_builds_group_safe_replacement_dataset(tmp_path: Path, monkeypatch) -> N
     holdout_negative = tool.read_jsonl(output / "full_test_holdout/negative_non_wuw_audio.jsonl")
     assert holdout_positive and holdout_negative
     assert all(set(row) == {"path", "text"} for row in holdout_positive + holdout_negative)
+
+
+def test_trimmed_replacement_respects_base_allowlist_and_exclusions(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    source_manifest = write_jsonl(
+        source_dir / "metadata.jsonl",
+        [
+            {"path": "wav/000000000.wav", "text": "Keep command"},
+            {"path": "wav/000000001.wav", "text": "Go Homepage"},
+            {"path": "wav/000000002.wav", "text": "Silent command"},
+        ],
+    )
+    for index in range(3):
+        path = source_dir / "wav" / f"{index:09d}.wav"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    trimmed_dir = tmp_path / "trimmed"
+    trimmed_rows = []
+    for index, text in enumerate(("Keep command", "Go Homepage", "Silent command")):
+        path = trimmed_dir / "wav" / f"00000000_{index:09d}_aaaaaaaaaa.wav"
+        trimmed_rows.append(audio_row(path, text, no_speech=index == 2))
+    trimmed_manifest = write_jsonl(trimmed_dir / "metadata.jsonl", trimmed_rows)
+    (trimmed_dir / "metadata.summary.json").write_text(
+        json.dumps({"input_jsonl": str(source_manifest)}),
+        encoding="utf-8",
+    )
+
+    external = tmp_path / "external.wav"
+    external.touch()
+    base_manifest = write_jsonl(
+        tmp_path / "base.jsonl",
+        [
+            {"path": str(source_dir / "wav/000000000.wav"), "text": "Keep command"},
+            {"path": str(source_dir / "wav/000000002.wav"), "text": "Silent command"},
+            {"path": str(external), "text": "Open Homepage"},
+        ],
+    )
+
+    rows, removed, dropped = tool.prepare_base_rows(
+        base_manifest,
+        excluded_texts={tool.normalized_text("Go Homepage"), tool.normalized_text("Hey Siri")},
+        replacement_manifest=trimmed_manifest,
+        check_audio=True,
+    )
+
+    assert removed == {}
+    assert dropped == 1
+    assert rows == [
+        {"path": str(trimmed_dir / "wav/00000000_000000000_aaaaaaaaaa.wav"), "text": "Keep command"},
+        {"path": str(external), "text": "Open Homepage"},
+    ]
