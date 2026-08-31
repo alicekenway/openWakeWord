@@ -9,6 +9,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from data_processing_tools.wakewords_to_keyword_tokens import (  # noqa: E402
     build_keyword_config,
+    build_keyword_variant_config,
+    read_keyword_variants,
     read_phoneme_dictionary,
     read_token_table,
     read_wakewords,
@@ -74,3 +76,32 @@ def test_rejects_duplicate_normalized_pronunciations(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Duplicate pronunciation"):
         read_phoneme_dictionary(path)
+
+
+def test_builds_multiple_variants_with_shared_display_text(tmp_path: Path) -> None:
+    first = write_text(
+        tmp_path / "first.tsv",
+        "hello_loncin_aa_n\tHello Loncin\th ə l oʊ l ɑː n s ɪ n\n",
+    )
+    second = write_text(
+        tmp_path / "second.tsv",
+        "hello_loncin_ao_ng\tHello Loncin\th ə l oʊ l ɔː ŋ s ɪ n\n",
+    )
+    variants = read_keyword_variants([first, second])
+    symbols = "h ə l oʊ ɑː ɔː n ŋ s ɪ".split()
+    result = build_keyword_variant_config(variants, {symbol: index for index, symbol in enumerate(symbols)})
+
+    assert [item["id"] for item in result["keywords"]] == [
+        "hello_loncin_aa_n",
+        "hello_loncin_ao_ng",
+    ]
+    assert {item["display_text"] for item in result["keywords"]} == {"Hello Loncin"}
+
+
+def test_variant_files_reject_duplicate_ids(tmp_path: Path) -> None:
+    variants = write_text(
+        tmp_path / "variants.tsv",
+        "same\tHello One\th ə\nsame\tHello Two\th ə\n",
+    )
+    with pytest.raises(ValueError, match="Duplicate keyword variant id"):
+        read_keyword_variants([variants])

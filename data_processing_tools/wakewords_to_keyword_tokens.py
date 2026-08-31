@@ -170,15 +170,89 @@ def build_keyword_config(
     return {"keywords": keywords}
 
 
+def read_keyword_variants(paths: list[Path]) -> list[tuple[str, str, tuple[str, ...]]]:
+    """Read explicit ``id<TAB>display_text<TAB>phonemes`` keyword variants."""
+
+    variants: list[tuple[str, str, tuple[str, ...]]] = []
+    seen_ids: dict[str, tuple[Path, int]] = {}
+    for path in paths:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                fields = stripped.split("\t")
+                if len(fields) != 3:
+                    raise ValueError(
+                        f"Invalid keyword variant line {line_number} of {path}: expected "
+                        "<id><TAB><display text><TAB><space-separated phonemes>"
+                    )
+                keyword_id = fields[0].strip()
+                display_text = normalize_phrase(fields[1])
+                phonemes = tuple(fields[2].split())
+                if not keyword_id or not display_text or not phonemes:
+                    raise ValueError(f"Empty field on keyword variant line {line_number} of {path}")
+                if keyword_id in seen_ids:
+                    first_path, first_line = seen_ids[keyword_id]
+                    raise ValueError(
+                        f"Duplicate keyword variant id {keyword_id!r} on line {line_number} of {path}; "
+                        f"first seen on line {first_line} of {first_path}"
+                    )
+                seen_ids[keyword_id] = (path, line_number)
+                variants.append((keyword_id, display_text, phonemes))
+    if not variants:
+        raise ValueError("Keyword variant files contain no entries")
+    return variants
+
+
+def build_keyword_variant_config(
+    variants: list[tuple[str, str, tuple[str, ...]]],
+    token_ids: dict[str, int],
+) -> dict[str, list[dict[str, object]]]:
+    """Build keyword JSON while allowing several IDs to share display text."""
+
+    unknown_phonemes: dict[str, list[str]] = {}
+    keywords: list[dict[str, object]] = []
+    for keyword_id, display_text, phonemes in variants:
+        unknown = sorted({phoneme for phoneme in phonemes if phoneme not in token_ids})
+        if unknown:
+            unknown_phonemes[keyword_id] = unknown
+            continue
+        keywords.append(
+            {
+                "id": keyword_id,
+                "display_text": display_text,
+                "token_ids": [token_ids[phoneme] for phoneme in phonemes],
+            }
+        )
+    if unknown_phonemes:
+        details = "; ".join(
+            f"unknown phoneme(s) for {keyword_id!r}: "
+            + ", ".join(repr(item) for item in phonemes)
+            for keyword_id, phonemes in unknown_phonemes.items()
+        )
+        raise ValueError(f"Cannot build keyword config; {details}")
+    return {"keywords": keywords}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Map wake words through a phoneme dictionary and WeNet token table into keyword-token JSON."
     )
-    parser.add_argument("--wakewords", required=True, help="Text file with one wake-word phrase per line")
+    parser.add_argument("--wakewords", help="Text file with one wake-word phrase per line")
     parser.add_argument(
         "--phoneme-dict",
-        required=True,
         help="UTF-8 dictionary with <wake word><TAB><space-separated phonemes>",
+    )
+    parser.add_argument(
+        "--keyword-variants",
+        action="append",
+        default=[],
+        help=(
+            "Explicit UTF-8 variant file with "
+            "<id><TAB><display text><TAB><space-separated phonemes>. "
+            "May be repeated; cannot be combined with --wakewords/--phoneme-dict."
+        ),
     )
     parser.add_argument(
         "--tokens",
@@ -196,28 +270,41 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    wakewords_path = Path(args.wakewords).expanduser().resolve()
-    phoneme_dict_path = Path(args.phoneme_dict).expanduser().resolve()
     tokens_path = Path(args.tokens).expanduser().resolve()
     output_path = Path(args.output_json).expanduser().resolve()
 
-    for name, path in (
-        ("wake-word file", wakewords_path),
-        ("phoneme dictionary", phoneme_dict_path),
-        ("token table", tokens_path),
-    ):
+    variant_mode = bool(args.keyword_variants)
+    if variant_mode and (args.wakewords or args.phoneme_dict):
+        raise ValueError("--keyword-variants cannot be combined with --wakewords or --phoneme-dict")
+    if not variant_mode and not (args.wakewords and args.phoneme_dict):
+        raise ValueError("provide --keyword-variants, or provide both --wakewords and --phoneme-dict")
+
+    required_paths: list[tuple[str, Path]] = [("token table", tokens_path)]
+    variant_paths = [Path(value).expanduser().resolve() for value in args.keyword_variants]
+    if variant_mode:
+        required_paths.extend(("keyword variant file", path) for path in variant_paths)
+    else:
+        wakewords_path = Path(args.wakewords).expanduser().resolve()
+        phoneme_dict_path = Path(args.phoneme_dict).expanduser().resolve()
+        required_paths.extend(
+            (("wake-word file", wakewords_path), ("phoneme dictionary", phoneme_dict_path))
+        )
+    for name, path in required_paths:
         if not path.is_file():
             raise FileNotFoundError(f"{name} does not exist: {path}")
 
-    wakewords = read_wakewords(wakewords_path, case_sensitive=args.case_sensitive)
-    pronunciations = read_phoneme_dictionary(phoneme_dict_path, case_sensitive=args.case_sensitive)
     token_ids = read_token_table(tokens_path)
-    result = build_keyword_config(
-        wakewords,
-        pronunciations,
-        token_ids,
-        case_sensitive=args.case_sensitive,
-    )
+    if variant_mode:
+        result = build_keyword_variant_config(read_keyword_variants(variant_paths), token_ids)
+    else:
+        wakewords = read_wakewords(wakewords_path, case_sensitive=args.case_sensitive)
+        pronunciations = read_phoneme_dictionary(phoneme_dict_path, case_sensitive=args.case_sensitive)
+        result = build_keyword_config(
+            wakewords,
+            pronunciations,
+            token_ids,
+            case_sensitive=args.case_sensitive,
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote {len(result['keywords'])} keyword(s) to {output_path}")

@@ -82,6 +82,49 @@ from the token table, or an input mapping is ambiguous. The output deliberately
 has no `threshold`; use it as `keyword_tokens` during feature generation, then
 maintain stage-1 thresholds separately in the training/testing keyword JSON.
 
+To define multiple pronunciations for one display phrase, use one or more
+explicit variant TSVs instead of `--wakewords` and `--phoneme-dict`:
+
+```text
+hello_loncin_aa_n<TAB>Hello Loncin<TAB>h ə l oʊ l ɑː n s ɪ n
+hello_loncin_ao_ng<TAB>Hello Loncin<TAB>h ə l oʊ l ɔː ŋ s ɪ n
+```
+
+```bash
+python data_processing_tools/wakewords_to_keyword_tokens.py \
+  --keyword-variants /path/to/variants.tsv \
+  --tokens /path/to/tokens.txt \
+  --output-json /path/to/wenet_ctc_keyword_tokens.json
+```
+
+Variant IDs must be unique, but several IDs may share one `display_text`.
+Positive manifests should provide `expected_keyword_id` so feature reports can
+distinguish those pronunciations.
+
+## CosyVoice ARPAbet To IPA
+
+Convert bracketed CosyVoice/CMU pronunciations to the IPA inventory used by a
+WeNet token table:
+
+```bash
+python data_processing_tools/cosyvoice_arpabet_to_ipa.py \
+  --input-json /path/to/variants.json \
+  --tokens /path/to/ipa_units.txt \
+  --output-tsv /path/to/variants.dct
+```
+
+The JSON contains a `variants` list whose items have `id`, `display_text`, and
+a fully bracketed `arpabet` value. Stress digits are used where they affect the
+IPA vowel and are otherwise omitted from the output.
+
+## Replacement Wake-Word Dataset
+
+`prepare_wuw_replacement_dataset.py` creates a manifest-only `input_data` tree
+from an existing one. It removes a legacy positive phrase, adds new TTS
+positives and hard negatives, drops rows marked `vad_trim.no_speech`, and uses
+CosyVoice generation provenance to keep evaluation speaker groups intact.
+Audio is not copied; output manifests use absolute canonical `path` values.
+
 ## Common Voice TSV To JSONL
 
 Convert all rows:
