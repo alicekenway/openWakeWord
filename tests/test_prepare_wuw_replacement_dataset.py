@@ -183,19 +183,20 @@ def test_trimmed_replacement_respects_base_allowlist_and_exclusions(tmp_path: Pa
         [
             {"path": "wav/000000000.wav", "text": "Keep command"},
             {"path": "wav/000000001.wav", "text": "Go Homepage"},
-            {"path": "wav/000000002.wav", "text": "Silent command"},
+            {"path": "wav/000000005.wav", "text": "Silent command"},
         ],
     )
-    for index in range(3):
+    source_indexes = (0, 1, 5)
+    for index in source_indexes:
         path = source_dir / "wav" / f"{index:09d}.wav"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
 
     trimmed_dir = tmp_path / "trimmed"
     trimmed_rows = []
-    for index, text in enumerate(("Keep command", "Go Homepage", "Silent command")):
+    for index, text in zip(source_indexes, ("Keep command", "Go Homepage", "Silent command")):
         path = trimmed_dir / "wav" / f"00000000_{index:09d}_aaaaaaaaaa.wav"
-        trimmed_rows.append(audio_row(path, text, no_speech=index == 2))
+        trimmed_rows.append(audio_row(path, text, no_speech=index == 5))
     trimmed_manifest = write_jsonl(trimmed_dir / "metadata.jsonl", list(reversed(trimmed_rows)))
     (trimmed_dir / "metadata.summary.json").write_text(
         json.dumps({"input_jsonl": str(source_manifest)}),
@@ -208,7 +209,7 @@ def test_trimmed_replacement_respects_base_allowlist_and_exclusions(tmp_path: Pa
         tmp_path / "base.jsonl",
         [
             {"path": str(source_dir / "wav/000000000.wav"), "text": "Keep command"},
-            {"path": str(source_dir / "wav/000000002.wav"), "text": "Silent command"},
+            {"path": str(source_dir / "wav/000000005.wav"), "text": "Silent command"},
             {"path": str(external), "text": "Open Homepage"},
         ],
     )

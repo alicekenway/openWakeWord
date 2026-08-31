@@ -111,15 +111,24 @@ def load_trimmed_replacements(
             f"{len(trimmed_rows)} != {len(source_rows)}"
         )
     replacements: dict[str, tuple[dict[str, Any], Path]] = {}
+    source_by_index: dict[int, dict[str, Any]] = {}
+    for source_row in source_rows:
+        source_stem = Path(audio_path(source_row)).stem
+        if not source_stem.isdigit():
+            raise ValueError(f"Original replacement source path has non-numeric stem: {source_stem}")
+        source_index = int(source_stem)
+        if source_index in source_by_index:
+            raise ValueError(f"Duplicate original replacement source index {source_index}")
+        source_by_index[source_index] = source_row
     seen_indexes: set[int] = set()
     for trimmed_row in trimmed_rows:
         index = trimmed_source_index(trimmed_row, manifest)
-        if not 0 <= index < len(source_rows):
-            raise ValueError(f"Trimmed replacement source index {index} is out of range in {manifest}")
+        if index not in source_by_index:
+            raise ValueError(f"Trimmed replacement source index {index} has no source row in {manifest}")
         if index in seen_indexes:
             raise ValueError(f"Duplicate trimmed replacement source index {index} in {manifest}")
         seen_indexes.add(index)
-        source_row = source_rows[index]
+        source_row = source_by_index[index]
         source_path = canonicalize(source_row, source_manifest, check_audio=False)["path"]
         if source_path in replacements:
             raise ValueError(f"Duplicate source path in replacement manifest: {source_path}")
