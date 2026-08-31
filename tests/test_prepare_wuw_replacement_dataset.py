@@ -138,6 +138,7 @@ def test_builds_group_safe_replacement_dataset(tmp_path: Path, monkeypatch) -> N
             "--variants-json", str(variants_path),
             "--output-dir", str(output),
             "--validation-group-count", "1",
+            "--test-group-count", "1",
             "--seed", "1337",
         ],
     )
@@ -146,7 +147,8 @@ def test_builds_group_safe_replacement_dataset(tmp_path: Path, monkeypatch) -> N
     summary = json.loads((output / "preparation_summary.json").read_text(encoding="utf-8"))
     assert summary["removed_old_positive_rows"] == {"train": 1, "val": 1, "test": 1}
     assert summary["validation_group_count"] == 1
-    assert summary["test_group_count"] == 3
+    assert summary["test_group_count"] == 1
+    assert summary["full_test_holdout_group_count"] == 2
     assert sum(summary["no_speech_rows_removed"].values()) == 3
 
     positive_rows = {
@@ -158,9 +160,13 @@ def test_builds_group_safe_replacement_dataset(tmp_path: Path, monkeypatch) -> N
         row for rows in positive_rows.values() for row in rows if row["text"] == "Hello Loncin"
     ]
     assert new_rows
-    assert all("expected_keyword_id" in row for row in new_rows)
-    eval_groups = {
-        split: {row["source_group_id"] for row in positive_rows[split] if "source_group_id" in row}
-        for split in ("val", "test")
+    assert all(set(row) == {"path", "text"} for rows in positive_rows.values() for row in rows)
+    negative_rows = {
+        split: tool.read_jsonl(output / "negative_non_wuw_audio" / f"{split}.jsonl")
+        for split in tool.SPLITS
     }
-    assert not (eval_groups["val"] & eval_groups["test"])
+    assert all(set(row) == {"path", "text"} for rows in negative_rows.values() for row in rows)
+    holdout_positive = tool.read_jsonl(output / "full_test_holdout/positive_wuw_audio.jsonl")
+    holdout_negative = tool.read_jsonl(output / "full_test_holdout/negative_non_wuw_audio.jsonl")
+    assert holdout_positive and holdout_negative
+    assert all(set(row) == {"path", "text"} for row in holdout_positive + holdout_negative)

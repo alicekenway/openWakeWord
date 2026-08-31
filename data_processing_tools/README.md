@@ -123,7 +123,11 @@ IPA vowel and are otherwise omitted from the output.
 from an existing one. It removes a legacy positive phrase, adds new TTS
 positives and hard negatives, drops rows marked `vad_trim.no_speech`, and uses
 CosyVoice generation provenance to keep evaluation speaker groups intact.
-Audio is not copied; output manifests use absolute canonical `path` values.
+Audio is not copied. Positive and non-WUW rows are normalized to exactly
+`path` and `text`, with an absolute canonical path. The requested validation
+and test group counts stay in their regular manifests; all other new
+evaluation groups are written under `full_test_holdout/` for a later full
+evaluation without development-set speaker leakage.
 
 ## Common Voice TSV To JSONL
 

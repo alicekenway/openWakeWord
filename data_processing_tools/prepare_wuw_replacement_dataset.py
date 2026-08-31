@@ -3,7 +3,9 @@
 
 The tool starts from an existing ``input_data`` tree, removes one legacy
 positive phrase, adds new positive and hard-negative TTS manifests, and makes
-a group-safe validation/test split from a generated CosyVoice evaluation set.
+a group-safe validation/test/holdout split from a generated CosyVoice
+evaluation set.  Positive and non-WUW manifests are normalized to the legacy
+two-field ``path``/``text`` contract.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ AUDIO_PATH_KEYS = (
     "filename",
 )
 SPLITS = ("train", "val", "test")
+NEW_SPLITS = (*SPLITS, "holdout")
 TRIMMED_NAME = re.compile(r"^\d{8}_(\d+)_([0-9a-f]{10})$")
 
 
@@ -84,12 +87,10 @@ def canonicalize(record: dict[str, Any], manifest: Path, *, check_audio: bool) -
     resolved = Path(os.path.abspath(os.fspath(resolved)))
     if check_audio and not resolved.is_file():
         raise FileNotFoundError(f"Audio referenced by {manifest} does not exist: {resolved}")
-    updated = dict(record)
-    for key in AUDIO_PATH_KEYS:
-        updated.pop(key, None)
-    updated.pop("source_path", None)
-    updated["path"] = str(resolved)
-    return updated
+    text = " ".join(str(record.get("text", "")).split())
+    if not text:
+        raise ValueError(f"JSONL row in {manifest} has empty text")
+    return {"path": str(resolved), "text": text}
 
 
 def no_speech(record: dict[str, Any], manifest: Path) -> bool:
@@ -190,10 +191,11 @@ def prepare_new_positive(
     *,
     check_audio: bool,
     group_map: list[str] | None = None,
-    validation_groups: set[str] | None = None,
-) -> tuple[dict[str, list[dict[str, Any]]], int]:
-    output = {"train": [], "val": [], "test": []}
+    group_splits: dict[str, str] | None = None,
+) -> tuple[dict[str, list[dict[str, Any]]], int, Counter[str]]:
+    output = {split: [] for split in NEW_SPLITS}
     dropped = 0
+    variant_counts: Counter[str] = Counter()
     seen_source_indexes: set[int] = set()
     for row in read_jsonl(manifest):
         source_text = " ".join(str(row.get("text", "")).split())
@@ -214,18 +216,19 @@ def prepare_new_positive(
         keyword_id, display_text = variants[source_text]
         updated = canonicalize(row, manifest, check_audio=check_audio)
         updated["text"] = display_text
-        updated["expected_keyword_id"] = keyword_id
+        variant_counts[keyword_id] += 1
         split = "train"
         if group_id is not None:
-            updated["source_group_id"] = group_id
-            split = "val" if group_id in (validation_groups or set()) else "test"
+            if group_splits is None or group_id not in group_splits:
+                raise ValueError(f"No split assignment for evaluation group {group_id}")
+            split = group_splits[group_id]
         output[split].append(updated)
     if group_map is not None and len(seen_source_indexes) != len(group_map):
         raise ValueError(
             f"Provenance map has {len(group_map)} rows but {manifest} has "
             f"{len(seen_source_indexes)} unique source indexes"
         )
-    return output, dropped
+    return output, dropped, variant_counts
 
 
 def prepare_new_negative(
@@ -233,9 +236,9 @@ def prepare_new_negative(
     *,
     check_audio: bool,
     group_map: list[str] | None = None,
-    validation_groups: set[str] | None = None,
+    group_splits: dict[str, str] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], int]:
-    output = {"train": [], "val": [], "test": []}
+    output = {split: [] for split in NEW_SPLITS}
     dropped = 0
     seen_source_indexes: set[int] = set()
     for row in read_jsonl(manifest):
@@ -258,8 +261,9 @@ def prepare_new_negative(
         updated["text"] = text
         split = "train"
         if group_id is not None:
-            updated["source_group_id"] = group_id
-            split = "val" if group_id in (validation_groups or set()) else "test"
+            if group_splits is None or group_id not in group_splits:
+                raise ValueError(f"No split assignment for evaluation group {group_id}")
+            split = group_splits[group_id]
         output[split].append(updated)
     if group_map is not None and len(seen_source_indexes) != len(group_map):
         raise ValueError(
@@ -271,8 +275,8 @@ def prepare_new_negative(
 
 def split_paths(rows_by_split: dict[str, list[dict[str, Any]]], label: str) -> None:
     seen: dict[str, str] = {}
-    for split in SPLITS:
-        for row in rows_by_split[split]:
+    for split, rows in rows_by_split.items():
+        for row in rows:
             path = str(row["path"])
             previous = seen.get(path)
             if previous is not None:
@@ -304,6 +308,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--old-wakeword", default="Hey Siri")
     parser.add_argument("--validation-group-count", type=int, default=10)
+    parser.add_argument("--test-group-count", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument(
         "--skip-audio-check",
@@ -337,11 +342,22 @@ def main() -> int:
     )
     if positive_group_ids != negative_group_ids:
         raise ValueError("Positive and negative provenance group order differs")
-    if not 0 < args.validation_group_count < len(positive_group_ids):
-        raise ValueError("--validation-group-count must be between 1 and group_count - 1")
-    validation_groups = set(
-        random.Random(args.seed).sample(sorted(positive_group_ids), args.validation_group_count)
-    )
+    if args.validation_group_count < 1 or args.test_group_count < 1:
+        raise ValueError("--validation-group-count and --test-group-count must both be positive")
+    if args.validation_group_count + args.test_group_count >= len(positive_group_ids):
+        raise ValueError("validation and test groups must leave at least one full-test holdout group")
+    ordered_groups = sorted(positive_group_ids)
+    rng = random.Random(args.seed)
+    validation_groups = set(rng.sample(ordered_groups, args.validation_group_count))
+    remaining_groups = [group_id for group_id in ordered_groups if group_id not in validation_groups]
+    test_groups = set(rng.sample(remaining_groups, args.test_group_count))
+    holdout_groups = set(remaining_groups) - test_groups
+    group_splits = {
+        group_id: (
+            "val" if group_id in validation_groups else "test" if group_id in test_groups else "holdout"
+        )
+        for group_id in ordered_groups
+    }
     check_audio = not args.skip_audio_check
 
     old_positive: dict[str, list[dict[str, Any]]] = {}
@@ -366,7 +382,7 @@ def main() -> int:
             canonicalize(row, manifest, check_audio=False) for row in read_jsonl(manifest)
         ]
 
-    new_positive_train, dropped_positive_train = prepare_new_positive(
+    new_positive_train, dropped_positive_train, train_variant_counts = prepare_new_positive(
         args.positive_train_jsonl,
         variants,
         check_audio=check_audio,
@@ -375,18 +391,18 @@ def main() -> int:
         args.negative_train_jsonl,
         check_audio=check_audio,
     )
-    new_positive_eval, dropped_positive_eval = prepare_new_positive(
+    new_positive_eval, dropped_positive_eval, eval_variant_counts = prepare_new_positive(
         args.positive_eval_jsonl,
         variants,
         check_audio=check_audio,
         group_map=positive_map,
-        validation_groups=validation_groups,
+        group_splits=group_splits,
     )
     new_negative_eval, dropped_negative_eval = prepare_new_negative(
         args.negative_eval_jsonl,
         check_audio=check_audio,
         group_map=negative_map,
-        validation_groups=validation_groups,
+        group_splits=group_splits,
     )
 
     positive = {
@@ -403,6 +419,14 @@ def main() -> int:
     }
     split_paths(positive, "positive")
     split_paths(negative, "negative")
+    split_paths(
+        {**positive, "holdout": new_positive_eval["holdout"]},
+        "positive including full-test holdout",
+    )
+    split_paths(
+        {**negative, "holdout": new_negative_eval["holdout"]},
+        "negative including full-test holdout",
+    )
     if any(
         normalized_text(str(row.get("text", ""))) == old_key
         for rows in positive.values()
@@ -421,6 +445,14 @@ def main() -> int:
         for split in SPLITS:
             write_jsonl(temporary / "positive_wuw_audio" / f"{split}.jsonl", positive[split])
             write_jsonl(temporary / "negative_non_wuw_audio" / f"{split}.jsonl", negative[split])
+        write_jsonl(
+            temporary / "full_test_holdout" / "positive_wuw_audio.jsonl",
+            new_positive_eval["holdout"],
+        )
+        write_jsonl(
+            temporary / "full_test_holdout" / "negative_non_wuw_audio.jsonl",
+            new_negative_eval["holdout"],
+        )
 
         summary = {
             "schema_version": 1,
@@ -436,22 +468,23 @@ def main() -> int:
             },
             "seed": args.seed,
             "validation_group_count": len(validation_groups),
-            "test_group_count": len(positive_group_ids) - len(validation_groups),
+            "test_group_count": len(test_groups),
+            "full_test_holdout_group_count": len(holdout_groups),
             "validation_group_ids": sorted(validation_groups),
+            "test_group_ids": sorted(test_groups),
+            "full_test_holdout_group_ids": sorted(holdout_groups),
             "positive_rows": counts(positive),
             "negative_non_wuw_rows": counts(negative),
             "positive_text_counts": text_counts(positive),
-            "new_positive_variant_counts": dict(
-                sorted(
-                    Counter(
-                        str(row["expected_keyword_id"])
-                        for rows in (new_positive_train, new_positive_eval)
-                        for split_rows in rows.values()
-                        for row in split_rows
-                    ).items()
-                )
+            "full_test_holdout_rows": {
+                "positive_wuw_audio": len(new_positive_eval["holdout"]),
+                "negative_non_wuw_audio": len(new_negative_eval["holdout"]),
+            },
+            "new_positive_source_variant_counts": dict(
+                sorted((train_variant_counts + eval_variant_counts).items())
             ),
             "canonical_audio_field": "path",
+            "manifest_fields": ["path", "text"],
             "absolute_audio_paths": True,
             "audio_files_copied": False,
         }
@@ -466,6 +499,8 @@ def main() -> int:
                         "category": category,
                         "rows": counts(rows),
                         "validation_group_ids": sorted(validation_groups),
+                        "test_group_ids": sorted(test_groups),
+                        "full_test_holdout_group_ids": sorted(holdout_groups),
                         "seed": args.seed,
                     },
                     ensure_ascii=False,
